@@ -8,7 +8,7 @@ use guard_core_engine::preprocessor;
 use regex::Regex;
 
 fn load() -> (Corpus, Ledger) {
-    let corpus = corpus::load_corpus().expect("corpus must load and target spec 4.0.3");
+    let corpus = corpus::load_corpus().expect("corpus must load and target spec 4.1.0");
     let ledger = ledger::load_ledger().expect("ledger must load");
     (corpus, ledger)
 }

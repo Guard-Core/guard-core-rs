@@ -4,6 +4,7 @@ pub mod corpus;
 pub mod detect;
 pub mod knobs;
 pub mod ledger;
+pub mod pipeline;
 pub mod report;
 
 use serde_json::Value;

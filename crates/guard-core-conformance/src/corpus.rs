@@ -112,8 +112,8 @@ pub fn load_corpus() -> Result<Corpus, String> {
     let mut suites = Vec::new();
     for (name, entry) in &index.suites {
         if !entry.is_detect() {
-            // Pipeline-kind suites are consumed by the go/php/ts runners; the
-            // rust engine has no pipeline port yet.
+            // Pipeline-kind suites load through src/pipeline.rs (the
+            // pipeline-stage runner); the detect corpus stays here.
             continue;
         }
         let path = dir.join(format!("{name}.json"));

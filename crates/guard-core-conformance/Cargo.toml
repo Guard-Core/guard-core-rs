@@ -11,6 +11,7 @@ bench = false
 
 [dependencies]
 guard-core-engine = { workspace = true }
+guard-core-rs = { workspace = true }
 regex             = { workspace = true }
 serde             = { workspace = true }
 serde_json        = { workspace = true }

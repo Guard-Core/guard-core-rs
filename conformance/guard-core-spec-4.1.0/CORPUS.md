@@ -16,10 +16,21 @@ reference engine, never hand-written.
   (exempt_ips, CORS, geo country rules, security headers, rate-limit tiers,
   route detection exclusions, passive_mode, the 400 detection shape,
   custom_error_responses, on_block payloads, behavior rules) recorded through
-  the reference's real check pipeline. The rust engine has no pipeline port
-  yet, so the rust runner loads only the detect suites (see the `consumers`
-  list per suite in `index.json`); the go/php/ts runners consume the
-  pipeline suites through their own engines.
+  the reference's real check pipeline. Consumed by this repo's
+  pipeline-stage runner (`guard-core-conformance` `src/pipeline.rs`, test
+  `tests/pipeline_conformance.rs`): the case engine composes the family's
+  real stages (`IpGateConfig`, the geo `check_countries` gate,
+  `UserAgentStage`, `RateLimitStage::decide_for_path_observed`, the
+  `detection_exclusions` resolution) over an in-memory geo stub, redis-free,
+  one fresh engine per case. The `events` observation key is skipped (the
+  stage composition exposes no reference-vocabulary event-bus capture; the
+  Go runner's documented precedent). Where the rust architecture has no port
+  yet - the security-headers manager, CORS, the response-side
+  `process_response` pass, the suspicious-activity `400` answer, route
+  `ip_whitelist`/`ip_blacklist`, and the behavior-rule engine - the failing
+  cases sit in `conformance/xfail_baseline.toml` with the honest per-case
+  reason, under the same fail-closed rules as the detect baseline. Current
+  state: 7 passed, 28 xfail, 0 unbaselined failures.
 
 ## Detect drift vs spec 4.0.3
 

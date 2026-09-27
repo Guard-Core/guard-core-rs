@@ -782,6 +782,7 @@ name = "guard-core-conformance"
 version = "4.1.0"
 dependencies = [
  "guard-core-engine",
+ "guard-core-rs",
  "regex",
  "serde",
  "serde_json",

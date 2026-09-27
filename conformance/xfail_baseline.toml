@@ -5,9 +5,43 @@
 # random-noise binary cases, whose decode-stage parity gaps are covered by the
 # guard-core-engine binary_noise_gate honesty tests instead.
 #
-# Drift semantics (fail-closed, enforced by tests/conformance.rs and src/report.rs):
+# Pipeline-kind suites (spec 4.1.0): entries here name architecture gaps of the
+# rust family's stage composition (no security-headers manager, no CORS, no
+# response-side process_response pass, no suspicious-activity 400 stage, no
+# route ip lists or detection exclusions, no behavior-rule engine, no
+# reference-vocabulary event-bus capture). Each reason is the honest gap, per
+# specs/fixtures/README.md. The rules are fail-closed:
 #   - failing case NOT listed here -> gate fails (unbaselined failure)
 #   - listed case that now PASSES  -> gate fails (stale baseline; remove the entry)
 #   - failing case listed here     -> xfail (tolerated, reported four-way)
 spec_version = '4.1.0'
-cases = []
+cases = [
+  { case = 'pipeline_behavior_rules::return_pattern_rule_bans_after_threshold', reason = "no behavior-rule engine port: the process_response drives pass through unmodified and no behavior ban is recorded, and the reference responses carry the security-header set the rust family does not render" },
+  { case = 'pipeline_behavior_rules::return_pattern_rule_below_threshold_no_ban', reason = "no behavior-rule engine port, and the reference 404 responses carry the unrendered security-header set" },
+  { case = 'pipeline_behavior_rules::return_pattern_rule_passive_mode_never_bans', reason = "no behavior-rule engine port, and the reference 404 responses carry the unrendered security-header set" },
+  { case = 'pipeline_detection_response::attack_blocked_400_contract_body', reason = "the reference 400 'Suspicious activity detected' answer belongs to the suspicious-activity stage, which has no tower counterpart (the detection feed answers only at the ban threshold); the reference response also carries the unrendered security-header set" },
+  { case = 'pipeline_detection_response::attack_custom_error_response_overrides_body', reason = "no 400 suspicious-activity stage to carry the custom_error_responses override, and the reference response carries the unrendered security-header set" },
+  { case = 'pipeline_detection_response::attack_on_block_payload_active', reason = "no 400 suspicious-activity stage: the active detection emits no block answer and fires no on_block payload below the ban threshold; the reference response also carries the unrendered security-header set" },
+  { case = 'pipeline_detection_response::route_detection_exclusion_allows_attack', reason = "the route detection toggle resolves through the ported detection_exclusions seam (drive 1 compares clean), but drive 2 expects the unported 400 suspicious-activity answer with its security-header set" },
+  { case = 'pipeline_detection_response::route_excluded_detection_header', reason = "the header exclusion resolves through the ported detection_exclusions seam (xss still detects from the excluded header, as in the reference), but the drive expects the unported 400 answer with its security-header set" },
+  { case = 'pipeline_detection_response::second_attack_hits_400_without_ban', reason = "no 400 suspicious-activity stage: every attack drive passes through instead of answering the contract body (whose reference responses also carry the unrendered security-header set)" },
+  { case = 'pipeline_headers_cors::error_response_carries_default_security_headers', reason = "no security-headers manager port (and no 400 suspicious-activity stage to render them on)" },
+  { case = 'pipeline_headers_cors::disabled_security_headers_on_error_response', reason = "no 400 suspicious-activity stage: the attack drive passes through instead of answering the contract body (this case would otherwise compare clean with headers disabled)" },
+  { case = 'pipeline_headers_cors::custom_security_headers_on_error_response', reason = "no security-headers manager port, and no 400 suspicious-activity stage to render them on" },
+  { case = 'pipeline_headers_cors::cors_allowed_origin_echoed_on_response', reason = "no CORS or security-headers port: the process_response pass renders no headers on the response" },
+  { case = 'pipeline_headers_cors::cors_disallowed_origin_gets_no_cors_headers', reason = "no CORS or security-headers port: the process_response pass renders no headers on the response" },
+  { case = 'pipeline_headers_cors::cors_wildcard_with_credentials_blocked', reason = "no CORS or security-headers port: the process_response pass renders no headers on the response" },
+  { case = 'pipeline_headers_cors::cors_disabled_no_cors_headers', reason = "no security-headers port: the process_response pass renders no headers on the response" },
+  { case = 'pipeline_ip_control::ip_blacklist_forbidden', reason = "the gate decision and on_block reason match, but the reference block response carries the security-header set the rust family does not render" },
+  { case = 'pipeline_ip_control::blacklist_beats_exemption', reason = "the gate decision and on_block reason match, but the reference block response carries the security-header set the rust family does not render" },
+  { case = 'pipeline_ip_control::non_exempt_user_agent_blocked', reason = "the user-agent block matches (status, body, on_block), but the reference response carries the security-header set the rust family does not render" },
+  { case = 'pipeline_ip_control::geo_blocked_country_denied', reason = "the geo gate decision and on_block reason match, but the reference block response carries the security-header set the rust family does not render" },
+  { case = 'pipeline_ip_control::geo_whitelist_mode_denies_unresolved', reason = "the geo gate decisions and on_block reasons match, but the reference block responses carry the security-header set the rust family does not render" },
+  { case = 'pipeline_ip_control::exempt_ip_still_country_blocked', reason = "the geo gate blocks the exempt IP correctly, but the reference block response carries the security-header set the rust family does not render" },
+  { case = 'pipeline_ip_control::route_ip_whitelist_denies_other_ip', reason = "route ip_whitelist/ip_blacklist have no rust port: the route-denied drive passes through instead of the 403 Forbidden shape (whose reference response also carries the unrendered security-header set)" },
+  { case = 'pipeline_ip_control::route_blacklisted_user_agent', reason = "the route user-agent block matches (status, body, on_block), but the reference response carries the security-header set the rust family does not render" },
+  { case = 'pipeline_rate_limits::global_limit_429_with_retry_after', reason = "the 429 shape (status, body, Retry-After) matches, but the reference response carries the unrendered security-header set and the stage's on_block reason wording differs ('Rate limit exceeded: N requests in Ws window' vs the reference 'Rate limit exceeded for IP: ...')" },
+  { case = 'pipeline_rate_limits::endpoint_tier_independent_of_global', reason = "the tier decisions match, but the reference 429 responses carry the unrendered security-header set and the stage's on_block reason wording differs" },
+  { case = 'pipeline_rate_limits::route_rate_limit_tier', reason = "the route tier decision matches, but the reference 429 response carries the unrendered security-header set and the stage's on_block reason wording differs" },
+  { case = 'pipeline_rate_limits::rate_limit_passive_mode_allows', reason = "a passive rate-limit crossing emits no on_block payload on the rust stage (event-bus and log emissions only)" },
+]
