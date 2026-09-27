@@ -51,16 +51,17 @@ when Redis is off; the Redis-distributed mode is a follow-up).
 
 | Field | Type | Default | Reference knob |
 |---|---|---|---|
-| `enable_rate_limiting` | `bool` | `false` | `enable_rate_limiting` |
+| `enable_rate_limiting` | `bool` | `true` | `enable_rate_limiting` |
 | `rate_limit` | `u32` | `10` | `rate_limit` (requests per window, >= 1) |
 | `rate_limit_window` | `u64` | `60` | `rate_limit_window` (seconds, >= 1) |
 | `enable_rate_limit_auto_ban` | `bool` | `false` | `enable_rate_limit_auto_ban` |
+| `endpoint_rate_limits` | `HashMap<String, RateLimitEntry>` | empty | `endpoint_rate_limits` (per-endpoint `(requests, window)` tier) |
 
-Two deltas from the Python reference are deliberate: the engine default for
-`enable_rate_limiting` is `false` (Python defaults `true`; the Rust family
-pins the conservative value so enabling is an explicit act), and the config
-constructor fails closed on a zero limit or window (Python's pydantic
-rejects them with `ge=1`).
+The config constructor fails closed on a zero limit or window (Python's
+pydantic rejects them with `ge=1`) and on any `endpoint_rate_limits` entry
+with a zero `requests` or `window`, the same bound the tier entries
+inherit. `RateLimitEntry::new` and `RouteRateLimits::new` carry the same
+fail-closed validation for the tier overrides.
 
 Counting semantics: one sliding log of request timestamps per
 `(client IP, scope)`. Before a request is recorded, every timestamp at or
@@ -77,6 +78,31 @@ Scope: `check(ip, None)` is the global per-IP window (the default pipeline
 tier, every endpoint sharing one budget); `check(ip, Some(path))` is the
 per-endpoint window keyed by `(ip, path)` (the reference's
 `endpoint_path`-keyed tier).
+
+### Rate-limit tiers (`check_tiers`)
+
+`check_tiers(ip, url_path, route, country_of_ip)` runs the reference
+pipeline's tier order (`RateLimitCheck.check` in `rate_limit.py`, via the
+Go port's `tiersFor`/`runTier`). Every configured tier records one hit
+into its own `(ip, path)` window (each tier is an independent budget,
+exactly as the references count), and the first tier that crosses decides
+the outcome with its own window for `Retry-After`:
+
+1. **endpoint** - `endpoint_rate_limits[url_path]` (exact path match);
+2. **route** - the decorator's `rate_limit` (window default 60,
+   `rate_limit_window or 60`);
+3. **geo** - the decorator's `geo_rate_limits`: the resolved country's
+   entry with the `"*"` fallback (`country in limits else "*" in limits`).
+   Without a country resolver the tier never applies (the reference's
+   `if not geo_handler: return None`), even with a `"*"` entry;
+4. **global** - the flat `rate_limit`/`rate_limit_window`, keyed by IP
+   alone.
+
+Without any tier configured the sequence collapses to the global tier:
+byte-identical to the pre-tier behavior. `RouteRateLimits` is the validated
+carrier for the decorator tiers (`None` fields inherit or skip). The
+references always key the route and geo tiers by the request path, so a
+call without a `url_path` runs the global tier only.
 
 ## Dynamic IP bans and the auto-ban engine (ip_ban)
 
@@ -289,10 +315,22 @@ behavior for the two checks the stage owns (`rate_limit`, the ban check of
   (`RateLimitStageConfig { rate_limit, ip_ban }`); construction fails
   closed on any invalid part (rate limit bounds, trusted-proxy entries,
   ban-config validation).
-- Not yet mirrored: the endpoint-rate-limit tier (`endpoint_rate_limits`,
-  route decorators, geo tiers; the stage runs the global per-IP window,
-  the reference default tier), the reference's `passive_mode` (no
-  counterpart in the Rust config surface yet), and the suspicious-activity
+- **Rate-limit tiers**: the service resolves the request path
+  (`request.uri().path()`) and the tier surfaces ride alongside it. The
+  endpoint tier is the config's `endpoint_rate_limits` map; the decorator
+  tiers arrive either as a `RouteRateLimits` request extension (what an
+  adapter's routing layer inserts) or through the builder's
+  `route_resolver` seam (`path -> Option<RouteRateLimits>`, the same
+  route seam the request-limits and user-agent stages use; an explicit
+  extension wins). The geo tier resolves its country through the builder's
+  `geo_handler` seam (`Arc<dyn GeoIpHandler>`); without a handler it never
+  applies. A tier crossing answers the same `429` shape with the blocking
+  tier's window and feeds the auto-ban engine exactly as the global tier
+  does. With no tiers configured the stage is byte-identical to the
+  pre-tier global-only behavior.
+- Not mirrored: the reference's per-tier event emissions and reason
+  strings (`EVENT_DECORATOR_VIOLATION` payloads; the decision names the
+  tier instead), `log_activity`, and the suspicious-activity
   `400` answer for a threat below the ban threshold (the detection stage
   has no tower counterpart yet).
 

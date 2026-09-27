@@ -2,6 +2,13 @@
 
 All notable changes to this project.
 
+## [Unreleased]
+
+### Added
+
+- The reference pipeline's rate-limit tiers (`guard_core_engine::rate_limit::RateLimiter::check_tiers`, mirrored from `RateLimitCheck.check` in the reference `rate_limit.py` via the Go port's `tiersFor`/`runTier`): the endpoint tier (`endpoint_rate_limits[url_path]`, the new `RateLimitConfig` map field), the route tier (`RouteRateLimits`, the decorator's `rate_limit` with the reference default window of 60), the geo tier (the decorator's `geo_rate_limits` country map, the resolved country's entry with the `"*"` fallback, resolved through a `GeoIpHandler` and never applied without one), and the global tier. Every configured tier records one hit into its own `(ip, path)` window (independent budgets, exactly as the references count) and the first tier that crosses decides, naming its tier and carrying its window for `Retry-After`. The tier entries (`RateLimitEntry::new`, `RouteRateLimits::new`, and the limiter config constructor) fail closed on zero requests or windows (`ge=1`). Without any tier configured the behavior is byte-identical to the previous global-only window
+- The tier surfaces on the tower stage (`guard_core_rs::tower`): `RateLimitStage::decide_for_path` resolves the endpoint tier from the request path, the decorator tiers from a `RouteRateLimits` request extension or the builder's `route_resolver` seam (`path -> Option<RouteRateLimits>`, the same route seam the request-limits and user-agent stages use; the extension wins), and the geo tier from the builder's `geo_handler` seam (`Arc<dyn GeoIpHandler>`); a tier crossing answers the same `429` + `Retry-After` shape and feeds the auto-ban engine exactly as the global tier does; `decide` keeps its signature and runs the global tier only
+
 ## [4.1.0] - 2026-09-26
 
 ### Added
