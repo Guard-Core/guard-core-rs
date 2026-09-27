@@ -8,6 +8,11 @@
 //!
 //! Re-exports the detection engine modules:
 //!
+//! - [`detection_exclusions`] - the per-route detection exclusion resolution
+//!   and the multi-surface request scan (`scan_request`): excluded
+//!   headers/params/body fields, enabled detection categories, and the
+//!   detection scan-body toggle, resolved from the global config and the
+//!   route config exactly as the reference's `_resolve_*` helpers do
 //! - [`compiler`] - regex pattern compilation with LRU caching and ReDoS safety validation
 //! - [`detect`] - the spec 4.0.2 detection pipeline entry point (`detect`, [`detect::DetectConfig`],
 //!   [`detect::DetectVerdict`])
@@ -59,5 +64,6 @@ pub mod user_agent;
 
 pub use guard_core_engine::compiler;
 pub use guard_core_engine::detect;
+pub use guard_core_engine::detection_exclusions;
 pub use guard_core_engine::preprocessor;
 pub use guard_core_engine::semantic;

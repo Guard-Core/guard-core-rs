@@ -191,6 +191,48 @@ before the first `:`) to one of `query_param`, `header`, `url_path`,
 filters; embedded-JSON leaf contexts (a `:embedded_json` suffix) keep the
 suffix for validator scoping.
 
+## Per-route detection exclusions (detection_exclusions)
+
+The per-request detection exclusion resolution and the multi-surface
+request scan mirror `guard_core/_utils/detection_config.py` and the
+pipeline's `detectThreat` (via the Go port's `detectionexclusions.go`). The
+decision core is `guard_core_engine::detection_exclusions::scan_request`;
+adapters resolve `Some(&DetectionExclusionConfig), Some(&route)` per request
+(the route standing in for `request.state.route_config`) and translate the
+`RequestScanVerdict` into the pipeline's `ThreatFinding`.
+
+Resolution (`resolve`), the reference `_resolve_*` semantics:
+
+| Surface | Route `None` | Route `Some` |
+|---|---|---|
+| `excluded_detection_headers` | defaults + config | merged: defaults + config + route (additive, never a replacement) |
+| `excluded_detection_params` | config | route replaces |
+| `excluded_detection_body_fields` | config | route replaces |
+| `enabled_detection_categories` | config (`None` = every category) | route replaces (an empty set disables every category) |
+| `detection_scan_body` | config (`None` = `true`) | route overrides both directions |
+
+All sets lowercase at resolution time, so matching is case-insensitive.
+
+Scan order (`scan_request`): URL path (`url_path`), query params skipping
+excluded names (`query_param`), headers (`header`; an excluded header is
+not skipped outright - it scans with its known-false-positive categories
+suppressed, `ssrf` for the address-carrying proxy headers and for
+whole-address-chain values, so a payload in the same header still
+detects), then the body surface when `scan_body` is set (form pairs,
+multipart parts, JSON walks, and the blob fallback, each honoring the
+excluded body fields). A value that is a threat but whose categories are
+all filtered out ends the scan clean - the reference's per-value filter is
+terminal, not a reason to keep scanning later values. Regex threats carry
+the category; semantic threats carry none (the reference's semantic
+payloads have no `category` key). Mongo-operator JSON keys
+(`$where`, `$ne`, ...) hit from the walk unfiltered by the category set.
+
+Route toggles: `detection_enabled(global, route)` applies the route's
+`enable_suspicious_detection` over the global `enable_penetration_detection`
+in both directions at request time, and `check_applies` keeps the
+suspicious-activity check alive while the global flag is on or any route
+enables its toggle (the reference `SuspiciousActivityCheck.applies_to`).
+
 ## Request size and content-type limits (request_limits)
 
 The route-scoped size and content gate mirrors the reference engine's

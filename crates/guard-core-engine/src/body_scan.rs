@@ -30,8 +30,9 @@
 //!   binary-like threshold for real payloads.
 //! - JSON number leaves scan the literal JSON text instead of Python's float
 //!   `repr`; JSON `NaN`/`Infinity` extensions are accepted like `json.loads`.
-//! - excluded/sensitive body-field redaction is not modeled: the Rust config
-//!   layer has no such knob, so the exclusion sets are empty.
+//! - excluded body fields (`excluded_detection_body_fields`) arrive as the
+//!   [`ExcludedBodyFields`] set: an excluded form pair, multipart part, or
+//!   JSON entry key is skipped outright, the reference's per-field routing.
 //! - scan budgets (`detection_max_scan_values`/`_max_scan_chars`) are not
 //!   modeled; the input is bounded by the adapter body cap instead.
 
@@ -79,29 +80,89 @@ impl BodyScanValue {
     }
 }
 
+/// The excluded detection body fields: the reference
+/// `excluded_detection_body_fields` set (config or route resolution),
+/// entries lowercased at resolution time.
+///
+/// Case-insensitive matching at the field-name boundary happens here
+/// (`contains` lowercases its input), the reference's
+/// `{k.lower() for k in ...}` coercion.
+#[derive(Debug, Clone, Copy)]
+pub struct ExcludedBodyFields<'a>(&'a std::collections::HashSet<String>);
+
+impl Default for ExcludedBodyFields<'_> {
+    fn default() -> Self {
+        static EMPTY: std::sync::OnceLock<std::collections::HashSet<String>> =
+            std::sync::OnceLock::new();
+        Self(EMPTY.get_or_init(std::collections::HashSet::new))
+    }
+}
+
+impl<'a> ExcludedBodyFields<'a> {
+    /// Carry a resolved (lowercased) exclusion set.
+    #[must_use]
+    pub const fn new(set: &'a std::collections::HashSet<String>) -> Self {
+        Self(set)
+    }
+
+    /// `true` when no fields are excluded.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Case-insensitive membership: the field name lowercased before the
+    /// lookup, like the reference's lowercase comparison.
+    pub(crate) fn contains(self, name: &str) -> bool {
+        self.0.contains(name.to_ascii_lowercase().as_str())
+    }
+}
+
 /// `extractBodyScanValues`: the `_scan_request_body` routing on the lowered
 /// content type - urlencoded form fields, multipart parts, JSON walks, and the
 /// whole-body blob fallback.
 ///
 /// Binary island reduction inside file parts uses
 /// `config.binary_min_run_length`.
+///
+/// The no-exclusions form: identical to
+/// [`extract_body_scan_values_with_exclusions`] with an empty set. The
+/// adapters' existing extraction call sites keep compiling unchanged.
 #[must_use]
 pub fn extract_body_scan_values(
     raw_body: &str,
     content_type: &str,
     config: &DetectConfig,
 ) -> Vec<BodyScanValue> {
+    extract_body_scan_values_with_exclusions(
+        raw_body,
+        content_type,
+        config,
+        ExcludedBodyFields::default(),
+    )
+}
+
+/// [`extract_body_scan_values`] with the excluded detection body fields
+/// carried through: an excluded form pair, multipart part, or JSON entry
+/// key is skipped outright, the reference's per-field routing.
+#[must_use]
+pub fn extract_body_scan_values_with_exclusions(
+    raw_body: &str,
+    content_type: &str,
+    config: &DetectConfig,
+    excluded: ExcludedBodyFields<'_>,
+) -> Vec<BodyScanValue> {
     let lowered = content_type.to_ascii_lowercase();
     if lowered.contains("application/x-www-form-urlencoded") {
-        return append_form_body_values(Vec::new(), raw_body);
+        return append_form_body_values(Vec::new(), raw_body, excluded);
     }
     if lowered.contains("multipart/form-data") {
-        return append_multipart_body_values(Vec::new(), raw_body, content_type, config);
+        return append_multipart_body_values(Vec::new(), raw_body, content_type, config, excluded);
     }
     if lowered.contains("json")
         && let Some(root) = parse_ordered_json(raw_body)
     {
-        return append_json_walk_entries(Vec::new(), &root, REQUEST_BODY_CONTEXT);
+        return append_json_walk_entries(Vec::new(), &root, REQUEST_BODY_CONTEXT, excluded);
     }
     vec![BodyScanValue::plain(raw_body, REQUEST_BODY_CONTEXT)]
 }
@@ -111,10 +172,18 @@ pub fn extract_body_scan_values(
 /// value
 /// (with the embedded JSON walk taking precedence over the raw string, exactly
 /// like `_check_value_enhanced`'s embedded-JSON-first order).
-fn append_form_body_values(mut values: Vec<BodyScanValue>, raw_body: &str) -> Vec<BodyScanValue> {
+fn append_form_body_values(
+    mut values: Vec<BodyScanValue>,
+    raw_body: &str,
+    excluded: ExcludedBodyFields<'_>,
+) -> Vec<BodyScanValue> {
     for pair in parse_form_pairs(raw_body) {
+        // An excluded field name skips the whole pair (name and value).
+        if excluded.contains(&pair.name) {
+            continue;
+        }
         values.push(BodyScanValue::plain(pair.name, REQUEST_BODY_CONTEXT));
-        values = append_field_body_value(values, &pair.value, FORM_FIELD_CONTEXT);
+        values = append_field_body_value(values, &pair.value, FORM_FIELD_CONTEXT, excluded);
     }
     values
 }
@@ -130,10 +199,11 @@ fn append_field_body_value(
     mut values: Vec<BodyScanValue>,
     text: &str,
     ctx: &str,
+    excluded: ExcludedBodyFields<'_>,
 ) -> Vec<BodyScanValue> {
     if let Some(root) = parse_ordered_json(text) {
         let walk_context = format!("{ctx}{}", crate::detect::EMBEDDED_JSON_LEAF_CONTEXT_SUFFIX);
-        values = append_json_walk_entries(values, &root, &walk_context);
+        values = append_json_walk_entries(values, &root, &walk_context, excluded);
     }
     values.push(BodyScanValue::plain(text, ctx));
     values
@@ -148,6 +218,7 @@ fn append_multipart_body_values(
     raw_body: &str,
     content_type: &str,
     config: &DetectConfig,
+    excluded: ExcludedBodyFields<'_>,
 ) -> Vec<BodyScanValue> {
     let (_, params) = parse_media_type_params(content_type);
     let boundary = param_lookup(&params, "boundary").unwrap_or_default();
@@ -157,7 +228,7 @@ fn append_multipart_body_values(
         return values;
     }
     for part in parts {
-        append_multipart_part_values(&mut values, &part, config);
+        append_multipart_part_values(&mut values, &part, config, excluded);
     }
     values
 }
@@ -174,8 +245,14 @@ fn append_multipart_part_values(
     values: &mut Vec<BodyScanValue>,
     part: &MultipartPart<'_>,
     config: &DetectConfig,
+    excluded: ExcludedBodyFields<'_>,
 ) {
     let (name, has_name) = part_disposition_param(part, "name");
+    // An excluded part label skips the whole part (filename entry, part
+    // headers, payload), exactly the reference's excluded-field routing.
+    if has_name && excluded.contains(&name) {
+        return;
+    }
     let (plain_filename, plain_found) = part_disposition_param(part, "filename");
     let (filename, has_filename) = if plain_found {
         (plain_filename, true)
@@ -211,7 +288,12 @@ fn append_multipart_part_values(
     }
     values.push(BodyScanValue::plain(label.as_ref(), REQUEST_BODY_CONTEXT));
     for entry in &entries {
-        *values = append_field_body_value(std::mem::take(values), entry, MULTIPART_FIELD_CONTEXT);
+        *values = append_field_body_value(
+            std::mem::take(values),
+            entry,
+            MULTIPART_FIELD_CONTEXT,
+            excluded,
+        );
     }
 }
 
@@ -497,10 +579,15 @@ mod tests {
     }
 
     fn extract(raw_body: &str, content_type: &str) -> Vec<(String, String)> {
-        extract_body_scan_values(raw_body, content_type, &corpus_config())
-            .into_iter()
-            .map(|v| (v.context, v.content))
-            .collect()
+        extract_body_scan_values_with_exclusions(
+            raw_body,
+            content_type,
+            &corpus_config(),
+            ExcludedBodyFields::default(),
+        )
+        .into_iter()
+        .map(|v| (v.context, v.content))
+        .collect()
     }
 
     #[test]
@@ -639,10 +726,11 @@ mod tests {
 
     #[test]
     fn mongo_operator_key_forces_a_nosql_hit() {
-        let values = extract_body_scan_values(
+        let values = extract_body_scan_values_with_exclusions(
             "{\"$where\": \"1 OR 1=1\"}",
             "application/json",
             &corpus_config(),
+            ExcludedBodyFields::default(),
         );
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].content, "$where");
