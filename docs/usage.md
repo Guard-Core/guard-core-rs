@@ -2,7 +2,7 @@
 
 ## The detect pipeline
 
-`guard_core_rs::detect::detect` is the top-level entry point: the spec 4.0.2
+`guard_core_rs::detect::detect` is the top-level entry point: the spec 4.1.0
 `SusPatternsManager.detect` equivalent. It preprocesses the content, runs the
 reference scan views, applies semantic analysis, and scores the result.
 
@@ -105,13 +105,13 @@ RE2-like and linear-time, so catastrophic backtracking is structurally absent.
 
 ## Conformance
 
-The `guard-core-conformance` crate runs the vendored spec 4.0.2 corpus
+The `guard-core-conformance` crate runs the vendored spec 4.1.0 corpus
 through the Rust pipeline and compares `is_threat`, `threat_score`,
 lengths, detection method, and the threat multiset:
 
 ```sh
 cargo test -p guard-core-conformance -- --nocapture
-# conformance gate: N passed, N failed, N xfail, N not_run (spec 4.0.2)
+# conformance gate: N passed, N failed, N xfail, N not_run (spec 4.1.0)
 ```
 
 Drift handling is fail-closed: unbaselined failures and stale xfails both

@@ -414,28 +414,22 @@ respectively), and the trusted-proxies seam stays on the stage builder
 
 ## What is not implemented (fail-closed honesty)
 
-The port targets spec 4.0.2 and is not complete. Do not expect these yet:
+The port targets spec 4.1.0; the detect stage passes the corpus gate
+(184 cases, zero xfail). The remaining parity gaps are pipeline-side and
+listed here rather than hidden:
 
-- **The 4.x pattern-table scan stage**: the full reference regex table
-  across all scan views has no Rust counterpart yet; the corpus xfail
-  baseline records the resulting divergences (the dominant cause of xfail
-  entries).
-- **Config, pipeline, and handler sections** (Python sections 02, 03,
-  07-12): no `SecurityConfig`, no middleware protocol, no handlers,
-  protocols, or decorators. The global IP gate (`whitelist`, `blacklist`,
-  `exempt_ips`) exists (`ip_gate`), the in-memory rate limiter and dynamic
-  IP ban store exist (`rate_limit`, `ip_ban`), the rate-limit/ban
-  pipeline stage exists for tower stacks (`guard_core_rs::tower`) and as
-  example wirings for actix-web and Rocket (`examples/actix_app`,
-  `examples/rocket_app`), and the route-scoped request size/content gate
-  exists (`request_limits`), but there
-  is no Redis-backed distributed mode, no cloud provider blocking, no
-  user-agent filtering, and no response factory; the remaining pipeline
-  `examples/rocket_app`), and the user-agent filter exists (`user_agent`),
-  but there
-  is no Redis-backed distributed mode, no cloud provider blocking, and no
-  response factory; the remaining pipeline
-  stages and the published framework adapters live in the adapter repos.
+- **Config, pipeline, and handler parity gaps**: no Redis-backed
+  distributed rate-limit mode, no `passive_mode` switch, no
+  endpoint/decorator/geo rate-limit tiers, no Redis event pipeline, and no
+  decorator/protocol layer (that is the adapters' job). Present today: the
+  global IP gate (`whitelist`, `blacklist`, `exempt_ips` via `ip_gate`), the
+  in-memory rate limiter and dynamic IP ban store (`rate_limit`, `ip_ban`),
+  the rate-limit/ban pipeline stage for tower stacks (`guard_core_rs::tower`)
+  plus example wirings for actix-web and Rocket (`examples/actix_app`,
+  `examples/rocket_app`), the route-scoped request size/content gate
+  (`request_limits`), the user-agent filter (`user_agent`), cloud-provider
+  listing (`cloud_provider`), and geo country rules (`geo`). The published
+  framework adapters live in the adapter repos.
 - **`PerformanceMonitor`** and per-scan timeouts, plus a handful of tracked
   detection knobs recorded as unmapped with reasons.
 

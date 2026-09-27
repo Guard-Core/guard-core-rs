@@ -3,12 +3,17 @@
 `guard-core-rs` is the Rust port of the
 [guard-core](https://github.com/rennf93/guard-core) detection engine: the
 framework-agnostic, CPU-bound core of the Guard ecosystem. It is a cargo
-workspace that currently implements content preprocessing, semantic analysis,
-and regex pattern detection, plus a spec 4.0.2 conformance harness.
+workspace that implements the full 4.x detect pipeline (content
+preprocessing, the pattern-table scan stage, semantic analysis, and regex
+pattern detection) plus the pipeline-side surfaces the adapters consume
+(rate limiting, IP bans, geo country rules, cloud provider checks, security
+headers, events, responses), with a spec 4.1.0 conformance harness.
 
-It is a pre-1.0 work in progress: the 4.x pattern-table scan stage and all
-I/O layers are not yet ported, and parity with the Python engine is partial
-(the conformance gate reports the exact pass/xfail split on every run).
+The detect stage passes the vendored spec 4.1.0 corpus (184 cases, zero
+xfail); the remaining parity gaps are pipeline-side (distributed Redis rate
+limiting, `passive_mode`, rate-limit tiers, the suspicious-activity response
+shape) and are listed in the configuration guide's honesty section rather
+than hidden.
 
 ## What it provides
 
@@ -20,10 +25,10 @@ I/O layers are not yet ported, and parity with the Python engine is partial
   detection, attack probability scoring, obfuscation detection, code
   injection risk, and aggregate threat scoring
 - Regex pattern compilation with LRU caching and ReDoS safety validation
-- The `detect` pipeline: the spec 4.0.2 `SusPatternsManager.detect`
+- The `detect` pipeline: the spec 4.1.0 `SusPatternsManager.detect`
   equivalent, with reference view passes and scoring semantics
-- A conformance harness pinning behavior against the vendored spec 4.0.2
-  corpus (163 cases across 11 suites)
+- A conformance harness pinning behavior against the vendored spec 4.1.0
+  corpus (184 detect cases across 12 suites, zero baselined xfail)
 
 ## Ecosystem position
 
