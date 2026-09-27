@@ -488,6 +488,7 @@ impl RateLimitStage {
     /// `log_activity` "suspicious" lines, redacted through the installed
     /// [`ObservabilityConfig`]). The request pieces arrive through
     /// `observation`; `None` composes from what the decision carries.
+    #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn decide_for_path_observed(
         &self,
@@ -597,6 +598,39 @@ impl RateLimitStage {
             }
         }
 
+        // The detection feed (the reference pipeline's suspicious-activity
+        // stage), factored out as [`RateLimitStage::feed_finding`] so a
+        // host whose framework splits the pipeline (Rocket's `on_request`
+        // never sees the body) can feed the body finding through the same
+        // logic without re-recording the rate-limit window.
+        self.feed_finding(Some(ip), whitelisted, finding, observation)
+    }
+
+    /// The detection-feed half of [`RateLimitStage::decide_for_path_observed`]
+    /// as its own entry point: the counters record the finding's categories,
+    /// a crossed threshold bans on the spot (the passive path counts and
+    /// observes only), and the reference emissions fire - but the ban check
+    /// and the rate-limit tiers do NOT run again. This is the tower
+    /// counterpart of feeding the reference's `suspicious_activity` stage
+    /// without paying the `rate_limit` stage twice; for frameworks whose
+    /// pipeline runs in one place, [`RateLimitStage::decide_for_path_observed`]
+    /// already calls it. `Some` is the crossing block answer (`403 "IP has
+    /// been banned"`), exactly what [`RateLimitStage::decide_for_path_observed`]
+    /// would return for the same finding.
+    ///
+    /// `whitelisted` is the global IP gate's skip state (a whitelisted IP
+    /// never feeds - the reference skips a whitelisted IP only; exemption
+    /// never shields counting).
+    #[must_use]
+    pub fn feed_finding(
+        &self,
+        ip: Option<IpAddr>,
+        whitelisted: bool,
+        finding: Option<&ThreatFinding>,
+        observation: Option<&RequestObservation>,
+    ) -> Option<StageResponse> {
+        let ip = ip?;
+        let passive = self.config.passive_mode;
         if let Some(finding) = finding.filter(|finding| finding.is_threat && !whitelisted) {
             let categories: Vec<&str> = finding.categories.iter().map(String::as_str).collect();
             if passive {
@@ -670,7 +704,6 @@ impl RateLimitStage {
                 }
             }
         }
-
         None
     }
 
@@ -2997,5 +3030,146 @@ mod tests {
         stage.counters().record(visitor, &["sqli"]);
         let snapshot = counters.snapshot(visitor);
         assert_eq!(snapshot.get("sqli"), Some(&1));
+    }
+
+    // ---- the feed_finding split (the two-phase frameworks' seam) ----
+
+    #[test]
+    fn feed_finding_after_decide_records_exactly_one_window_hit() {
+        // The two-phase flow (Rocket): the on_request pass decides with the
+        // metadata finding, then the data guard feeds the body finding. The
+        // rate window must record exactly ONE hit across both, and each
+        // finding counts its own categories once.
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 2,
+                ..RateLimitConfig::default()
+            },
+            ip_ban: IpBanConfig {
+                enable_ip_banning: true,
+                auto_ban_threshold: 100,
+                ..IpBanConfig::default()
+            },
+            ..RateLimitStageConfig::default()
+        })
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.96");
+        let metadata_finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["sqli".to_owned()],
+            trigger_info: "metadata".to_owned(),
+        };
+        let body_finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["xss".to_owned()],
+            trigger_info: "body".to_owned(),
+        };
+        assert!(
+            stage
+                .decide_for_path(
+                    Some(visitor),
+                    Some("/submit"),
+                    None,
+                    None,
+                    Some(&metadata_finding)
+                )
+                .is_none()
+        );
+        assert!(
+            stage
+                .feed_finding(Some(visitor), false, Some(&body_finding), None)
+                .is_none()
+        );
+        // The window has one hit, not two: hits 2 and 3 of a limit-2
+        // limiter decide allowed and throttled.
+        assert!(
+            stage.limiter().check(visitor, None).allowed,
+            "the window recorded exactly one hit across decide and feed"
+        );
+        assert!(
+            !stage.limiter().check(visitor, None).allowed,
+            "the second fresh hit crosses the limit-2 window"
+        );
+        // Each finding fed exactly once.
+        let snapshot = stage.counters().snapshot(visitor);
+        assert_eq!(snapshot.get("sqli"), Some(&1));
+        assert_eq!(snapshot.get("xss"), Some(&1));
+    }
+
+    #[test]
+    fn feed_finding_crosses_the_threshold_with_the_same_answer() {
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            ip_ban: IpBanConfig {
+                enable_ip_banning: true,
+                auto_ban_threshold: 100,
+                threat_ban_config: std::iter::once((
+                    "dir_traversal".to_owned(),
+                    ThreatBanEntry {
+                        threshold: 2,
+                        duration: 60,
+                    },
+                ))
+                .collect(),
+                ..IpBanConfig::default()
+            },
+            ..RateLimitStageConfig::default()
+        })
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.97");
+        let finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["dir_traversal".to_owned()],
+            trigger_info: "traversal".to_owned(),
+        };
+        // Violation 1 through the full decide, violation 2 through the
+        // split feed: both count, and the feed answers the same 403 the
+        // decide path would.
+        assert!(
+            stage
+                .decide_for_path(Some(visitor), None, None, None, Some(&finding))
+                .is_none()
+        );
+        let crossed = stage.feed_finding(Some(visitor), false, Some(&finding), None);
+        let crossed = crossed.expect("the crossed threshold bans");
+        assert_eq!(crossed.status, StatusCode::FORBIDDEN);
+        assert_eq!(crossed.body, BAN_CROSSED_BODY);
+        // A whitelisted IP never feeds (the reference skips a whitelisted
+        // IP only), and an unattributed request never feeds.
+        let other = ip("192.0.2.98");
+        assert!(
+            stage
+                .feed_finding(Some(other), true, Some(&finding), None)
+                .is_none()
+        );
+        assert!(
+            stage
+                .feed_finding(None, false, Some(&finding), None)
+                .is_none()
+        );
+        assert_eq!(stage.counters().snapshot(other).len(), 0);
+    }
+    #[test]
+    fn dbg_window_counting() {
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 2,
+                ..RateLimitConfig::default()
+            },
+            ..RateLimitStageConfig::default()
+        })
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.96");
+        let d = stage.limiter().check(visitor, Some("/submit"));
+        println!("after check1: allowed={} count={}", d.allowed, d.count);
+        let d = stage.limiter().check(visitor, Some("/submit"));
+        println!("after check2: allowed={} count={}", d.allowed, d.count);
+        let d = stage.limiter().check(visitor, None);
+        println!("after check3 None: allowed={} count={}", d.allowed, d.count);
+        println!("tracked={}", stage.limiter().tracked_windows());
     }
 }
