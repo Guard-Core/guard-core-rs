@@ -7,7 +7,7 @@ use guard_core_conformance::report::{evaluate, suite_table};
 use guard_core_conformance::run_corpus;
 
 #[test]
-fn conformance_gate_against_spec_4_0_3() {
+fn conformance_gate_against_spec_4_1_0() {
     let corpus = corpus::load_corpus().unwrap_or_else(|e| panic!("corpus load failed: {e}"));
     let knobs = map_knobs(&corpus.index.config_knobs)
         .unwrap_or_else(|e| panic!("knob mapping failed: {e}"));

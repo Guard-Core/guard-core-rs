@@ -63,7 +63,7 @@ jobs:
         run: cargo test --workspace --exclude guard-core-python
 
   conformance:
-    name: Conformance gate (spec 4.0.3)
+    name: Conformance gate (spec 4.1.0)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -85,6 +85,9 @@ jobs:
 
       - name: Conformance gate
         run: cargo test -p guard-core-conformance --test conformance -- --nocapture
+
+      - name: Pipeline conformance gate
+        run: cargo test -p guard-core-conformance --test pipeline_conformance -- --nocapture
 
   msrv:
     name: MSRV (1.92)
