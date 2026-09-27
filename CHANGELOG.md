@@ -2,6 +2,14 @@
 
 All notable changes to this project.
 
+## [4.2.0] - 2026-09-27
+
+### Note
+
+- Parity release: the 17-suite, 219-case conformance corpus at spec 4.1.0 (detect 184/0/0, pipeline 35 passed, 0 failed, 0 xfail, 0 config divergences) is the 4.2.0 parity surface, and the corpus `engine_version` stamp moves with the engine to 4.2.0 so the gate output is a truthful statement about the shipping engine
+- The 4.1.0 family tags were a version-accuracy error and were yanked/unpublished from crates.io; this release republishes the train correctly at 4.2.0
+- Honesty notes: the behavior-rule engine's Redis layout is in-memory only in this port (the reference's distributed behavior-rule storage has no Redis-backed mode here), and the route `ip_whitelist`/`ip_blacklist` list order diverges from the reference: this port denies on a route-blacklist match before a configured route whitelist takes over, while the reference (`check_route_ip_access`) answers a route-whitelist match first (a whitelisted IP passes even when also blacklisted); recorded in the configuration guide's honesty section
+
 ## [Unreleased]
 
 ### Added

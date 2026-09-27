@@ -438,6 +438,15 @@ listed here rather than hidden:
   The published framework adapters live in the adapter repos.
 - **`PerformanceMonitor`** and per-scan timeouts, plus a handful of tracked
   detection knobs recorded as unmapped with reasons.
+- **Behavior-rule storage is in-memory only**: the behavior engine's sliding
+  windows and ban dispatch live in the process-local stores; the reference's
+  Redis-backed layout for behavior rules has no distributed mode in this
+  port.
+- **Route IP-list order**: this port evaluates the route `ip_blacklist`
+  first, then a configured route `ip_whitelist` takes over the route
+  verdict (a miss denies, a match passes); the reference
+  (`check_route_ip_access`) evaluates the route whitelist first, so a
+  whitelisted IP passes even when also blacklisted. Recorded divergence.
 
 ## Conformance knobs
 
