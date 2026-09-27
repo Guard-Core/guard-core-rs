@@ -452,6 +452,9 @@ pub struct RateLimiter {
     config: RateLimitConfig,
     windows: Arc<Mutex<LruCache<WindowKey, VecDeque<f64>>>>,
     clock: Clock,
+    store: Option<Arc<dyn crate::distributed::SlidingWindowStore>>,
+    redis_prefix: String,
+    redis_fail_open: bool,
 }
 
 impl Clone for RateLimiter {
@@ -463,6 +466,9 @@ impl Clone for RateLimiter {
             config: self.config.clone(),
             windows: Arc::clone(&self.windows),
             clock: Arc::clone(&self.clock),
+            store: self.store.clone(),
+            redis_prefix: self.redis_prefix.clone(),
+            redis_fail_open: self.redis_fail_open,
         }
     }
 }
@@ -547,16 +553,177 @@ impl RateLimiter {
             config,
             windows: new_window_store(),
             clock,
+            store: None,
+            redis_prefix: String::from("guard_core:"),
+            redis_fail_open: false,
         })
     }
 
     /// Swap the wall clock. Test seam: production builds use the system
     /// clock; deterministic window-sliding coverage injects a fake.
+    /// Run the limiter over a distributed window store (the reference
+    /// `enable_redis && redis_handler` conjunction): every tier's hit
+    /// records into `{prefix}rate_limit:rate:{ip}[:{endpoint hash}]`
+    /// through one transaction of the reference's four operations, and
+    /// the decision compares the post-recording count with
+    /// `count <= limit` (the Redis formulation; the same boundary as the
+    /// in-memory `count < limit`).
+    ///
+    /// `redis_fail_open = true` mirrors the reference `redis_fail_open`:
+    /// a failing backend call degrades to the in-memory window (the
+    /// `workers x rate_limit` caveat applies); `false` (the default)
+    /// surfaces the failure as `Err` so the caller can answer the
+    /// reference `503 "Redis rate limiting unavailable"`.
     #[must_use]
+    pub fn with_distributed_store(
+        mut self,
+        store: Arc<dyn crate::distributed::SlidingWindowStore>,
+        redis_prefix: &str,
+        redis_fail_open: bool,
+    ) -> Self {
+        self.store = Some(store);
+        redis_prefix.clone_into(&mut self.redis_prefix);
+        self.redis_fail_open = redis_fail_open;
+        self
+    }
+
+    /// [`RateLimiter::check`] over the distributed store: `Err` means a
+    /// failing backend with `redis_fail_open = false`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`](crate::distributed::StoreError) when the backend
+    /// call fails and fail-open is off.
+    pub fn check_distributed(
+        &self,
+        ip: IpAddr,
+        endpoint: Option<&str>,
+    ) -> Result<RateLimitDecision, crate::distributed::StoreError> {
+        if !self.config.enable_rate_limiting {
+            return Ok(RateLimitDecision {
+                allowed: true,
+                count: 0,
+                window: self.config.rate_limit_window,
+            });
+        }
+        let (allowed, count, window) = self.record_and_decide_distributed(
+            ip,
+            endpoint,
+            self.config.rate_limit,
+            self.config.rate_limit_window,
+        )?;
+        Ok(RateLimitDecision {
+            allowed,
+            count,
+            window,
+        })
+    }
+
+    /// [`RateLimiter::check_tiers`] over the distributed store: every
+    /// tier keys its window the way the reference does (endpoint tiers
+    /// keyed with the hashed path segment, the global tier by IP alone).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`](crate::distributed::StoreError) when a tier's
+    /// backend call fails and fail-open is off.
+    pub fn check_tiers_distributed(
+        &self,
+        ip: IpAddr,
+        url_path: Option<&str>,
+        route: Option<&RouteRateLimits>,
+        country_of_ip: Option<&dyn Fn(IpAddr) -> Option<String>>,
+    ) -> Result<TierDecision, crate::distributed::StoreError> {
+        let inert = TierDecision {
+            allowed: true,
+            count: 0,
+            tier: RateLimitTier::Global,
+            window: self.config.rate_limit_window,
+        };
+        if !self.config.enable_rate_limiting {
+            return Ok(inert);
+        }
+        if let Some(path) = url_path {
+            if let Some(entry) = self.config.endpoint_rate_limits.get(path) {
+                let (allowed, count, window) = self.record_and_decide_distributed(
+                    ip,
+                    Some(path),
+                    entry.requests,
+                    entry.window,
+                )?;
+                if !allowed {
+                    return Ok(TierDecision {
+                        allowed,
+                        count,
+                        tier: RateLimitTier::Endpoint,
+                        window,
+                    });
+                }
+            }
+            if let Some(route) = route {
+                if let Some(limit) = route.rate_limit() {
+                    let window = route
+                        .rate_limit_window()
+                        .unwrap_or(DEFAULT_ROUTE_RATE_LIMIT_WINDOW);
+                    let (allowed, count, window) =
+                        self.record_and_decide_distributed(ip, Some(path), limit, window)?;
+                    if !allowed {
+                        return Ok(TierDecision {
+                            allowed,
+                            count,
+                            tier: RateLimitTier::Route,
+                            window,
+                        });
+                    }
+                }
+                if let (Some(limits), Some(country_of_ip)) =
+                    (route.geo_rate_limits(), country_of_ip)
+                {
+                    let country = country_of_ip(ip);
+                    let entry = country
+                        .as_ref()
+                        .and_then(|code| limits.get(code))
+                        .or_else(|| limits.get("*"));
+                    if let Some(entry) = entry {
+                        let (allowed, count, window) = self.record_and_decide_distributed(
+                            ip,
+                            Some(path),
+                            entry.requests,
+                            entry.window,
+                        )?;
+                        if !allowed {
+                            return Ok(TierDecision {
+                                allowed,
+                                count,
+                                tier: RateLimitTier::Geo,
+                                window,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let (allowed, count, window) = self.record_and_decide_distributed(
+            ip,
+            None,
+            self.config.rate_limit,
+            self.config.rate_limit_window,
+        )?;
+        Ok(TierDecision {
+            allowed,
+            count,
+            tier: RateLimitTier::Global,
+            window,
+        })
+    }
+
     pub fn with_clock(clock: Clock) -> Self {
         Self {
             config: RateLimitConfig::default(),
             windows: new_window_store(),
+            store: None,
+            redis_prefix: String::from("guard_core:"),
+            redis_fail_open: false,
             clock,
         }
     }
@@ -575,6 +742,42 @@ impl RateLimiter {
     // nursery lint cannot see through that reference and wants it dropped
     // early. The lock scope below already ends before the decision is built.
     #[allow(clippy::significant_drop_tightening)]
+    /// The distributed hit path: one transaction of the reference's four
+    /// operations over the tier's Redis key, `allowed = count <= limit`
+    /// (the Redis formulation). Fail-open degrades to the in-memory
+    /// window on a backend error; fail-closed surfaces the error.
+    fn record_and_decide_distributed(
+        &self,
+        ip: IpAddr,
+        endpoint: Option<&str>,
+        limit: u32,
+        window_seconds: u64,
+    ) -> Result<(bool, u64, u64), crate::distributed::StoreError> {
+        let Some(store) = &self.store else {
+            return Ok(self.record_and_decide(ip, endpoint, limit, window_seconds));
+        };
+        let now = (self.clock)();
+        let key = endpoint.map_or_else(
+            || crate::distributed::rate_window_key(&self.redis_prefix, ip),
+            |path| crate::distributed::rate_window_key_endpoint(&self.redis_prefix, ip, path),
+        );
+        match store.record_hit(&key, now, window_seconds) {
+            Ok(count) => {
+                let allowed = count <= u64::from(limit);
+                Ok((allowed, count, window_seconds))
+            }
+            Err(error) if self.redis_fail_open => {
+                // The reference `_warn_redis_fail_open_in_memory_fallback`:
+                // with several workers the effective limit is
+                // workers x rate_limit. This port degrades silently per
+                // call; hosts log through their own stack.
+                let _ = error;
+                Ok(self.record_and_decide(ip, endpoint, limit, window_seconds))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn record_and_decide(
         &self,
         ip: IpAddr,
@@ -606,6 +809,7 @@ impl RateLimiter {
             }
             let inside = timestamps.len();
             timestamps.push_back(now);
+            drop(windows);
             inside
         };
         let allowed = inside < usize::try_from(limit).unwrap_or(usize::MAX);
@@ -931,6 +1135,9 @@ mod tests {
                 NonZeroUsize::new(16).expect("above zero"),
             ))),
             clock: fake.clock(),
+            store: None,
+            redis_prefix: String::from("guard_core:"),
+            redis_fail_open: false,
         };
         assert!(limiter.check(ip("192.0.2.1"), None).allowed);
         assert!(limiter.check(ip("192.0.2.1"), None).allowed);
@@ -1087,6 +1294,9 @@ mod tests {
                 NonZeroUsize::new(16).expect("above zero"),
             ))),
             clock: fake.clock(),
+            store: None,
+            redis_prefix: String::from("guard_core:"),
+            redis_fail_open: false,
         };
         let route = RouteRateLimits::new(Some(1), None, None).expect("valid route");
         let visitor = ip("192.0.2.42");
