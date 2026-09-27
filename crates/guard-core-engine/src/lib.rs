@@ -4,6 +4,7 @@ pub mod cloud_provider;
 pub mod compiler;
 pub mod detect;
 pub mod detection_exclusions;
+pub mod distributed;
 pub mod geo;
 pub mod headers_auth;
 pub mod ip_ban;

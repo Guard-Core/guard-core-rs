@@ -146,6 +146,7 @@ use crate::logging::{LogLevel, LogType, log_activity};
 use crate::redact::SensitiveNames;
 use crate::responses::{CustomErrorResponses, OnBlockHook, build_block_payload, fire_block_hook};
 
+pub use guard_core_engine::distributed::{BanStore, SlidingWindowStore};
 pub use guard_core_engine::geo::GeoIpHandler;
 pub use guard_core_engine::ip_ban::{
     BanError, BanRecord, IpBanConfig, IpBanConfigError, IpBanManager, RATE_LIMIT_CATEGORY,
@@ -165,6 +166,10 @@ pub const BAN_CROSSED_BODY: &str = "IP has been banned";
 /// The throttled answer body (`ratelimit_handler.check_rate_limit`'s default
 /// message).
 pub const THROTTLED_BODY: &str = "Too many requests";
+/// The fail-closed Redis-unavailable answer body (the reference raises
+/// `GuardRedisError(503, "Redis rate limiting unavailable")` when
+/// `redis_fail_open` is off).
+pub const REDIS_UNAVAILABLE_BODY: &str = "Redis rate limiting unavailable";
 /// The reason the rate-limit crossing feeds the auto-ban engine under
 /// (`RateLimitCheck._record_rate_limit_autoban`).
 pub const RATE_LIMIT_BAN_REASON: &str = "rate_limit_exceeded";
@@ -373,6 +378,16 @@ pub struct RateLimitStage {
     on_block: Option<OnBlockHook>,
 }
 
+/// The distributed-store installation: the engine seam plus the
+/// reference `redis_prefix` and `redis_fail_open` knobs.
+#[derive(Clone)]
+struct DistributedSeam {
+    window_store: Arc<dyn SlidingWindowStore>,
+    ban_store: Option<Arc<dyn BanStore>>,
+    redis_prefix: String,
+    redis_fail_open: bool,
+}
+
 impl fmt::Debug for RateLimitStage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RateLimitStage")
@@ -407,6 +422,7 @@ impl RateLimitStage {
             events: None,
             observability: None,
             on_block: None,
+            distributed: None,
         }
     }
 
@@ -516,14 +532,30 @@ impl RateLimitStage {
                 // tiered check only; the stage outlives the call.
                 move |ip: IpAddr| handler.get_country(ip)
             });
-            let decision = self.limiter.check_tiers(
+            // The distributed variant degrades to the in-memory window
+            // when no store is installed, and internally under
+            // fail-open; only a fail-closed backend error surfaces, as
+            // the reference 503 (never firing on_block, which the
+            // reference excludes for adapter Redis-unavailable
+            // responses).
+            let Ok(decision) = self.limiter.check_tiers_distributed(
                 ip,
                 path,
                 resolved_route,
                 country_of_ip
                     .as_ref()
                     .map(|f| f as &dyn Fn(IpAddr) -> Option<String>),
-            );
+            ) else {
+                // Fail-closed backend error: the reference 503, which
+                // never fires `on_block` (the reference excludes the
+                // adapter's Redis-unavailable response from the hook).
+                return Some(StageResponse {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    body: REDIS_UNAVAILABLE_BODY,
+                    retry_after: None,
+                    custom_body: None,
+                });
+            };
             if !decision.allowed() {
                 // The reference logs and emits the rate-limited event on
                 // every crossing, passive mode included; only the 429 and
@@ -940,6 +972,7 @@ pub struct RateLimitStageBuilder {
     events: Option<Arc<SecurityEventBus>>,
     observability: Option<Arc<ObservabilityConfig>>,
     on_block: Option<OnBlockHook>,
+    distributed: Option<DistributedSeam>,
 }
 
 impl RateLimitStageBuilder {
@@ -1000,6 +1033,39 @@ impl RateLimitStageBuilder {
         self
     }
 
+    /// Run the limiter and ban engine over a distributed store (the
+    /// reference `enable_redis && redis_handler` conjunction). The
+    /// window/ban keys and the failure semantics are the reference's:
+    /// `redis_fail_open = false` (the default) answers the fail-closed
+    /// `503 "Redis rate limiting unavailable"` on a backend error,
+    /// `true` degrades to the in-memory window. The 503 never fires the
+    /// `on_block` hook, matching the reference's excluded
+    /// Redis-unavailable response.
+    pub fn distributed_store(
+        mut self,
+        window_store: Arc<dyn SlidingWindowStore>,
+        redis_prefix: &str,
+        redis_fail_open: bool,
+    ) -> Self {
+        self.distributed = Some(DistributedSeam {
+            window_store,
+            ban_store: None,
+            redis_prefix: redis_prefix.to_owned(),
+            redis_fail_open,
+        });
+        self
+    }
+
+    /// Attach the ban store the distributed mode shares (the reference
+    /// `{prefix}banned_ips:{ip}` namespace). Only meaningful together
+    /// with [`RateLimitStageBuilder::distributed_store`].
+    pub fn distributed_ban_store(mut self, ban_store: Arc<dyn BanStore>) -> Self {
+        if let Some(distributed) = &mut self.distributed {
+            distributed.ban_store = Some(ban_store);
+        }
+        self
+    }
+
     /// Install the reference `on_block` callback: fired exactly once per
     /// blocked request (and once per passive-mode-flagged request, with
     /// `status_code = None`) with the reference payload keys. Never fired
@@ -1033,11 +1099,23 @@ impl RateLimitStageBuilder {
             .validate()
             .map_err(RateLimitStageError::IpBan)?;
         let clock = self.clock.unwrap_or_else(|| Arc::new(system_clock));
-        let limiter =
+        let mut limiter =
             RateLimiter::with_config_and_clock(self.config.rate_limit.clone(), Arc::clone(&clock))
                 .map_err(RateLimitStageError::RateLimit)?;
-        let bans = IpBanManager::with_trusted_proxies_and_clock(self.trusted_proxies, clock)
+        let mut bans = IpBanManager::with_trusted_proxies_and_clock(self.trusted_proxies, clock)
             .map_err(RateLimitStageError::TrustedProxy)?;
+        if let Some(seam) = &self.distributed {
+            if let Some(ban_store) = &seam.ban_store {
+                bans = bans
+                    .clone()
+                    .with_distributed_store(Arc::clone(ban_store), &seam.redis_prefix);
+            }
+            limiter = limiter.with_distributed_store(
+                Arc::clone(&seam.window_store),
+                &seam.redis_prefix,
+                seam.redis_fail_open,
+            );
+        }
         Ok(RateLimitStage {
             config: self.config,
             limiter,
@@ -2727,5 +2805,104 @@ mod tests {
         );
         let events = seen.lock().expect("sink").clone();
         assert_eq!(events[0].path, "/login?token=[REDACTED]");
+    }
+
+    // ---- distributed store mode (the reference Redis-backed windows
+    // and bans) ----
+
+    use guard_core_engine::distributed::StoreError;
+
+    use guard_core_engine::distributed::MemoryStore;
+
+    #[test]
+    fn fail_closed_distributed_store_answers_the_reference_503() {
+        let store = Arc::new(MemoryStore::default());
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 10,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: false,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .distributed_store(
+            Arc::clone(&store) as Arc<dyn SlidingWindowStore>,
+            "guard_core:",
+            false,
+        )
+        .build()
+        .expect("config");
+        let answer = stage
+            .decide(Some(ip("192.0.2.91")), None, None)
+            .expect("fail closed");
+        assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(answer.body, REDIS_UNAVAILABLE_BODY);
+    }
+
+    #[test]
+    fn fail_open_distributed_store_falls_back_to_the_local_window() {
+        let store = Arc::new(MemoryStore::default());
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: false,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .distributed_store(
+            Arc::clone(&store) as Arc<dyn SlidingWindowStore>,
+            "guard_core:",
+            true,
+        )
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.92");
+        assert!(stage.decide(Some(visitor), None, None).is_none());
+        let throttled = stage.decide(Some(visitor), None, None).expect("throttled");
+        assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn a_live_distributed_store_shares_one_budget_through_the_stage() {
+        let store = Arc::new(MemoryStore::default());
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 2,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: false,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .distributed_store(
+            Arc::clone(&store) as Arc<dyn SlidingWindowStore>,
+            "guard_core:",
+            false,
+        )
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.93");
+        assert!(stage.decide(Some(visitor), None, None).is_none());
+        assert!(stage.decide(Some(visitor), None, None).is_none());
+        let throttled = stage.decide(Some(visitor), None, None).expect("throttled");
+        assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(throttled.custom_body, None);
+        // The hits landed under the reference Redis key layout.
+        assert!(
+            store
+                .windows
+                .lock()
+                .expect("windows")
+                .contains_key("guard_core:rate_limit:rate:192.0.2.93")
+        );
+        let _ = StoreError(String::new());
     }
 }

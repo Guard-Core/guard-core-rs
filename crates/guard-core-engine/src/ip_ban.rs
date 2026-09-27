@@ -323,6 +323,8 @@ pub struct IpBanManager {
     bans: Arc<Mutex<LruCache<IpAddr, BanRecord>>>,
     trusted_proxies: Vec<IpNet>,
     clock: Clock,
+    ban_store: Option<Arc<dyn crate::distributed::BanStore>>,
+    redis_prefix: String,
 }
 
 impl Clone for IpBanManager {
@@ -335,6 +337,8 @@ impl Clone for IpBanManager {
             bans: Arc::clone(&self.bans),
             trusted_proxies: self.trusted_proxies.clone(),
             clock: Arc::clone(&self.clock),
+            ban_store: self.ban_store.clone(),
+            redis_prefix: self.redis_prefix.clone(),
         }
     }
 }
@@ -359,6 +363,8 @@ impl IpBanManager {
     pub fn new() -> Self {
         Self {
             bans: new_ban_store(),
+            ban_store: None,
+            redis_prefix: String::from("guard_core:"),
             trusted_proxies: Vec::new(),
             clock: Arc::new(system_clock),
         }
@@ -411,6 +417,8 @@ impl IpBanManager {
         }
         Ok(Self {
             bans: new_ban_store(),
+            ban_store: None,
+            redis_prefix: String::from("guard_core:"),
             trusted_proxies,
             clock,
         })
@@ -418,10 +426,32 @@ impl IpBanManager {
 
     /// Swap the wall clock. Test seam: production builds use the system
     /// clock; deterministic expiry coverage injects a fake.
+    /// Run the ban engine over a distributed store (the reference
+    /// `redis_handler` seam): ban writes go to
+    /// `{prefix}banned_ips:{ip}` with the ban TTL (a failed write
+    /// degrades to the local store, the reference `except` branch), and
+    /// lookups fall through to the store on a local miss, caching the
+    /// answer (the reference `_check_redis_exact`). A failing lookup
+    /// reads as unbanned locally: the reference propagates the backend
+    /// error into the pipeline's fail-secure handling, which this sync
+    /// `bool` seam cannot express; the deviation is recorded in the
+    /// module docs.
     #[must_use]
+    pub fn with_distributed_store(
+        mut self,
+        store: Arc<dyn crate::distributed::BanStore>,
+        redis_prefix: &str,
+    ) -> Self {
+        self.ban_store = Some(store);
+        redis_prefix.clone_into(&mut self.redis_prefix);
+        self
+    }
+
     pub fn with_clock(clock: Clock) -> Self {
         Self {
             bans: new_ban_store(),
+            ban_store: None,
+            redis_prefix: String::from("guard_core:"),
             trusted_proxies: Vec::new(),
             clock,
         }
@@ -461,6 +491,18 @@ impl IpBanManager {
                 reason: reason.to_owned(),
             },
         );
+        if let Some(store) = &self.ban_store {
+            // The distributed store honors the unclamped TTL (only the
+            // local cache is capped, exactly the reference). A failed
+            // write degrades to the local store above.
+            #[allow(clippy::cast_precision_loss)]
+            let distributed_expiry = (self.clock)() + duration as f64;
+            let _ = store.set_ban(
+                &crate::distributed::ban_key(&self.redis_prefix, ip),
+                distributed_expiry,
+                duration,
+            );
+        }
         Ok(true)
     }
 
@@ -470,14 +512,43 @@ impl IpBanManager {
     pub fn is_banned(&self, ip: IpAddr) -> bool {
         let ip = canonical(ip);
         let now = (self.clock)();
-        let mut bans = self.bans.lock().expect("ban store");
-        match bans.get(&ip) {
-            Some(record) if now <= record.expiry => true,
-            Some(_) => {
-                bans.pop(&ip);
+        {
+            let mut bans = self.bans.lock().expect("ban store");
+            match bans.get(&ip) {
+                Some(record) if now <= record.expiry => return true,
+                Some(_) => {
+                    bans.pop(&ip);
+                }
+                None => {}
+            }
+        }
+        self.check_distributed_ban(ip, now)
+    }
+
+    /// The distributed lookup on a local miss (the reference
+    /// `_check_redis_exact`): a stored expiry at or after `now` counts as
+    /// banned and is cached locally, a stale one is deleted, a backend
+    /// error reads as unbanned.
+    fn check_distributed_ban(&self, ip: IpAddr, now: f64) -> bool {
+        let Some(store) = &self.ban_store else {
+            return false;
+        };
+        match store.get_ban(&crate::distributed::ban_key(&self.redis_prefix, ip)) {
+            Ok(Some(expiry)) if now <= expiry => {
+                self.bans.lock().expect("ban store").put(
+                    ip,
+                    BanRecord {
+                        expiry,
+                        reason: String::from("distributed"),
+                    },
+                );
+                true
+            }
+            Ok(Some(_)) => {
+                let _ = store.delete_ban(&crate::distributed::ban_key(&self.redis_prefix, ip));
                 false
             }
-            None => false,
+            Ok(None) | Err(_) => false,
         }
     }
 
