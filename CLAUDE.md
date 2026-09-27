@@ -3,13 +3,13 @@ Guidance for AI agents (including Claude Code) working in this repository.
 
 ## Project Overview
 
-guard-core-rs is the Rust port of the [guard-core](https://github.com/rennf93/guard-core) detection engine: the framework-agnostic, CPU-bound core of the Guard ecosystem. It is a cargo workspace of five crates that currently implements content preprocessing, semantic analysis, and regex pattern compilation, plus a spec conformance harness. It is a pre-1.0 work in progress: several pipeline stages (most notably the 4.x pattern-table scan stage) and all I/O layers are not yet ported. Do not claim parity with the Python engine in any doc, issue, or PR.
+guard-core-rs is the Rust port of the [guard-core](https://github.com/rennf93/guard-core) detection engine: the framework-agnostic, CPU-bound core of the Guard ecosystem. It is a cargo workspace of five crates that implements the full 4.x detect pipeline (pattern compilation, content preprocessing, the pattern-table scan stage, semantic analysis) plus the pipeline-side surfaces the adapters consume (rate limiting, IP bans, geo country rules, cloud provider checks, security headers, the event bus, responses), with a conformance harness pinning the detect stage to the vendored spec 4.1.0 corpus. Documented divergences from the Python engine live in the CHANGELOG's "Known differences from Python" section; do not claim full parity beyond what that list and the corpus gate prove.
 
 - **Repository**: https://github.com/rennf93/guard-core-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
-- **Version**: 0.0.1 (pre-release; API surface unstable)
-- **Reference implementation**: guard-core (Python), spec 4.0.2
+- **Version**: 4.1.0 (all workspace crates; mirrors guard-core 4.1.0)
+- **Reference implementation**: guard-core (Python), spec 4.1.0
 - **Status**: work in progress. Read [Current Status](#current-status) before writing any code or docs here.
 
 ## Ecosystem Position
@@ -17,29 +17,29 @@ guard-core-rs is the Rust port of the [guard-core](https://github.com/rennf93/gu
 ```
 guard-core (Python)           <- Reference implementation, spec owner (specs/01-14), corpus source
 ├── guard-core-rs (this repo) <- Rust port: detection engine + conformance harness
-│   ├── tower-guard-rs        <- Adapter (scaffold)
-│   ├── axum-guard-rs         <- Adapter (scaffold)
-│   ├── actix-guard-rs        <- Adapter (scaffold)
-│   └── rocket-guard-rs       <- Adapter (scaffold)
+│   ├── tower-guard-rs        <- Adapter (v1.1.0 on crates.io)
+│   ├── axum-guard-rs         <- Adapter (v1.1.0 on crates.io)
+│   ├── actix-guard-rs        <- Adapter (v1.1.0 on crates.io)
+│   └── rocket-guard-rs       <- Adapter (v1.1.0 on crates.io)
 ├── guard-core-go             <- Go port (precedent for the conformance layout)
 └── guard-core-ts             <- TypeScript port
 ```
 
 Per `specs/impl/rs.md` in the reference repo, the engine crate serves two consumers:
 
-1. **Native Rust middleware**: the engine behind the four adapter crates (all currently scaffolds).
+1. **Native Rust middleware**: the engine behind the four adapter crates (all released at v1.1.0).
 2. **Embeddable engine**: PyO3 bindings (`guard-core-python`) exposing the detection sections to Python. The binding surface mirrors only the detection sections (04-06); it is NOT a guard-core replacement and MUST NOT be documented as one.
 
-Ports target **spec 4.0.2**. The conformance corpus is vendored byte-identical from the reference repo with a sha256 manifest, so every behavioral claim can be checked against a pinned, shared fixture set.
+Ports target **spec 4.1.0**. The conformance corpus is vendored byte-identical from the reference repo with a sha256 manifest, so every behavioral claim can be checked against a pinned, shared fixture set.
 
 ## Boundary Rules
 
 - **`guard-core-engine` MUST stay framework-free and I/O-free**: no network, no filesystem access at runtime, no tokio, no async runtime, no framework crates (actix-web, axum, rocket, tower, hyper). Pure, synchronous, CPU-bound functions only.
 - **No panics across the FFI boundary or the public API**: engine malfunctions return typed errors; the fail-closed rule of the reference repo's `conformance.md` applies.
 - **`guard-core-python` (PyO3) exposes detection sections 04-06 only** (`04-detection`, `05-content-pipeline`, `06-suspatterns` in the reference repo's `specs/`). Handlers, config, Redis, IP intelligence, rate limiting, and responses are out of scope. Publish only in lockstep with the engine crate (PyO3 ABI coupling).
-- **`guard-core-rs` (facade crate)** is the planned home for config (section 02), pipeline (section 03), and handlers (sections 07-12) behind `async_trait`. Today it only re-exports the engine modules (`compiler`, `preprocessor`, `semantic`).
+- **`guard-core-rs` (facade crate)** is the home for config (section 02), pipeline (section 03), and handler-side modules (sections 07-12): it re-exports the engine stages (`compiler`, `preprocessor`, `semantic`, `detect`, `detection_exclusions`) and hosts the pipeline-side modules the adapters use (`tower` stage plumbing, `events`, `geo`, `cloud_provider`, `responses`, `headers_auth`, `user_agent`, `redact`, `logging`, `request_limits`).
 - **Adapter crates wire framework types to the engine and contain no security logic.**
-- **Never edit files under `conformance/guard-core-spec-4.0.2/`**: the corpus is vendored byte-identical from the reference repo and protected by a sha256 manifest in `CORPUS.md`. Behavior changes happen in the engine, not the fixtures.
+- **Never edit files under `conformance/guard-core-spec-4.1.0/`**: the corpus is vendored byte-identical from the reference repo and protected by a sha256 manifest in `CORPUS.md`. Behavior changes happen in the engine, not the fixtures.
 
 ## Current Status
 
@@ -54,19 +54,17 @@ Honest state of the port. Verify rather than trust; numbers below were read from
 - **`guard-core-benchmark`**: 4 criterion suites (`compiler`, `detection_engine`, `preprocessor`, `semantic`).
 - **CI**: format check, clippy with `-D warnings`, workspace tests, MSRV 1.92 job, `cargo audit`, `cargo deny`, docs build with warnings as errors, libfuzzer smoke, conformance gate.
 
-### Conformance (on the `feat/conformance-ledger` branch, pending merge to master)
+### Conformance
 
-- Vendored spec 4.0.2 corpus: **163 cases across 11 suites** (xss 22, sqli 22, cmd_injection 18, path_traversal 10, inclusion_sensitive_recon 18, misc_injection 29, encoding 8, semantic 6, benign 15, context_matrix 9, boundaries 6), pinned at reference commit `886f8013`.
-- **Pattern translation ledger** (`conformance/pattern_ledger.toml`): 70 patterns (47 as-is, 3 translated, 20 residual). Every corpus pattern must compile as-is or have a recorded, corpus-verified translation; anything else fails CI. Translated entries are currently all `\Z` to `\z` anchor rewrites.
-- **xfail baseline** (`conformance/xfail_baseline.toml`): 124 baselined cases. With zero drift the gate reports **39 passed / 124 xfail** (163 total). xfail reasons: 119 x "rust engine lacks the 4.x pattern-table scan stage", plus a handful of documented preprocessor divergences.
+- Vendored spec 4.1.0 corpus (`conformance/guard-core-spec-4.1.0/`, pinned at reference commit `0122af02`): **17 suites, 219 cases**, of which the runner consumes the 12 `kind: detect` suites (**184 cases**); the 5 `kind: pipeline` suites (35 cases) are pinned for the go/php/ts pipeline runners.
+- **Pattern translation ledger** (`conformance/pattern_ledger.toml`): every corpus pattern must compile as-is or have a recorded, corpus-verified translation; anything else fails CI.
+- **xfail baseline** (`conformance/xfail_baseline.toml`): **0 baselined cases**. The engine runs the full 4.x detect pipeline (pattern table across the scan views) and passes the detect corpus; the gate reports **184 passed / 0 xfail** with zero drift.
 - Drift handling is **fail-closed**: an unbaselined failure fails the gate, a baselined-but-passing (stale) xfail fails the gate, and an unbaselined not-run case fails the gate.
 
 ### Not yet implemented
 
-- **The 4.x pattern-table scan stage**: the full reference regex pattern table across the scan views (processed / raw / decoded-path-traversal / url-decoded / short-base64) has no Rust counterpart. The conformance detect equivalent therefore hardcodes `regex_anomaly = 0.0` and relies on semantic analysis only; this is the dominant cause of the 124 xfail entries.
-- Config, pipeline, and handler sections (02, 03, 07-12): no handlers, protocols, decorators, or I/O layers exist in Rust.
-- `PerformanceMonitor`, per-scan timeout, tracked-pattern knobs (5 detection knobs are recorded as unmapped with reasons).
-- Open decision, deliberately not settled: ledger-only (stdlib `regex`) vs ledger plus `fancy-regex` for the 20 residual patterns.
+- Config, pipeline, and handler parity gaps versus the reference (opt-in vs default-on stage wiring, `passive_mode`, endpoint/decorator/geo rate-limit tiers, the suspicious-activity response shape, Redis-distributed rate limiting) are recorded here rather than silently absorbed.
+- `PerformanceMonitor` and the monitoring knobs (`detection_compiler_timeout`, `detection_anomaly_threshold`, `detection_slow_pattern_threshold`, `detection_monitor_history_size`, `detection_anomaly_emission_cooldown`, `detection_min_samples_for_anomaly`, `detection_max_tracked_patterns`) are recorded as unmapped with reasons in the knob mapping.
 
 ## Quick Start
 
@@ -107,7 +105,7 @@ cargo clippy --workspace --all-targets --exclude guard-core-python -- -D warning
 # Unit + integration tests (CI gate)
 cargo test --workspace --exclude guard-core-python
 
-# Conformance gate (spec 4.0.2); prints "conformance gate: N passed, N failed, N xfail, N not_run"
+# Conformance gate (spec 4.1.0); prints "conformance gate: N passed, N failed, N xfail, N not_run"
 cargo test -p guard-core-conformance --test conformance -- --nocapture
 
 # Ledger integrity: every corpus pattern is as-is, translated, or residual, exactly one state
@@ -145,7 +143,7 @@ guard-core-rs/
 │   ├── guard-core-python/      # PyO3 bindings (cdylib, Python module name: guard_core_rs)
 │   ├── guard-core-benchmark/   # criterion benches (4 suites, harness = false)
 │   └── guard-core-conformance/ # conformance runner (gate + ledger integrity tests)
-├── conformance/                # vendored spec 4.0.2 corpus, pattern_ledger.toml, xfail_baseline.toml
+├── conformance/                # vendored spec 4.1.0 corpus, pattern_ledger.toml, xfail_baseline.toml
 ├── fuzz/                       # libfuzzer targets: fuzz_preprocess, fuzz_semantic, fuzz_compiler
 ├── scripts/                    # pin-actions.sh (pinact), benches/ (Python-vs-Rust comparison)
 ├── .github/workflows/          # ci.yml, fuzz.yml, greetings/labeler/stale/summary/sync-labels
@@ -153,8 +151,6 @@ guard-core-rs/
 ├── rustfmt.toml, clippy.toml, deny.toml
 └── CHANGELOG.md                # [Unreleased] + "Known differences from Python"
 ```
-
-Note: `guard-core-conformance` and the root `conformance/` directory live on the `feat/conformance-ledger` branch until it merges.
 
 ## Technology Stack
 
@@ -170,7 +166,7 @@ The RE2-like `regex` crate is a structural advantage: section 04's catastrophic-
 ## Testing & Conformance
 
 - **Unit tests**: 55 inline `#[test]` functions (engine: compiler 7, preprocessor 14, semantic 14; conformance: 20), plus 1 doctest in the facade crate. All tests are inline `#[cfg(test)]` modules; there is no shared test-utility crate.
-- **Conformance gate**: runs every corpus case through the Rust detect equivalent (preprocess, then semantic analysis under recorded config knobs), compares `is_threat`, `threat_score` (floats rounded to 6 decimals), `original_length` and `processed_length` (code-point counts), `detection_method`, and `threats` as an order-insensitive multiset. `execution_time` is dropped. The authoritative result is the printed line `conformance gate: N passed, N failed, N xfail, N not_run (spec 4.0.2)`.
+- **Conformance gate**: runs every `kind: detect` corpus case through the full Rust detect pipeline (preprocess, pattern-table scan, semantic analysis under recorded config knobs), compares `is_threat`, `threat_score` (floats rounded to 6 decimals), `original_length` and `processed_length` (code-point counts), `detection_method`, and `threats` as an order-insensitive multiset. `execution_time` is dropped. The authoritative result is the printed line `conformance gate: N passed, N failed, N xfail, N not_run (spec 4.1.0)`.
 - **Knob mapping**: 5 detection knobs are mapped (`detection_max_content_length`, `detection_max_body_inspect_bytes`, `detection_preserve_attack_patterns`, `detection_semantic_threshold`, `detection_threat_score_threshold`); 7 are recorded as unmapped with reasons (e.g. `PerformanceMonitor is not ported`).
 - **Ledger integrity tests**: full coverage, exactly-one-state per pattern, as-is compilation, translated patterns reproducing corpus evidence, residual rejection.
 - **Positions are Unicode code-point indices**, not byte offsets, in all public results and bindings (the engine matches on bytes internally and converts). Keep it that way; the corpus expects Python `match.start()` semantics on `str`.
@@ -203,4 +199,4 @@ The RE2-like `regex` crate is a structural advantage: section 04's catastrophic-
 - [guard-core-go](https://github.com/rennf93/guard-core-go): Go port; precedent for the conformance directory layout.
 - [guard-core-ts](https://github.com/rennf93/guard-core-ts): TypeScript port.
 - [fastapi-guard](https://github.com/rennf93/fastapi-guard), flaskapi-guard, djapi-guard, tornadoapi-guard: Python framework adapters.
-- Rust adapters (all scaffolds): [tower-guard-rs](https://github.com/rennf93/tower-guard-rs), [axum-guard-rs](https://github.com/rennf93/axum-guard-rs), [actix-guard-rs](https://github.com/rennf93/actix-guard-rs), [rocket-guard-rs](https://github.com/rennf93/rocket-guard-rs).
+- Rust adapters (released at v1.1.0): [tower-guard-rs](https://github.com/rennf93/tower-guard-rs), [axum-guard-rs](https://github.com/rennf93/axum-guard-rs), [actix-guard-rs](https://github.com/rennf93/actix-guard-rs), [rocket-guard-rs](https://github.com/rennf93/rocket-guard-rs).

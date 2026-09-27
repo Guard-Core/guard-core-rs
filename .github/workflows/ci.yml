@@ -63,7 +63,7 @@ jobs:
         run: cargo test --workspace --exclude guard-core-python
 
   conformance:
-    name: Conformance gate (spec 4.0.3)
+    name: Conformance gate (spec 4.1.0)
     runs-on: ubuntu-latest
     permissions:
       contents: read
