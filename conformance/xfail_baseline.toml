@@ -1,7 +1,7 @@
-# Expected-fail baseline for the guard-core-rs conformance runner against spec 4.0.3.
+# Expected-fail baseline for the guard-core-rs conformance runner against spec 4.1.0.
 # The engine runs the full 4.x detect pipeline (pattern table across the four
 # scan views, semantic analysis, scoring) and passes the corpus. The corpus is
-# the go/php vendored spec 4.0.3 set: it deliberately excludes full-entropy
+# the reference spec 4.1.0 detect set (detect expectations unchanged since 4.0.3): it deliberately excludes full-entropy
 # random-noise binary cases, whose decode-stage parity gaps are covered by the
 # guard-core-engine binary_noise_gate honesty tests instead.
 #
@@ -9,5 +9,5 @@
 #   - failing case NOT listed here -> gate fails (unbaselined failure)
 #   - listed case that now PASSES  -> gate fails (stale baseline; remove the entry)
 #   - failing case listed here     -> xfail (tolerated, reported four-way)
-spec_version = '4.0.3'
+spec_version = '4.1.0'
 cases = []

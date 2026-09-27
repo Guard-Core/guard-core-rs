@@ -1,7 +1,8 @@
 {
   "suite": "cmd_injection",
-  "spec_version": "4.0.3",
-  "engine_version": "4.0.3",
+  "kind": "detect",
+  "spec_version": "4.1.0",
+  "engine_version": "4.1.0",
   "cases": [
     {
       "id": "cmdi_semicolon_cat",

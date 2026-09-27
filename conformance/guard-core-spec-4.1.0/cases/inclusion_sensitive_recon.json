@@ -1,7 +1,8 @@
 {
   "suite": "inclusion_sensitive_recon",
-  "spec_version": "4.0.3",
-  "engine_version": "4.0.3",
+  "kind": "detect",
+  "spec_version": "4.1.0",
+  "engine_version": "4.1.0",
   "cases": [
     {
       "id": "incl_php_filter",

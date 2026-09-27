@@ -1,9 +1,9 @@
-# Pattern translation ledger for spec 4.0.3.
-# Every distinct regex pattern firing in the vendored corpus (guard-core-spec-4.0.3/cases/) appears in exactly one state.
+# Pattern translation ledger for spec 4.1.0.
+# Every distinct regex pattern firing in the vendored corpus (guard-core-spec-4.1.0/cases/) appears in exactly one state.
 # as_is: compiles unchanged with the regex crate.
 # translated: recorded corpus-verified translation; verified_on lists corpus cases whose recorded (match, position) evidence the translation reproduces.
 # residual: constructs the RE2-family regex crate rejects; no translation attempted. Input for the OPEN decision ledger-only vs ledger+fancy-regex; decide nothing here.
-spec_version = '4.0.3'
+spec_version = '4.1.0'
 
 [[as_is]]
 pattern = '<script[^>]*>[^<]*<\/script\s*>'

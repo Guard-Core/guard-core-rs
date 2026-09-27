@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::Value;
 
-pub const EXPECTED_SPEC_VERSION: &str = "4.0.3";
+pub const EXPECTED_SPEC_VERSION: &str = "4.1.0";
 
 #[derive(Deserialize)]
 pub struct IndexFile {
@@ -21,6 +21,15 @@ pub struct IndexFile {
 #[derive(Deserialize)]
 pub struct SuiteEntry {
     pub case_count: usize,
+    pub kind: Option<String>,
+    pub consumers: Option<Vec<String>>,
+}
+
+impl SuiteEntry {
+    #[must_use]
+    pub fn is_detect(&self) -> bool {
+        self.kind.as_deref().is_none_or(|k| k == "detect")
+    }
 }
 
 #[derive(Deserialize)]
@@ -76,7 +85,7 @@ impl CorpusCase {
 
 #[must_use]
 pub fn corpus_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../conformance/guard-core-spec-4.0.3/cases")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../conformance/guard-core-spec-4.1.0/cases")
 }
 
 #[must_use]
@@ -102,6 +111,11 @@ pub fn load_corpus() -> Result<Corpus, String> {
 
     let mut suites = Vec::new();
     for (name, entry) in &index.suites {
+        if !entry.is_detect() {
+            // Pipeline-kind suites are consumed by the go/php/ts runners; the
+            // rust engine has no pipeline port yet.
+            continue;
+        }
         let path = dir.join(format!("{name}.json"));
         let raw = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let suite: SuiteFile =
