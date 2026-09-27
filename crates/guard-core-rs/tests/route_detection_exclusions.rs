@@ -106,6 +106,7 @@ fn stage() -> RateLimitStage {
             ..IpBanConfig::default()
         },
         passive_mode: false,
+        custom_error_responses: std::collections::HashMap::new(),
     })
     .expect("valid stage config")
 }

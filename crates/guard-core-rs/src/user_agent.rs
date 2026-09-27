@@ -244,6 +244,7 @@ impl UserAgentStage {
             status: StatusCode::FORBIDDEN,
             body: USER_AGENT_BLOCKED_BODY,
             retry_after: None,
+            custom_body: None,
         })
     }
 }
@@ -392,7 +393,7 @@ where
             self.stage
                 .decide(ip, gate, Some(&path), user_agent.as_deref(), finding)
         {
-            let response = render(answer);
+            let response = render(&answer);
             return Box::pin(async move { Ok(response) });
         }
         let future = self.inner.call(request);
@@ -402,7 +403,7 @@ where
 
 /// Render the stage's block answer into the wrapped service's response body
 /// type.
-fn render<ResBody: From<&'static str>>(answer: StageResponse) -> Response<ResBody> {
+fn render<ResBody: From<&'static str>>(answer: &StageResponse) -> Response<ResBody> {
     let mut response = Response::new(ResBody::from(answer.body));
     *response.status_mut() = answer.status;
     response

@@ -54,10 +54,12 @@ use rocket::{Build, Rocket};
 
 /// The fail-secure answer: the stage is not running (no managed state), so
 /// the request is refused rather than passed uninspected.
-const FAIL_SECURE: StageAnswer = StageAnswer {
-    body: "Security check failed",
-    retry_after: None,
-};
+fn fail_secure() -> StageAnswer {
+    StageAnswer {
+        body: "Security check failed".to_owned(),
+        retry_after: None,
+    }
+}
 
 /// Minimal default bodies for statuses a catcher receives without any
 /// stashed stage answer (a `403`/`429`/`500` that did not come from this
@@ -72,16 +74,21 @@ const DEFAULT_500: &str = "500 Internal Server Error";
 /// render: the family shape (bare default body, optional `Retry-After`
 /// seconds). The status travels through the guard's error outcome, so it is
 /// not carried here twice.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct StageAnswer {
-    body: &'static str,
+    body: String,
     retry_after: Option<u64>,
 }
 
-impl From<StageResponse> for StageAnswer {
-    fn from(answer: StageResponse) -> Self {
+impl From<&StageResponse> for StageAnswer {
+    fn from(answer: &StageResponse) -> Self {
         Self {
-            body: answer.body,
+            // The custom_error_responses body override wins over the
+            // family default, exactly the reference response factory.
+            body: answer
+                .custom_body
+                .clone()
+                .unwrap_or_else(|| answer.body.to_owned()),
             retry_after: answer.retry_after,
         }
     }
@@ -141,7 +148,7 @@ impl<'r> FromRequest<'r> for RateLimitGuard {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let Some(stage) = request.rocket().state::<RateLimitStage>() else {
-            stash(request, FAIL_SECURE);
+            stash(request, fail_secure());
             return Outcome::Error((Status::InternalServerError, ()));
         };
 
@@ -155,9 +162,9 @@ impl<'r> FromRequest<'r> for RateLimitGuard {
         let Some(answer) = stage.decide(ip, gate, finding.as_ref()) else {
             return Outcome::Success(Self { _private: () });
         };
-        stash(request, StageAnswer::from(answer));
         let status =
             Status::from_code(answer.status.as_u16()).unwrap_or(Status::InternalServerError);
+        stash(request, StageAnswer::from(&answer));
         Outcome::Error((status, ()))
     }
 }
@@ -187,9 +194,10 @@ pub fn stage_catchers() -> Vec<Catcher> {
 /// the request, a minimal default body otherwise.
 fn render_stashed<'r>(status: Status, request: &'r Request<'_>) -> BoxFuture<'r> {
     let answer = request.local_cache::<Option<StageAnswer>, _>(|| None);
-    let (body, retry_after) = answer.map_or((default_body(status), None), |answer| {
-        (answer.body, answer.retry_after)
-    });
+    let (body, retry_after) = answer.as_ref().map_or_else(
+        || (default_body(status).to_owned(), None),
+        |answer| (answer.body.clone(), answer.retry_after),
+    );
     Box::pin(async move {
         let mut build = Response::build();
         build.status(status).header(ContentType::Plain);
@@ -261,6 +269,7 @@ mod tests {
             },
             ip_ban: IpBanConfig::default(),
             passive_mode: false,
+            custom_error_responses: std::collections::HashMap::new(),
         })
         .clock(clock)
         .build()
@@ -501,6 +510,7 @@ mod tests {
                 ..IpBanConfig::default()
             },
             passive_mode: false,
+            custom_error_responses: std::collections::HashMap::new(),
         })
         .clock(fake.clock())
         .build()
