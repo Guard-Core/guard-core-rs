@@ -8,15 +8,14 @@
 # Pipeline-kind suites (spec 4.1.0): entries here name architecture gaps of the
 # rust family's stage composition. The security-headers manager, CORS, the
 # response-side process_response pass (behavior rules included), the
-# suspicious-activity 400 stage, and the route detection exclusions have all
-# been ported; what remains is the route ip_whitelist/ip_blacklist surface and
-# the reference-vocabulary event-bus capture (the documented `events` skip).
+# suspicious-activity 400 stage, the route detection exclusions, and the route
+# ip_whitelist/ip_blacklist surface have all been ported; the only documented
+# comparison skip is the reference-vocabulary event-bus capture (the
+# `events` key, see the pipeline runner's module docs).
 # Each reason is the honest gap, per specs/fixtures/README.md. The rules are
 # fail-closed:
 #   - failing case NOT listed here -> gate fails (unbaselined failure)
 #   - listed case that now PASSES  -> gate fails (stale baseline; remove the entry)
 #   - failing case listed here     -> xfail (tolerated, reported four-way)
 spec_version = '4.1.0'
-cases = [
-  { case = 'pipeline_ip_control::route_ip_whitelist_denies_other_ip', reason = "route ip_whitelist/ip_blacklist have no rust port: the route-denied drive passes through instead of the 403 Forbidden shape (which now renders the security-header set the port applies to every block answer)" },
-]
+cases = []
