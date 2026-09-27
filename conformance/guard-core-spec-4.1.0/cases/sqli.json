@@ -1,7 +1,8 @@
 {
   "suite": "sqli",
-  "spec_version": "4.0.3",
-  "engine_version": "4.0.3",
+  "kind": "detect",
+  "spec_version": "4.1.0",
+  "engine_version": "4.1.0",
   "cases": [
     {
       "id": "sqli_or_tautology",
