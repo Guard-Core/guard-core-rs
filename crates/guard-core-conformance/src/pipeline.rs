@@ -24,19 +24,25 @@
 //!
 //! Where the Rust architecture has no port yet, the case still runs and
 //! the diffs land in the fail-closed xfail baseline
-//! (`conformance/xfail_baseline.toml`) with the reason. The known gaps:
-//! the security-headers manager (every blocked response in the corpus
-//! carries the reference header set), CORS, the response-side
-//! `process_response` pass, the suspicious-activity `400` answer (see the
-//! `guard_core_rs::tower` module docs: the 400 belongs to a stage with no
-//! tower counterpart), route `ip_whitelist` / `ip_blacklist`, route
-//! detection exclusions, `bypassed_checks`, and the behavior-rule engine.
+//! (`conformance/xfail_baseline.toml`) with the reason. The ported
+//! surfaces: the security-headers manager
+//! (`guard_core_engine::security_headers`, applied to every blocked and
+//! `process_response` answer), CORS (`guard_core_engine::cors`), the
+//! response-side `process_response` pass with the behavior-rule engine
+//! (`guard_core_rs::process_response` + `guard_core_engine::behavior`,
+//! sharing the stages' ban store), and the suspicious-activity `400`
+//! answer (the detection feed answers the contract body below the ban
+//! threshold). The remaining gap: route `ip_whitelist` /
+//! `ip_blacklist`.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
+use guard_core_engine::behavior::{BehaviorTracker, rule_from_config};
+use guard_core_engine::cors::{CorsConfig, downgrade_wildcard_credentials};
 use guard_core_engine::detect::{self, DetectConfig};
 use guard_core_engine::detection_exclusions::{
     self, DetectionExclusionConfig, RouteDetectionExclusions,
@@ -44,14 +50,19 @@ use guard_core_engine::detection_exclusions::{
 use guard_core_engine::geo::{
     self, CountryGate, GeoIpHandler, check_countries, generic_list_block_reason,
 };
+use guard_core_engine::ip_ban::IpBanManager;
 use guard_core_engine::ip_gate::{IpGateConfig, IpGateVerdict};
 use guard_core_engine::rate_limit::{RateLimitEntry, RouteRateLimits};
+use guard_core_engine::security_headers::{
+    self as security_headers_engine, CspDirective, HstsConfig, SecurityHeadersConfig,
+};
 use guard_core_engine::user_agent::UserAgentFilter;
+use guard_core_rs::process_response::{RequestBits, ResponseBits, ResponseProcessor};
 use guard_core_rs::redact::SensitiveNames;
 use guard_core_rs::responses::{OnBlockHook, resolve_error_body};
 use guard_core_rs::tower::{
     IpBanConfig, ObservabilityConfig, RateLimitConfig, RateLimitStage, RateLimitStageConfig,
-    RequestObservation, ThreatFinding,
+    RequestObservation, ThreatFinding, ViolationCounters,
 };
 use guard_core_rs::user_agent::{UserAgentStage, UserAgentStageConfig};
 use serde::Deserialize;
@@ -165,6 +176,11 @@ pub struct CaseEngine {
     passive: bool,
     detect_config: DetectConfig,
     payloads: Arc<Mutex<Vec<Value>>>,
+    /// The rendered security-header set (`security_headers_manager
+    /// .get_headers`); empty when the headers feature is disabled.
+    security_headers: BTreeMap<String, String>,
+    /// The response-side pass (behavior rules + headers + CORS).
+    processor: ResponseProcessor,
 }
 
 /// The route table entry: the rate tier the family ports plus the
@@ -211,6 +227,14 @@ fn config_bool(config: &Value, key: &str, default: bool) -> bool {
     config_value(config, key)
         .and_then(Value::as_bool)
         .unwrap_or(default)
+}
+
+/// Case-insensitive header lookup (the adapters' header maps).
+fn header_value(headers: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
 }
 
 impl CaseEngine {
@@ -310,6 +334,11 @@ impl CaseEngine {
             }
         });
 
+        // The shared ban store: the reference singleton `ip_ban_manager`
+        // the behavior dispatch and the pipeline's ban check both see.
+        let bans = IpBanManager::new();
+        let counters = ViolationCounters::new();
+
         let rl_stage = RateLimitStage::builder(RateLimitStageConfig {
             rate_limit,
             ip_ban,
@@ -317,6 +346,7 @@ impl CaseEngine {
             custom_error_responses: custom_error_responses.clone(),
         })
         .on_block(hook)
+        .ban_manager(bans.clone(), counters)
         .observability(ObservabilityConfig {
             sensitive: SensitiveNames::default(),
             ..ObservabilityConfig::default()
@@ -384,6 +414,76 @@ impl CaseEngine {
             );
         }
 
+        // The security-headers manager surface: the reference
+        // `security_headers` dict (absent on the config = the
+        // `SecurityConfig` default block), resolved once per case the way
+        // the reference resolves `get_headers` against the config.
+        let headers_config = match config_value(config, "security_headers") {
+            Some(value) => security_headers_config_from(value)?,
+            None => SecurityHeadersConfig::reference_default(),
+        };
+        let security_headers = security_headers_engine::security_headers(&headers_config);
+
+        // The CORS config (`_compute_cors_config`): a disabled switch
+        // resolves to no CORS surface; wildcard + credentials downgrades
+        // at resolution time.
+        let cors = if config_bool(config, "enable_cors", false) {
+            let mut cors = CorsConfig {
+                enabled: true,
+                allow_origins: config_strings(config, "cors_allow_origins"),
+                allow_methods: {
+                    let methods = config_strings(config, "cors_allow_methods");
+                    if methods.is_empty() {
+                        CorsConfig::default().allow_methods
+                    } else {
+                        methods
+                    }
+                },
+                allow_headers: {
+                    let headers = config_strings(config, "cors_allow_headers");
+                    if headers.is_empty() {
+                        CorsConfig::default().allow_headers
+                    } else {
+                        headers
+                    }
+                },
+                allow_credentials: config_bool(config, "cors_allow_credentials", false),
+            };
+            if cors.allow_origins.is_empty() {
+                cors.allow_origins = CorsConfig::default().allow_origins;
+            }
+            downgrade_wildcard_credentials(&mut cors);
+            Some(cors)
+        } else {
+            None
+        };
+
+        // The behavior-rule engine: the reference `BehaviorTracker` plus
+        // the global return_pattern rules, sharing the ban store with the
+        // pipeline stages.
+        let global_rules = config_value(config, "global_behavior_rules")
+            .and_then(Value::as_array)
+            .map(|rules| {
+                rules
+                    .iter()
+                    .map(|cfg| {
+                        rule_from_config(cfg).ok_or_else(|| format!("invalid behavior rule: {cfg}"))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?;
+        let scan_response_body = config_bool(config, "behavior_scan_response_body", false);
+        let processor = ResponseProcessor::new(
+            Some(headers_config),
+            cors,
+            global_rules.unwrap_or_default(),
+            Arc::new(Mutex::new(BehaviorTracker::new())),
+            bans,
+            scan_response_body,
+            262_144,
+            passive,
+        );
+
         Ok(Self {
             gate,
             geo_gate,
@@ -394,6 +494,8 @@ impl CaseEngine {
             passive,
             detect_config,
             payloads,
+            security_headers,
+            processor,
         })
     }
 
@@ -403,7 +505,10 @@ impl CaseEngine {
 
     /// The pipeline-stage pass over one drive, in the reference order:
     /// global IP gate, geo country rules, user-agent stage, then the
-    /// rate-limit stage (bans, tiers, detection feed).
+    /// rate-limit stage (bans, tiers, detection feed). Blocked answers
+    /// carry the security-header set, exactly like the reference
+    /// `create_error_response`.
+    #[allow(clippy::too_many_lines)]
     fn drive(&self, drive: &PipelineDrive) -> Observation {
         let mut record = Observation {
             is_exempt: Some(false),
@@ -419,12 +524,28 @@ impl CaseEngine {
         let method = drive.method.as_deref().unwrap_or("GET");
 
         if drive.stage.as_deref().unwrap_or("pipeline") == "process_response" {
-            // No Rust port of the reference `process_response` pass (the
-            // security-headers manager, CORS, and the behavior rules all
-            // live there): the response passes through untouched, which is
-            // exactly what the family renders today.
-            record.status = Some(drive.response_status.unwrap_or(200));
-            record.body = Some(drive.response_body.clone().unwrap_or_else(|| "ok".into()));
+            // The response-side pass (`ErrorResponseFactory
+            // .process_response`): the behavior rules evaluate the
+            // produced response (a tripped ban lands in the shared ban
+            // store the pipeline drives see), then the security headers
+            // and the CORS verdict land on the response. Return rules
+            // never modify the response.
+            let mut response = ResponseBits {
+                status: drive.response_status.unwrap_or(200),
+                body: Some(drive.response_body.clone().unwrap_or_else(|| "ok".into())),
+                headers: BTreeMap::new(),
+            };
+            let request = RequestBits {
+                method: method.to_owned(),
+                url_path: path.to_owned(),
+                client_ip: ip.to_string(),
+                origin: header_value(&drive.headers, "origin"),
+            };
+            self.processor
+                .process(&request, &mut response, None, SystemTime::now());
+            record.status = Some(response.status);
+            record.body = response.body;
+            record.headers = response.headers;
             return record;
         }
 
@@ -533,6 +654,14 @@ impl CaseEngine {
             record.on_block.extend(seen.drain(..));
         }
 
+        // Every rendered (non-passive) answer carries the security-header
+        // set, exactly like the reference `create_error_response`.
+        if record.status.is_some() {
+            for (name, value) in &self.security_headers {
+                record.headers.insert(name.clone(), value.clone());
+            }
+        }
+
         record
     }
 
@@ -558,6 +687,11 @@ impl CaseEngine {
         record.status = render_status;
         if render_status.is_some() {
             record.body = Some(body.to_owned());
+            // The reference `create_error_response` applies the
+            // security-header set to every block answer.
+            for (name, value) in &self.security_headers {
+                record.headers.insert(name.clone(), value.clone());
+            }
         }
         record.on_block.push(payload_json(
             check_name,
@@ -610,24 +744,25 @@ impl CaseEngine {
             route.and_then(|r| r.exclusions.as_ref()),
         );
 
-        let mut sources: Vec<(&str, String, &'static [&'static str])> = Vec::new();
+        let mut sources: Vec<(String, String, &'static [&'static str])> = Vec::new();
         if resolved.scan_body
             && let Some(body) = drive.body.as_deref().filter(|body| !body.is_empty())
         {
-            sources.push(("request_body", body.to_owned(), &[]));
+            sources.push(("request_body".to_owned(), body.to_owned(), &[]));
         }
         let mut names: Vec<&String> = drive.headers.keys().collect();
         names.sort();
         for name in names {
-            let skip: &'static [&'static str] = if resolved
-                .excluded_headers
-                .contains(&name.to_ascii_lowercase())
-            {
+            // The reference's header maps lowercase the keys, so the
+            // detection trigger label reports the lowercase name
+            // (`Header 'x-skip-scan'`), even for a mixed-case wire name.
+            let lower_name = name.to_ascii_lowercase();
+            let skip: &'static [&'static str] = if resolved.excluded_headers.contains(&lower_name) {
                 detection_exclusions::excluded_header_skip_categories(name, &drive.headers[name])
             } else {
                 &[]
             };
-            sources.push((name.as_str(), drive.headers[name].clone(), skip));
+            sources.push((lower_name, drive.headers[name].clone(), skip));
         }
 
         let mut categories: Vec<String> = Vec::new();
@@ -680,6 +815,88 @@ impl CaseEngine {
             trigger_info,
         }
     }
+}
+
+/// Parse the corpus `security_headers` dict into the engine config (the
+/// `SecurityConfig.security_headers` subset the harness applies verbatim).
+fn security_headers_config_from(value: &Value) -> Result<SecurityHeadersConfig, String> {
+    let dict = value.as_object().ok_or("security_headers: not an object")?;
+    let str_field = |name: &str| {
+        dict.get(name).map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| format!("security_headers.{name}: not a string"))
+        })
+    };
+    let custom = match dict.get("custom") {
+        Some(Value::Null) | None => BTreeMap::new(),
+        Some(value) => {
+            let entries = value
+                .as_object()
+                .ok_or("security_headers.custom: not an object")?;
+            entries
+                .iter()
+                .map(|(name, value)| {
+                    let value = value
+                        .as_str()
+                        .ok_or_else(|| format!("security_headers.custom.{name}: not a string"))?;
+                    Ok((name.clone(), value.to_owned()))
+                })
+                .collect::<Result<BTreeMap<_, _>, String>>()?
+        }
+    };
+    let csp = match dict.get("csp") {
+        Some(Value::Null) | None => Vec::new(),
+        Some(value) => {
+            let directives = value
+                .as_object()
+                .ok_or("security_headers.csp: not an object")?;
+            directives
+                .iter()
+                .map(|(name, sources)| {
+                    Ok(CspDirective {
+                        name: name.clone(),
+                        sources: str_list(sources),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        }
+    };
+    let hsts = match dict.get("hsts") {
+        Some(Value::Null) | None => None,
+        Some(value) => {
+            let hsts = value
+                .as_object()
+                .ok_or("security_headers.hsts: not an object")?;
+            Some(HstsConfig {
+                max_age: hsts.get("max_age").and_then(Value::as_u64),
+                include_subdomains: hsts
+                    .get("include_subdomains")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                preload: hsts
+                    .get("preload")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        }
+    };
+    let config = SecurityHeadersConfig {
+        enabled: dict.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        hsts,
+        csp,
+        frame_options: str_field("frame_options").transpose()?,
+        content_type_options: str_field("content_type_options").transpose()?,
+        xss_protection: str_field("xss_protection").transpose()?,
+        referrer_policy: str_field("referrer_policy").transpose()?,
+        permissions_policy: str_field("permissions_policy").transpose()?,
+        custom,
+    };
+    config
+        .validate()
+        .map_err(|e| format!("security_headers: {e}"))?;
+    Ok(config)
 }
 
 fn endpoint_entry(path: &str, pair: &Value) -> Result<RateLimitEntry, String> {
