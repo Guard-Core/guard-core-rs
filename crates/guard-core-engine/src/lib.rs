@@ -1,7 +1,9 @@
+pub mod behavior;
 pub mod binary_islands;
 pub mod body_scan;
 pub mod cloud_provider;
 pub mod compiler;
+pub mod cors;
 pub mod detect;
 pub mod detection_exclusions;
 pub mod distributed;
@@ -15,5 +17,6 @@ pub mod patterns;
 pub mod preprocessor;
 pub mod rate_limit;
 pub mod request_limits;
+pub mod security_headers;
 pub mod semantic;
 pub mod user_agent;

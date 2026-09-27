@@ -12,6 +12,7 @@ sha2                  = "0.10"
 lru                   = { workspace = true }
 percent-encoding      = { workspace = true }
 regex                 = { workspace = true }
+serde_json            = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [lints.rust]

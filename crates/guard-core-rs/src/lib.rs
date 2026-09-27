@@ -70,6 +70,7 @@ pub mod events;
 pub mod geo;
 pub mod headers_auth;
 pub mod logging;
+pub mod process_response;
 pub mod redact;
 pub mod request_limits;
 pub mod responses;

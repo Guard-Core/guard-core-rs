@@ -67,10 +67,11 @@
 //!   but no `403`/`429` is rendered and the auto-ban feeds are suppressed
 //!   (the reference's passive paths skip `_record_rate_limit_autoban`,
 //!   `_try_threshold_ban`, and `escalate_identity_violation`).
-//! - A detection threat that does not cross a ban threshold passes through
-//!   here; the reference's `400 "Suspicious activity detected"` answer
-//!   belongs to the suspicious-activity stage, which has no tower
-//!   counterpart yet.
+//! - A detection threat that does not cross a ban threshold answers the
+//!   family contract body here: the `400 "Suspicious activity detected"`
+//!   of the reference's suspicious-activity stage (with the
+//!   `custom_error_responses` override), the same answer
+//!   [`RateLimitStage::feed_finding`] returns for the split pipelines.
 //! - The default client IP extraction prefers the peer address a stack
 //!   inserts as a `SocketAddr` extension, then falls back to forwarded
 //!   headers; see [`default_extract_ip`] for the exact policy and the
@@ -163,6 +164,9 @@ pub const BANNED_BODY: &str = "IP address banned";
 /// The crossing-ban answer body (`suspicious_activity`'s "banned" message,
 /// answered on the request whose finding crossed the threshold).
 pub const BAN_CROSSED_BODY: &str = "IP has been banned";
+/// The suspicious-activity answer body (`suspicious_activity`'s contract
+/// 400 message, answered on every flagged request below the ban threshold).
+pub const SUSPICIOUS_BODY: &str = "Suspicious activity detected";
 /// The throttled answer body (`ratelimit_handler.check_rate_limit`'s default
 /// message).
 pub const THROTTLED_BODY: &str = "Too many requests";
@@ -508,7 +512,7 @@ impl RateLimitStage {
                 BANNED_BODY,
                 None,
                 "ip_security",
-                "IP is banned",
+                &format!("Banned IP attempted access: {ip}"),
                 ip,
                 observation,
             ));
@@ -587,13 +591,39 @@ impl RateLimitStage {
                         Some(decision.retry_after()),
                         "rate_limit",
                         &format!(
-                            "Rate limit exceeded: {} requests in {}s window",
+                            "Rate limit exceeded for IP: {ip} ({} requests in {}s window)",
                             decision.count(),
                             decision.retry_after()
                         ),
                         ip,
                         observation,
                     ));
+                }
+                // The passive crossing still fires the hook (the
+                // reference's passive `log_activity` line carries the
+                // payload) with `status_code = None`: no response is ever
+                // sent, the request is only flagged.
+                if let Some(sensitive) = self.sensitive_names() {
+                    let payload = build_block_payload(
+                        "rate_limit",
+                        &format!(
+                            "Rate limit exceeded for IP: {ip} ({} requests in {}s window)",
+                            decision.count(),
+                            decision.retry_after()
+                        ),
+                        "",
+                        true,
+                        &ip.to_string(),
+                        observation
+                            .and_then(|obs| obs.url.as_deref())
+                            .unwrap_or("/"),
+                        observation
+                            .and_then(|obs| obs.method.as_deref())
+                            .unwrap_or(""),
+                        None,
+                        &sensitive,
+                    );
+                    fire_block_hook(self.on_block.as_ref(), &payload);
                 }
             }
         }
@@ -614,9 +644,11 @@ impl RateLimitStage {
     /// counterpart of feeding the reference's `suspicious_activity` stage
     /// without paying the `rate_limit` stage twice; for frameworks whose
     /// pipeline runs in one place, [`RateLimitStage::decide_for_path_observed`]
-    /// already calls it. `Some` is the crossing block answer (`403 "IP has
-    /// been banned"`), exactly what [`RateLimitStage::decide_for_path_observed`]
-    /// would return for the same finding.
+    /// already calls it. `Some` is the block answer the finding earns
+    /// (`403 "IP has been banned"` at the crossing, the `400 "Suspicious
+    /// activity detected"` contract body below it), exactly what
+    /// [`RateLimitStage::decide_for_path_observed`] would return for the
+    /// same finding.
     ///
     /// `whitelisted` is the global IP gate's skip state (a whitelisted IP
     /// never feeds - the reference skips a whitelisted IP only; exemption
@@ -702,6 +734,24 @@ impl RateLimitStage {
                         observation,
                     ));
                 }
+                // Below the ban threshold the flagged request still gets
+                // the family's contract answer: the reference
+                // suspicious-activity stage returns the 400
+                // "Suspicious activity detected" (with the
+                // custom_error_responses override) on every active
+                // detection, not only at the ban crossing.
+                return Some(self.error_response(
+                    StatusCode::BAD_REQUEST,
+                    SUSPICIOUS_BODY,
+                    None,
+                    "suspicious_activity",
+                    &format!(
+                        "Suspicious activity detected for IP: {ip} - {}",
+                        finding.trigger_info
+                    ),
+                    ip,
+                    observation,
+                ));
             }
         }
         None
@@ -1391,6 +1441,14 @@ mod tests {
         assert_eq!(answer.retry_after, None);
     }
 
+    /// The family contract answer on a flagged request below the ban
+    /// threshold: the 400 "Suspicious activity detected".
+    fn assert_flagged_400_shape(answer: &StageResponse) {
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+        assert_eq!(answer.body, SUSPICIOUS_BODY);
+        assert_eq!(answer.retry_after, None);
+    }
+
     #[test]
     fn default_stage_throttles_at_the_reference_threshold() {
         let stage = RateLimitStage::new(RateLimitStageConfig::default()).expect("default config");
@@ -1418,7 +1476,11 @@ mod tests {
             trigger_info: "probe".to_owned(),
         };
         for _ in 1..stage.config().ip_ban.auto_ban_threshold {
-            assert!(stage.decide(Some(attacker), None, Some(&finding)).is_none());
+            assert_flagged_400_shape(
+                &stage
+                    .decide(Some(attacker), None, Some(&finding))
+                    .expect("flagged below the threshold"),
+            );
         }
         // The violation that reaches the flat threshold bans and answers
         // with the crossing-ban shape on the same request.
@@ -1718,10 +1780,13 @@ mod tests {
             trigger_info: "union select".to_owned(),
         };
 
-        // Below the threshold the request passes through: the 400
-        // "Suspicious activity detected" answer belongs to a later stage
-        // this port does not ship yet.
-        assert!(stage.decide(Some(attacker), None, Some(&finding)).is_none());
+        // Below the threshold the request still gets the family's contract
+        // answer: the 400 "Suspicious activity detected".
+        assert_flagged_400_shape(
+            &stage
+                .decide(Some(attacker), None, Some(&finding))
+                .expect("flagged below the threshold"),
+        );
         assert_eq!(stage.counters().snapshot(attacker).get("sqli"), Some(&1));
 
         // The crossing request itself is answered with the crossing-ban
@@ -1790,11 +1855,12 @@ mod tests {
         );
         assert_eq!(stage.counters().tracked_ips(), 0);
 
-        // An exempt IP is never skipped by detection: the finding counts.
-        assert!(
-            stage
+        // An exempt IP is never skipped by detection: the finding counts
+        // and answers the 400 contract shape.
+        assert_flagged_400_shape(
+            &stage
                 .decide(Some(exempt), Some(exempt_gate), Some(&finding))
-                .is_none()
+                .expect("flagged"),
         );
         assert_eq!(stage.counters().snapshot(exempt).get("xss"), Some(&1));
     }
@@ -3066,21 +3132,21 @@ mod tests {
             categories: vec!["xss".to_owned()],
             trigger_info: "body".to_owned(),
         };
-        assert!(
-            stage
+        assert_flagged_400_shape(
+            &stage
                 .decide_for_path(
                     Some(visitor),
                     Some("/submit"),
                     None,
                     None,
-                    Some(&metadata_finding)
+                    Some(&metadata_finding),
                 )
-                .is_none()
+                .expect("flagged"),
         );
-        assert!(
-            stage
+        assert_flagged_400_shape(
+            &stage
                 .feed_finding(Some(visitor), false, Some(&body_finding), None)
-                .is_none()
+                .expect("flagged"),
         );
         // The window has one hit, not two: hits 2 and 3 of a limit-2
         // limiter decide allowed and throttled.
@@ -3127,10 +3193,10 @@ mod tests {
         // Violation 1 through the full decide, violation 2 through the
         // split feed: both count, and the feed answers the same 403 the
         // decide path would.
-        assert!(
-            stage
+        assert_flagged_400_shape(
+            &stage
                 .decide_for_path(Some(visitor), None, None, None, Some(&finding))
-                .is_none()
+                .expect("flagged below the threshold"),
         );
         let crossed = stage.feed_finding(Some(visitor), false, Some(&finding), None);
         let crossed = crossed.expect("the crossed threshold bans");

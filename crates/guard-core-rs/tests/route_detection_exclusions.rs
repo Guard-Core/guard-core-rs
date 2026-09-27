@@ -212,19 +212,20 @@ fn route_scan_body_false_skips_the_body_but_not_the_rest() {
 #[test]
 fn the_detection_feed_bans_through_the_shared_stage() {
     // The adapter translates the verdict into a `ThreatFinding` and feeds
-    // the stage: the second crossing (threshold 2) answers the crossing-ban
-    // shape on the same request, the family's 403 "IP has been banned".
+    // the stage: below the threshold the request answers the 400
+    // "Suspicious activity detected" contract body, and the second
+    // crossing (threshold 2) answers the crossing-ban shape on the same
+    // request, the family's 403 "IP has been banned".
     let stage = stage();
     let attacker = ip("192.0.2.100");
     let finding = scan("/public", &[("q", "<script>alert(1)</script>")], "", "");
     assert!(finding.is_threat);
 
-    assert!(
-        stage
-            .decide_for_path(Some(attacker), Some("/public"), None, None, Some(&finding))
-            .is_none(),
-        "below the threshold the request passes through"
-    );
+    let flagged = stage
+        .decide_for_path(Some(attacker), Some("/public"), None, None, Some(&finding))
+        .expect("below the threshold the request still answers the 400");
+    assert_eq!(flagged.status, http::StatusCode::BAD_REQUEST);
+    assert_eq!(flagged.body, "Suspicious activity detected");
     let answer = stage
         .decide_for_path(Some(attacker), Some("/public"), None, None, Some(&finding))
         .expect("threshold crossed");
