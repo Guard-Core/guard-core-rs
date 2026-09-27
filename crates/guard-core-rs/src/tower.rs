@@ -53,9 +53,14 @@
 //!
 //! ## Scope and honesty
 //!
-//! - The endpoint-rate-limit tier (`endpoint_rate_limits`, route decorators,
-//!   geo tiers) is not ported; the stage runs the global per-IP window only,
-//!   the reference pipeline's default tier.
+//! - The reference pipeline's rate-limit tiers are ported: the
+//!   `endpoint_rate_limits` map lives on [`RateLimitConfig`], and the route
+//!   decorator tiers (`rate_limit`, `rate_limit_window`, `geo_rate_limits`,
+//!   a [`RouteRateLimits`] request extension or a [`RouteRateResolver`])
+//!   resolve per path - see [`RateLimitStage::decide_for_path`]. With no
+//!   tiers configured the stage runs the global per-IP window only, the
+//!   reference pipeline's default tier, byte-identical to the pre-tier
+//!   behavior.
 //! - **Passive mode**: `passive_mode` (the reference `SecurityConfig`
 //!   flag, default `false`) turns every block answer into log-only
 //!   behavior: the sliding window and the violation counters still record,
@@ -131,13 +136,15 @@ use ::tower::Layer;
 use http::header::RETRY_AFTER;
 use http::{Extensions, HeaderMap, HeaderValue, Request, Response, StatusCode};
 
+pub use guard_core_engine::geo::GeoIpHandler;
 pub use guard_core_engine::ip_ban::{
     BanError, BanRecord, IpBanConfig, IpBanConfigError, IpBanManager, RATE_LIMIT_CATEGORY,
     ResolvedBan, ThreatBanEntry, ViolationCounters,
 };
 pub use guard_core_engine::ip_gate::{IpGateDecision, IpGateError};
 pub use guard_core_engine::rate_limit::{
-    Clock, RateLimitConfig, RateLimitConfigError, RateLimiter, system_clock,
+    Clock, RateLimitConfig, RateLimitConfigError, RateLimitEntry, RateLimitTier, RateLimiter,
+    RouteRateLimits, system_clock,
 };
 
 /// The banned answer body (`ip_security._check_banned_ip`'s default message).
@@ -154,6 +161,13 @@ pub const RATE_LIMIT_BAN_REASON: &str = "rate_limit_exceeded";
 /// The reason a detection finding feeds the auto-ban engine under
 /// (`_try_threshold_ban`'s default reason).
 pub const PENETRATION_BAN_REASON: &str = "penetration_attempt";
+
+/// The per-route rate-limit tier resolver: `path -> Option<RouteRateLimits>`.
+///
+/// The tower counterpart of the reference's `request.state.route_config`
+/// (the same seam the request-limits stage's `RouteLimitsResolver` uses).
+/// A resolver returning `None` for a path means the path has no route tier.
+pub type RouteRateResolver = Arc<dyn Fn(&str) -> Option<RouteRateLimits> + Send + Sync>;
 
 /// The detection result a prior pipeline stage may attach to the request
 /// extensions.
@@ -300,6 +314,8 @@ pub struct RateLimitStage {
     bans: IpBanManager,
     counters: ViolationCounters,
     extract_ip: ExtractIp,
+    route_resolver: Option<RouteRateResolver>,
+    geo_handler: Option<Arc<dyn GeoIpHandler>>,
 }
 
 impl fmt::Debug for RateLimitStage {
@@ -331,6 +347,8 @@ impl RateLimitStage {
             clock: None,
             trusted_proxies: Vec::new(),
             extract_ip: None,
+            route_resolver: None,
+            geo_handler: None,
         }
     }
 
@@ -361,28 +379,25 @@ impl RateLimitStage {
         &self.counters
     }
 
-    /// One pass of the stage over the pieces a tower request carries.
+    /// One pass of the stage over a request that carries a URL path: the
+    /// same decision as [`RateLimitStage::decide`] with the reference
+    /// pipeline's rate-limit tiers active. `path` keys the route tiers
+    /// (matched against [`RateLimitConfig`]'s `endpoint_rate_limits` and
+    /// fed through the stage's [`RouteRateResolver`] to resolve the
+    /// decorator tiers, an explicit `route` argument winning when both are
+    /// present), and the geo tier resolves its country through the stage's
+    /// [`GeoIpHandler`] seam.
     ///
-    /// `ip` is the extracted client identity (`None` passes through, the
-    /// reference skips the check without a client IP), `gate` the global IP
-    /// gate's skip state when the stack provides one, and `finding` the
-    /// detection result when the pipeline provides one. `None` means the
-    /// request passes through to the inner service; `Some` is the block
-    /// answer the layer renders.
-    ///
-    /// The order is the reference pipeline's: bans first (no exemption
-    /// skip), then the rate limit (skipped for `is_whitelisted ||
-    /// is_exempt`), then the detection feed (skipped for `is_whitelisted`
-    /// only, since a throttled request never reaches the suspicious-activity
-    /// stage in the reference).
-    ///
-    /// Under [`RateLimitStageConfig::passive_mode`] the observations still
-    /// happen (the window records, the detection categories count) but no
-    /// block answer is rendered and the auto-ban feeds are suppressed: the
-    /// reference's passive paths return `None` where they would block.
-    pub fn decide(
+    /// `None` still means pass-through; a tier crossing answers the same
+    /// `429` + `Retry-After: <blocking tier's window>` shape the global
+    /// tier answers, and feeds the auto-ban engine identically (the
+    /// reference records the crossing under every tier's reason with the
+    /// same `rate_limit` category).
+    pub fn decide_for_path(
         &self,
         ip: Option<IpAddr>,
+        path: Option<&str>,
+        route: Option<&RouteRateLimits>,
         gate: Option<IpGateDecision>,
         finding: Option<&ThreatFinding>,
     ) -> Option<StageResponse> {
@@ -401,8 +416,32 @@ impl RateLimitStage {
         let skip_rate_limit = whitelisted || gate.is_some_and(|gate| gate.is_exempt);
 
         if !skip_rate_limit {
-            let decision = self.limiter.check(ip, None);
-            if !decision.allowed && !passive {
+            // An explicit route argument wins; otherwise the stage's
+            // resolver produces the route tiers from the path.
+            let resolved_from_path;
+            let resolved_route: Option<&RouteRateLimits> =
+                match (route, path, self.route_resolver.as_ref()) {
+                    (Some(route), _, _) => Some(route),
+                    (None, Some(path), Some(resolver)) => {
+                        resolved_from_path = resolver(path);
+                        resolved_from_path.as_ref()
+                    }
+                    (None, _, _) => None,
+                };
+            let country_of_ip = self.geo_handler.as_deref().map(|handler| {
+                // The closure borrows the handler for the duration of the
+                // tiered check only; the stage outlives the call.
+                move |ip: IpAddr| handler.get_country(ip)
+            });
+            let decision = self.limiter.check_tiers(
+                ip,
+                path,
+                resolved_route,
+                country_of_ip
+                    .as_ref()
+                    .map(|f| f as &dyn Fn(IpAddr) -> Option<String>),
+            );
+            if !decision.allowed() && !passive {
                 // The crossing feeds the auto-ban engine with the
                 // `rate_limit` pseudo-category; the 429 still goes out (the
                 // reference returns the limit response either way) and the
@@ -455,6 +494,35 @@ impl RateLimitStage {
 
         None
     }
+
+    /// One pass of the stage over the pieces a tower request carries.
+    ///
+    /// `ip` is the extracted client identity (`None` passes through, the
+    /// reference skips the check without a client IP), `gate` the global IP
+    /// gate's skip state when the stack provides one, and `finding` the
+    /// detection result when the pipeline provides one. `None` means the
+    /// request passes through to the inner service; `Some` is the block
+    /// answer the layer renders.
+    ///
+    /// The order is the reference pipeline's: bans first (no exemption
+    /// skip), then the rate limit (skipped for `is_whitelisted ||
+    /// is_exempt`), then the detection feed (skipped for `is_whitelisted`
+    /// only, since a throttled request never reaches the suspicious-activity
+    /// stage in the reference).
+    ///
+    /// Under [`RateLimitStageConfig::passive_mode`] the observations still
+    /// happen (the window records, the detection categories count) but no
+    /// block answer is rendered and the auto-ban feeds are suppressed: the
+    /// reference's passive paths return `None` where they would block.
+    #[must_use]
+    pub fn decide(
+        &self,
+        ip: Option<IpAddr>,
+        gate: Option<IpGateDecision>,
+        finding: Option<&ThreatFinding>,
+    ) -> Option<StageResponse> {
+        self.decide_for_path(ip, None, None, gate, finding)
+    }
 }
 
 /// The fail-closed builder for [`RateLimitStage`]: every seam is optional
@@ -465,6 +533,8 @@ pub struct RateLimitStageBuilder {
     clock: Option<Clock>,
     trusted_proxies: Vec<String>,
     extract_ip: Option<ExtractIp>,
+    route_resolver: Option<RouteRateResolver>,
+    geo_handler: Option<Arc<dyn GeoIpHandler>>,
 }
 
 impl RateLimitStageBuilder {
@@ -496,6 +566,27 @@ impl RateLimitStageBuilder {
         self
     }
 
+    /// Resolve the per-route rate-limit tiers (`path ->
+    /// Option<RouteRateLimits>`, the tower counterpart of the reference's
+    /// `request.state.route_config`). A `RouteRateLimits` request
+    /// extension, when a stack provides one, wins over the resolver.
+    pub fn route_resolver<F>(mut self, resolver: F) -> Self
+    where
+        F: Fn(&str) -> Option<RouteRateLimits> + Send + Sync + 'static,
+    {
+        self.route_resolver = Some(Arc::new(resolver));
+        self
+    }
+
+    /// Resolve the geolocation the geo rate-limit tier reads (the
+    /// reference `geo_handler.get_country`; the MMDB reading is adapter
+    /// work). Without a handler the geo tier never applies, exactly the
+    /// reference's `if not geo_handler: return None`.
+    pub fn geo_handler(mut self, handler: Arc<dyn GeoIpHandler>) -> Self {
+        self.geo_handler = Some(handler);
+        self
+    }
+
     /// Validate everything and build the stage.
     ///
     /// # Errors
@@ -523,6 +614,8 @@ impl RateLimitStageBuilder {
             extract_ip: self
                 .extract_ip
                 .unwrap_or_else(|| Arc::new(default_extract_ip)),
+            route_resolver: self.route_resolver,
+            geo_handler: self.geo_handler,
         })
     }
 }
@@ -590,7 +683,14 @@ where
         let ip = (self.stage.extract_ip)(request.headers(), request.extensions());
         let gate = request.extensions().get::<IpGateDecision>().copied();
         let finding = request.extensions().get::<ThreatFinding>();
-        if let Some(answer) = self.stage.decide(ip, gate, finding) {
+        // The route tier overrides ride in as a request extension (what an
+        // adapter's routing layer inserts) when the stack provides one.
+        let route = request.extensions().get::<RouteRateLimits>();
+        let path = request.uri().path();
+        if let Some(answer) = self
+            .stage
+            .decide_for_path(ip, Some(path), route, gate, finding)
+        {
             let response = render(answer);
             return Box::pin(async move { Ok(response) });
         }
@@ -1149,6 +1249,371 @@ mod tests {
         );
     }
 
+    /// A fixed-country geo handler for the geo-tier tests.
+    struct FixedCountry(&'static str);
+
+    impl GeoIpHandler for FixedCountry {
+        fn get_country(&self, _ip: IpAddr) -> Option<String> {
+            Some(self.0.to_owned())
+        }
+    }
+
+    fn entry(requests: u32, window: u64) -> RateLimitEntry {
+        RateLimitEntry::new(requests, window).expect("valid entry")
+    }
+
+    #[test]
+    fn endpoint_tier_crosses_at_its_own_limit_and_window() {
+        let fake = FakeClock::default();
+        let stage = stage_with(
+            RateLimitStageConfig {
+                rate_limit: RateLimitConfig {
+                    rate_limit: 10,
+                    endpoint_rate_limits: std::iter::once(("/login".to_owned(), entry(1, 30)))
+                        .collect(),
+                    ..RateLimitConfig::default()
+                },
+                ip_ban: IpBanConfig::default(),
+                passive_mode: false,
+            },
+            fake.clock(),
+        );
+        let visitor = ip("192.0.2.60");
+
+        // The first request passes; the second crosses the endpoint tier
+        // (not the global one) and carries its window in Retry-After.
+        assert!(
+            stage
+                .decide_for_path(Some(visitor), Some("/login"), None, None, None)
+                .is_none()
+        );
+        let answer = stage
+            .decide_for_path(Some(visitor), Some("/login"), None, None, None)
+            .expect("throttled");
+        assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(answer.retry_after, Some(30), "the endpoint tier's window");
+
+        // An unconfigured path still runs the global tier only.
+        assert!(
+            stage
+                .decide_for_path(Some(visitor), Some("/other"), None, None, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn route_tier_rides_in_as_a_request_extension() {
+        let fake = FakeClock::default();
+        let stage = stage_with(
+            RateLimitStageConfig {
+                rate_limit: RateLimitConfig {
+                    rate_limit: 10,
+                    ..RateLimitConfig::default()
+                },
+                ip_ban: IpBanConfig::default(),
+                passive_mode: false,
+            },
+            fake.clock(),
+        );
+        let visitor = ip("192.0.2.61");
+        let route = RouteRateLimits::new(Some(1), Some(45), None).expect("valid route");
+
+        assert!(
+            stage
+                .decide_for_path(Some(visitor), Some("/x"), Some(&route), None, None)
+                .is_none()
+        );
+        let answer = stage
+            .decide_for_path(Some(visitor), Some("/x"), Some(&route), None, None)
+            .expect("throttled");
+        assert_eq!(answer.retry_after, Some(45), "the route tier's window");
+    }
+
+    #[test]
+    fn route_resolver_resolves_the_decorator_tiers_by_path() {
+        let fake = FakeClock::default();
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                rate_limit: 10,
+                ..RateLimitConfig::default()
+            },
+            ip_ban: IpBanConfig::default(),
+            passive_mode: false,
+        })
+        .clock(fake.clock())
+        .route_resolver(|path| {
+            (path == "/admin").then(|| RouteRateLimits::new(Some(1), None, None).expect("route"))
+        })
+        .build()
+        .expect("valid stage config");
+        let visitor = ip("192.0.2.62");
+
+        assert!(
+            stage
+                .decide_for_path(Some(visitor), Some("/admin"), None, None, None)
+                .is_none()
+        );
+        let answer = stage
+            .decide_for_path(Some(visitor), Some("/admin"), None, None, None)
+            .expect("throttled");
+        assert_eq!(
+            answer.retry_after,
+            Some(60),
+            "the reference default route window"
+        );
+
+        // A path the resolver does not know runs the global tier only.
+        assert!(
+            stage
+                .decide_for_path(Some(visitor), Some("/public"), None, None, None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn explicit_route_argument_wins_over_the_resolver() {
+        let fake = FakeClock::default();
+        let stage = RateLimitStage::builder(RateLimitStageConfig::default())
+            .clock(fake.clock())
+            .route_resolver(|_path| {
+                Some(RouteRateLimits::new(Some(1), None, None).expect("valid route"))
+            })
+            .build()
+            .expect("valid stage config");
+        let visitor = ip("192.0.2.63");
+        // The explicit route is inert (no tier configured): the resolver's
+        // tier must not apply.
+        let inert = RouteRateLimits::new(None, None, None).expect("valid route");
+        for _ in 0..5 {
+            assert!(
+                stage
+                    .decide_for_path(Some(visitor), Some("/x"), Some(&inert), None, None)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn geo_tier_needs_the_handler_and_falls_back_to_star() {
+        let fake = FakeClock::default();
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                rate_limit: 100,
+                ..RateLimitConfig::default()
+            },
+            ip_ban: IpBanConfig::default(),
+            passive_mode: false,
+        })
+        .clock(fake.clock())
+        .geo_handler(Arc::new(FixedCountry("RU")))
+        .route_resolver(|_path| {
+            Some(
+                RouteRateLimits::new(
+                    None,
+                    None,
+                    Some(
+                        [
+                            ("RU".to_owned(), entry(1, 60)),
+                            ("*".to_owned(), entry(5, 20)),
+                        ]
+                        .into_iter()
+                        .collect(),
+                    ),
+                )
+                .expect("valid route"),
+            )
+        })
+        .build()
+        .expect("valid stage config");
+        let russian = ip("192.0.2.64");
+
+        assert!(
+            stage
+                .decide_for_path(Some(russian), Some("/x"), None, None, None)
+                .is_none()
+        );
+        let answer = stage
+            .decide_for_path(Some(russian), Some("/x"), None, None, None)
+            .expect("throttled");
+        assert_eq!(
+            answer.retry_after,
+            Some(60),
+            "the resolved country's entry window"
+        );
+
+        // Without a handler the geo tier never applies (the reference's
+        // `if not geo_handler: return None`): an identical config without
+        // the handler runs the global tier only.
+        let stage_no_geo = RateLimitStage::builder(stage.config().clone())
+            .clock(fake.clock())
+            .route_resolver(|_path| {
+                Some(
+                    RouteRateLimits::new(
+                        None,
+                        None,
+                        Some(std::iter::once(("*".to_owned(), entry(1, 60))).collect()),
+                    )
+                    .expect("valid route"),
+                )
+            })
+            .build()
+            .expect("valid stage config");
+        for _ in 0..5 {
+            assert!(
+                stage_no_geo
+                    .decide_for_path(Some(ip("192.0.2.65")), Some("/x"), None, None, None)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn exempt_ip_skips_every_tier() {
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                rate_limit: 10,
+                endpoint_rate_limits: std::iter::once(("/login".to_owned(), entry(1, 60)))
+                    .collect(),
+                ..RateLimitConfig::default()
+            },
+            ip_ban: IpBanConfig::default(),
+            passive_mode: false,
+        })
+        .clock(Arc::new(system_clock))
+        .route_resolver(|_path| {
+            Some(RouteRateLimits::new(Some(1), None, None).expect("valid route"))
+        })
+        .build()
+        .expect("valid stage config");
+        let exempt = ip("192.0.2.66");
+        let gate = IpGateDecision {
+            is_whitelisted: false,
+            is_exempt: true,
+        };
+        for _ in 0..20 {
+            assert!(
+                stage
+                    .decide_for_path(Some(exempt), Some("/login"), None, Some(gate), None)
+                    .is_none(),
+                "an exempt IP skips every tier"
+            );
+        }
+        assert_eq!(stage.limiter().tracked_windows(), 0);
+    }
+
+    #[test]
+    fn tier_crossing_feeds_the_auto_ban_engine_like_the_global_tier() {
+        let fake = FakeClock::default();
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                rate_limit: 100,
+                enable_rate_limit_auto_ban: true,
+                endpoint_rate_limits: std::iter::once(("/login".to_owned(), entry(1, 60)))
+                    .collect(),
+                ..RateLimitConfig::default()
+            },
+            ip_ban: IpBanConfig {
+                enable_ip_banning: true,
+                auto_ban_threshold: 1,
+                ..IpBanConfig::default()
+            },
+            passive_mode: false,
+        })
+        .clock(fake.clock())
+        .build()
+        .expect("valid stage config");
+        let attacker = ip("192.0.2.67");
+
+        assert!(
+            stage
+                .decide_for_path(Some(attacker), Some("/login"), None, None, None)
+                .is_none()
+        );
+        let answer = stage
+            .decide_for_path(Some(attacker), Some("/login"), None, None, None)
+            .expect("throttled");
+        assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(stage.bans().is_banned(attacker), "the tier crossing banned");
+        assert_eq!(
+            stage.bans().ban_record(attacker).expect("record").reason,
+            RATE_LIMIT_BAN_REASON
+        );
+    }
+
+    #[test]
+    fn layer_wires_the_path_through_the_tiered_decision() {
+        let layer = RateLimitStageLayer::new(
+            RateLimitStage::builder(RateLimitStageConfig {
+                rate_limit: RateLimitConfig {
+                    rate_limit: 10,
+                    endpoint_rate_limits: std::iter::once(("/login".to_owned(), entry(1, 90)))
+                        .collect(),
+                    ..RateLimitConfig::default()
+                },
+                ip_ban: IpBanConfig::default(),
+                passive_mode: false,
+            })
+            .build()
+            .expect("valid stage config"),
+        );
+        let inner = Inner::new();
+        let mut service = ServiceBuilder::new().layer(layer).service(inner.clone());
+
+        let mut request = request_from_client("192.0.2.68");
+        *request.uri_mut() = "/login".parse().expect("path");
+        let first = block_on(service.call(request)).expect("ready");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let mut request = request_from_client("192.0.2.68");
+        *request.uri_mut() = "/login".parse().expect("path");
+        let second = block_on(service.call(request)).expect("ready");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            second
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("90"),
+            "Retry-After carries the endpoint tier's window"
+        );
+        assert_eq!(inner.call_count(), 1);
+    }
+
+    #[test]
+    fn layer_wires_the_route_extension_through_the_tiered_decision() {
+        let stage = throttling_stage(10, Arc::new(system_clock));
+        let mut service = RateLimitStageService {
+            inner: Inner::new(),
+            stage,
+        };
+
+        let mut request = request_from_client("192.0.2.69");
+        *request.uri_mut() = "/x".parse().expect("path");
+        request
+            .extensions_mut()
+            .insert(RouteRateLimits::new(Some(1), Some(15), None).expect("valid route"));
+        assert_eq!(
+            block_on(service.call(request)).expect("ready").status(),
+            StatusCode::OK
+        );
+
+        let mut request = request_from_client("192.0.2.69");
+        *request.uri_mut() = "/x".parse().expect("path");
+        request
+            .extensions_mut()
+            .insert(RouteRateLimits::new(Some(1), Some(15), None).expect("valid route"));
+        let response = block_on(service.call(request)).expect("ready");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("15"),
+            "the route extension's tier window"
+        );
+    }
+
     #[test]
     fn builder_fails_closed_on_every_rejected_part() {
         let error = RateLimitStage::new(RateLimitStageConfig {
@@ -1163,7 +1628,7 @@ mod tests {
         assert_eq!(
             error,
             RateLimitStageError::RateLimit(RateLimitConfigError {
-                field: "rate_limit",
+                field: "rate_limit".into(),
                 reason: "must be at least 1 request per window",
             })
         );

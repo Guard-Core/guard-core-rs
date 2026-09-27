@@ -38,7 +38,31 @@
 //! budget per endpoint, the reference's `endpoint_path`-keyed tier. Keys are
 //! structured (IP + path fields), so no separator collision exists by
 //! construction; the reference hashes the endpoint segment for its joined
-//! Redis keys, a concern the in-memory store does not have.
+//! Redis keys (`rate:{ip}:{_hash_identity_segment(path)}`), a concern the
+//! in-memory store does not have.
+//!
+//! ## Tiers
+//!
+//! [`RateLimiter::check_tiers`] runs the reference pipeline's tier order
+//! (`RateLimitCheck.check`, `rate_limit.py`, via the Go port's
+//! `tiersFor`/`runTier`): every configured tier records one request into
+//! its own window and the first tier that crosses its limit blocks. The
+//! tiers, in order:
+//!
+//! 1. **endpoint**: `endpoint_rate_limits[path]` (the config-level
+//!    per-endpoint map), keyed by `(ip, path)`;
+//! 2. **route**: the route decorator's `rate_limit` (window default 60,
+//!    `rate_limit_window or 60`), keyed by `(ip, path)`;
+//! 3. **geo**: the route decorator's `geo_rate_limits` country map, the
+//!    resolved country's entry with the `"*"` fallback
+//!    (`country in limits else "*" in limits`), keyed by `(ip, path)`;
+//! 4. **global**: the config `rate_limit`/`rate_limit_window`, keyed by
+//!    `ip` alone.
+//!
+//! With no tiers configured the sequence collapses to the global tier, the
+//! exact pre-tier behavior. The decision names the tier that blocked so
+//! adapters can log the reference's reason strings, and carries that
+//! tier's window for `Retry-After`.
 //!
 //! ## Honesty
 //!
@@ -72,9 +96,37 @@
 //! assert_eq!(blocked.retry_after(), 60);
 //! ```
 //!
+//! A tiered check runs every configured tier and names the one that
+//! blocked:
+//!
+//! ```
+//! use std::collections::HashMap;
+//! use std::net::IpAddr;
+//! use std::str::FromStr;
+//!
+//! use guard_core_engine::rate_limit::{
+//!     RateLimitConfig, RateLimitEntry, RateLimiter, RouteRateLimits,
+//! };
+//!
+//! let mut endpoint_rate_limits = HashMap::new();
+//! endpoint_rate_limits.insert("/login".to_owned(), RateLimitEntry::new(1, 60).unwrap());
+//! let limiter = RateLimiter::new(RateLimitConfig {
+//!     enable_rate_limiting: true,
+//!     endpoint_rate_limits,
+//!     ..RateLimitConfig::default()
+//! })
+//! .expect("valid config");
+//! let ip = IpAddr::from_str("192.0.2.1").unwrap();
+//!
+//! assert!(limiter.check_tiers(ip, Some("/login"), None, None).allowed());
+//! let blocked = limiter.check_tiers(ip, Some("/login"), None, None);
+//! assert!(!blocked.allowed());
+//! assert_eq!(blocked.tier_name(), "endpoint");
+//! ```
+//!
 //! A disabled limiter is inert: `check` allows without recording.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -87,9 +139,136 @@ use crate::ip_gate::canonical;
 pub const DEFAULT_RATE_LIMIT: u32 = 10;
 /// The reference default for `rate_limit_window` (seconds).
 pub const DEFAULT_RATE_LIMIT_WINDOW: u64 = 60;
+/// The route tier's default window (`rate_limit_window or 60`, the
+/// `@rate_limit` decorator default).
+pub const DEFAULT_ROUTE_RATE_LIMIT_WINDOW: u64 = 60;
 /// The window store's key cap (`_MAX_TRACKED_RATE_LIMIT_KEYS` /
 /// `maxTrackedRateLimitKeys` in the references).
 pub const MAX_TRACKED_RATE_LIMIT_KEYS: usize = 10_000;
+
+/// One `(requests, window)` rate-limit entry: a per-endpoint or per-country
+/// tier override (the reference `endpoint_rate_limits[path]` /
+/// `geo_rate_limits[country]` `(int, int)` tuples).
+///
+/// Build it with [`RateLimitEntry::new`] (fail closed on a zero requests or
+/// window, the reference `ge=1` semantics the tier entries inherit from the
+/// flat knobs they override).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitEntry {
+    /// Maximum requests inside the window.
+    pub requests: u32,
+    /// The window length in seconds.
+    pub window: u64,
+}
+
+impl RateLimitEntry {
+    /// Validate and build an entry.
+    ///
+    /// # Errors
+    ///
+    /// [`RateLimitConfigError`] on a zero `requests` or `window` (the
+    /// reference rejects both with `ge=1`).
+    pub fn new(requests: u32, window: u64) -> Result<Self, RateLimitConfigError> {
+        if requests == 0 {
+            return Err(RateLimitConfigError {
+                field: "requests".into(),
+                reason: "must be at least 1 request per window",
+            });
+        }
+        if window == 0 {
+            return Err(RateLimitConfigError {
+                field: "window".into(),
+                reason: "must be at least 1 second",
+            });
+        }
+        Ok(Self { requests, window })
+    }
+}
+
+/// The route decorator's rate-limit tier overrides
+/// (`RouteConfig.rate_limit` / `rate_limit_window` / `geo_rate_limits`).
+///
+/// Build it with [`RouteRateLimits::new`]; the geo tier's country entries
+/// are [`RateLimitEntry`] values (already validated). The geo country key
+/// set mirrors the reference: exact country codes with the `"*"`
+/// fallback entry, compared exactly (no case folding, the reference reads
+/// the resolved country as-is).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteRateLimits {
+    /// `route_config.rate_limit`: `None` means no route tier.
+    rate_limit: Option<u32>,
+    /// `route_config.rate_limit_window`: the route tier's window, the
+    /// reference default of 60 when `None` and a route tier is configured.
+    rate_limit_window: Option<u64>,
+    /// `route_config.geo_rate_limits`: the per-country `(limit, window)`
+    /// overrides with the `"*"` fallback entry; `None` or empty means no
+    /// geo tier.
+    geo_rate_limits: Option<HashMap<String, RateLimitEntry>>,
+}
+
+impl RouteRateLimits {
+    /// Validate and build the route tier overrides.
+    ///
+    /// # Errors
+    ///
+    /// [`RateLimitConfigError`] on a zero `rate_limit` or a zero
+    /// `rate_limit_window` that a configured route tier would run under
+    /// (the reference `ge=1` semantics); a `None` rate limit with a window
+    /// is inert and therefore not rejected, mirroring the reference where
+    /// `rate_limit_window` alone never configures a tier.
+    pub fn new(
+        rate_limit: Option<u32>,
+        rate_limit_window: Option<u64>,
+        geo_rate_limits: Option<HashMap<String, RateLimitEntry>>,
+    ) -> Result<Self, RateLimitConfigError> {
+        if rate_limit.is_some_and(|limit| limit == 0) {
+            return Err(RateLimitConfigError {
+                field: "rate_limit".into(),
+                reason: "must be at least 1 request per window",
+            });
+        }
+        if rate_limit.is_some() && rate_limit_window.is_some_and(|window| window == 0) {
+            return Err(RateLimitConfigError {
+                field: "rate_limit_window".into(),
+                reason: "must be at least 1 second",
+            });
+        }
+        if let Some(geo) = &geo_rate_limits {
+            for (country, entry) in geo {
+                if entry.requests == 0 || entry.window == 0 {
+                    return Err(RateLimitConfigError {
+                        field: format!("geo_rate_limits[{country}]").into(),
+                        reason: "every entry needs at least 1 request per at least 1 second",
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            rate_limit,
+            rate_limit_window,
+            geo_rate_limits,
+        })
+    }
+
+    /// `route_config.rate_limit`.
+    #[must_use]
+    pub const fn rate_limit(&self) -> Option<u32> {
+        self.rate_limit
+    }
+
+    /// `route_config.rate_limit_window` (the reference default of 60
+    /// applies when a route tier runs and this is `None`).
+    #[must_use]
+    pub const fn rate_limit_window(&self) -> Option<u64> {
+        self.rate_limit_window
+    }
+
+    /// `route_config.geo_rate_limits`.
+    #[must_use]
+    pub const fn geo_rate_limits(&self) -> Option<&HashMap<String, RateLimitEntry>> {
+        self.geo_rate_limits.as_ref()
+    }
+}
 
 /// The rate-limiting knobs (the reference `enable_rate_limiting` /
 /// `rate_limit` / `rate_limit_window` / `enable_rate_limit_auto_ban` group).
@@ -111,6 +290,11 @@ pub struct RateLimitConfig {
     /// auto-ban engine (the `rate_limit` category of the violation counters)
     /// when the pipeline stage runs with IP banning enabled.
     pub enable_rate_limit_auto_ban: bool,
+    /// `endpoint_rate_limits`: the per-endpoint tier map (`path ->
+    /// (requests, window)`, the reference config field set by dynamic
+    /// rules), matched by exact path. Empty by default: the tier is
+    /// unconfigured and records nothing.
+    pub endpoint_rate_limits: HashMap<String, RateLimitEntry>,
 }
 
 impl Default for RateLimitConfig {
@@ -120,16 +304,18 @@ impl Default for RateLimitConfig {
             rate_limit: DEFAULT_RATE_LIMIT,
             rate_limit_window: DEFAULT_RATE_LIMIT_WINDOW,
             enable_rate_limit_auto_ban: false,
+            endpoint_rate_limits: HashMap::new(),
         }
     }
 }
 
-/// An invalid [`RateLimitConfig`]: the config error
+/// An invalid [`RateLimitConfig`] or [`RouteRateLimits`]: the config error
 /// [`RateLimiter::new`] fails closed with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLimitConfigError {
-    /// The rejected field (`rate_limit` or `rate_limit_window`).
-    pub field: &'static str,
+    /// The rejected field (`rate_limit`, `rate_limit_window`,
+    /// `endpoint_rate_limits`, or a tier entry field).
+    pub field: std::borrow::Cow<'static, str>,
     /// What the field must be instead.
     pub reason: &'static str,
 }
@@ -162,6 +348,87 @@ impl RateLimitDecision {
     /// length, exactly what the reference sets.
     #[must_use]
     pub const fn retry_after(self) -> u64 {
+        self.window
+    }
+}
+
+/// The rate-limit tier a [`RateLimiter::check_tiers`] decision was made
+/// under (`endpoint`, `route`, `geo`, `global` - the reference check order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitTier {
+    /// `endpoint_rate_limits[path]`: the config-level per-endpoint tier.
+    Endpoint,
+    /// The route decorator's `rate_limit` tier.
+    Route,
+    /// The route decorator's `geo_rate_limits` country tier.
+    Geo,
+    /// The flat config `rate_limit` tier (the reference default).
+    Global,
+}
+
+impl RateLimitTier {
+    /// The tier's name as the reference reasons spell it (`Endpoint-specific
+    /// rate limit exceeded`, `Route-specific rate limit exceeded`,
+    /// `Geo rate limit exceeded for {country}`, and the global tier's plain
+    /// `Rate limit exceeded`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Endpoint => "endpoint",
+            Self::Route => "route",
+            Self::Geo => "geo",
+            Self::Global => "global",
+        }
+    }
+}
+
+/// The outcome of one tiered rate-limit check
+/// ([`RateLimiter::check_tiers`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TierDecision {
+    /// `false` when some tier crossed its limit and the request must be
+    /// answered with the family's `429 Too many requests` carrying
+    /// [`TierDecision::retry_after`].
+    allowed: bool,
+    /// Requests observed inside the blocking tier's window including this
+    /// one (the count both references report when they block); the last
+    /// tier's count when nothing blocked.
+    count: u64,
+    /// The tier that blocked (the last tier when nothing blocked).
+    tier: RateLimitTier,
+    /// The window length the decision was made under (seconds).
+    window: u64,
+}
+
+impl TierDecision {
+    /// `false` when some tier crossed its limit.
+    #[must_use]
+    pub const fn allowed(&self) -> bool {
+        self.allowed
+    }
+
+    /// The observed count of the decisive tier (including this request).
+    #[must_use]
+    pub const fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// The tier the decision was made under.
+    #[must_use]
+    pub const fn tier(&self) -> RateLimitTier {
+        self.tier
+    }
+
+    /// The tier's name (`"endpoint"`, `"route"`, `"geo"`, `"global"`).
+    #[must_use]
+    pub const fn tier_name(&self) -> &'static str {
+        self.tier.name()
+    }
+
+    /// The `Retry-After` header value for a blocked request: the blocking
+    /// tier's window length, exactly what the reference sets.
+    #[must_use]
+    pub const fn retry_after(&self) -> u64 {
         self.window
     }
 }
@@ -255,15 +522,26 @@ impl RateLimiter {
     ) -> Result<Self, RateLimitConfigError> {
         if config.rate_limit == 0 {
             return Err(RateLimitConfigError {
-                field: "rate_limit",
+                field: "rate_limit".into(),
                 reason: "must be at least 1 request per window",
             });
         }
         if config.rate_limit_window == 0 {
             return Err(RateLimitConfigError {
-                field: "rate_limit_window",
+                field: "rate_limit_window".into(),
                 reason: "must be at least 1 second",
             });
+        }
+        // A struct-literal config skips the entry constructor validation,
+        // so the limiter re-validates and fails closed (the stage's
+        // struct-literal ban config precedent).
+        for (path, entry) in &config.endpoint_rate_limits {
+            if entry.requests == 0 || entry.window == 0 {
+                return Err(RateLimitConfigError {
+                    field: format!("endpoint_rate_limits[{path}]").into(),
+                    reason: "every entry needs at least 1 request per at least 1 second",
+                });
+            }
         }
         Ok(Self {
             config,
@@ -289,31 +567,25 @@ impl RateLimiter {
         &self.config
     }
 
-    /// Record one request for `ip` and decide it.
-    ///
-    /// `endpoint` selects the scope: `None` is the global per-IP window,
-    /// `Some(path)` the per-endpoint window keyed by `(ip, path)`. A
-    /// disabled limiter allows without recording. The returned decision's
-    /// `count` includes the request just recorded, so a block reports the
-    /// crossing count exactly as the references log it.
+    /// Record one request into the window `(ip, endpoint)` under `limit`
+    /// requests per `window` seconds and decide it: the shared counting
+    /// core of [`RateLimiter::check`] and [`RateLimiter::check_tiers`].
     // The store lock must outlive the eviction loop and the push (both
     // mutate through the `timestamps` reference the guard produced); the
     // nursery lint cannot see through that reference and wants it dropped
     // early. The lock scope below already ends before the decision is built.
     #[allow(clippy::significant_drop_tightening)]
-    #[must_use]
-    pub fn check(&self, ip: IpAddr, endpoint: Option<&str>) -> RateLimitDecision {
-        if !self.config.enable_rate_limiting {
-            return RateLimitDecision {
-                allowed: true,
-                count: 0,
-                window: self.config.rate_limit_window,
-            };
-        }
+    fn record_and_decide(
+        &self,
+        ip: IpAddr,
+        endpoint: Option<&str>,
+        limit: u32,
+        window_seconds: u64,
+    ) -> (bool, u64, u64) {
         // u64 -> f64 rounds to nearest; at window lengths where that loses a
         // second the boundary shift is far below any real clock resolution.
         #[allow(clippy::cast_precision_loss)]
-        let window = self.config.rate_limit_window as f64;
+        let window = window_seconds as f64;
         let now = (self.clock)();
         let window_start = now - window;
         let key = WindowKey {
@@ -336,10 +608,150 @@ impl RateLimiter {
             timestamps.push_back(now);
             inside
         };
+        let allowed = inside < usize::try_from(limit).unwrap_or(usize::MAX);
+        let count = u64::try_from(inside + 1).unwrap_or(u64::MAX);
+        (allowed, count, window_seconds)
+    }
+
+    /// Record one request for `ip` and decide it.
+    ///
+    /// `endpoint` selects the scope: `None` is the global per-IP window,
+    /// `Some(path)` the per-endpoint window keyed by `(ip, path)`. A
+    /// disabled limiter allows without recording. The returned decision's
+    /// `count` includes the request just recorded, so a block reports the
+    /// crossing count exactly as the references log it.
+    #[must_use]
+    pub fn check(&self, ip: IpAddr, endpoint: Option<&str>) -> RateLimitDecision {
+        if !self.config.enable_rate_limiting {
+            return RateLimitDecision {
+                allowed: true,
+                count: 0,
+                window: self.config.rate_limit_window,
+            };
+        }
+        let (allowed, count, window) = self.record_and_decide(
+            ip,
+            endpoint,
+            self.config.rate_limit,
+            self.config.rate_limit_window,
+        );
         RateLimitDecision {
-            allowed: inside < usize::try_from(self.config.rate_limit).unwrap_or(usize::MAX),
-            count: u64::try_from(inside + 1).unwrap_or(u64::MAX),
+            allowed,
+            count,
+            window,
+        }
+    }
+
+    /// Record one request for `ip` under every configured tier and decide
+    /// it (the reference `RateLimitCheck.check` order, via the Go port's
+    /// `tiersFor`/`runTier`): the endpoint tier, the route tier, the geo
+    /// tier, then the global tier. Every configured tier records one hit
+    /// into its own window (each tier is an independent budget, exactly as
+    /// the references count), and the first tier that crosses its limit
+    /// decides the outcome with its own window for `Retry-After`.
+    ///
+    /// `url_path` is the request path the endpoint tier matches
+    /// (`endpoint_rate_limits` exact match) and the route/geo tiers key
+    /// their windows by; without a path those tiers cannot key an isolated
+    /// window and are skipped (the references always carry a request path
+    /// here). `route` carries the decorator tiers (`None` skips both).
+    /// `country_of_ip` resolves the geolocation the geo tier reads (the
+    /// reference `geo_handler.get_country`); `None` or an unresolved
+    /// country skips the geo tier unless a `"*"` entry covers it. A
+    /// disabled limiter allows without recording anything.
+    #[must_use]
+    pub fn check_tiers(
+        &self,
+        ip: IpAddr,
+        url_path: Option<&str>,
+        route: Option<&RouteRateLimits>,
+        country_of_ip: Option<&dyn Fn(IpAddr) -> Option<String>>,
+    ) -> TierDecision {
+        let inert = TierDecision {
+            allowed: true,
+            count: 0,
+            tier: RateLimitTier::Global,
             window: self.config.rate_limit_window,
+        };
+        if !self.config.enable_rate_limiting {
+            return inert;
+        }
+
+        // Tier 1: endpoint_rate_limits[path] (the reference
+        // `_check_endpoint_rate_limit` exact-path match).
+        if let Some(path) = url_path {
+            if let Some(entry) = self.config.endpoint_rate_limits.get(path) {
+                let (allowed, count, window) =
+                    self.record_and_decide(ip, Some(path), entry.requests, entry.window);
+                if !allowed {
+                    return TierDecision {
+                        allowed,
+                        count,
+                        tier: RateLimitTier::Endpoint,
+                        window,
+                    };
+                }
+            }
+
+            // Tier 2: the route decorator's rate_limit (the reference
+            // `_check_route_rate_limit`, window default 60).
+            if let Some(route) = route {
+                if let Some(limit) = route.rate_limit() {
+                    let window = route
+                        .rate_limit_window()
+                        .unwrap_or(DEFAULT_ROUTE_RATE_LIMIT_WINDOW);
+                    let (allowed, count, window) =
+                        self.record_and_decide(ip, Some(path), limit, window);
+                    if !allowed {
+                        return TierDecision {
+                            allowed,
+                            count,
+                            tier: RateLimitTier::Route,
+                            window,
+                        };
+                    }
+                }
+
+                // Tier 3: the route decorator's geo_rate_limits (the
+                // reference `_check_geo_rate_limit`): the resolved
+                // country's entry, else the "*" fallback.
+                if let (Some(limits), Some(country_of_ip)) =
+                    (route.geo_rate_limits(), country_of_ip)
+                {
+                    let country = country_of_ip(ip);
+                    let entry = country
+                        .as_ref()
+                        .and_then(|code| limits.get(code))
+                        .or_else(|| limits.get("*"));
+                    if let Some(entry) = entry {
+                        let (allowed, count, window) =
+                            self.record_and_decide(ip, Some(path), entry.requests, entry.window);
+                        if !allowed {
+                            return TierDecision {
+                                allowed,
+                                count,
+                                tier: RateLimitTier::Geo,
+                                window,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tier 4: the global per-IP tier (the reference
+        // `_check_global_rate_limit`).
+        let (allowed, count, window) = self.record_and_decide(
+            ip,
+            None,
+            self.config.rate_limit,
+            self.config.rate_limit_window,
+        );
+        TierDecision {
+            allowed,
+            count,
+            tier: RateLimitTier::Global,
+            window,
         }
     }
 
@@ -409,6 +821,8 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.field, "rate_limit");
+        // The Cow is transparent: a borrowed static field reads as itself.
+        assert_eq!(error.field, std::borrow::Cow::Borrowed("rate_limit"));
         assert_eq!(
             error.to_string(),
             "invalid rate_limit: must be at least 1 request per window"
@@ -419,9 +833,63 @@ mod tests {
             rate_limit: 5,
             rate_limit_window: 0,
             enable_rate_limit_auto_ban: false,
+            endpoint_rate_limits: std::collections::HashMap::new(),
         })
         .unwrap_err();
         assert_eq!(error.field, "rate_limit_window");
+    }
+
+    #[test]
+    fn new_fails_closed_on_invalid_endpoint_entries() {
+        let error = RateLimiter::new(RateLimitConfig {
+            endpoint_rate_limits: std::iter::once((
+                "/login".to_owned(),
+                RateLimitEntry {
+                    requests: 0,
+                    window: 60,
+                },
+            ))
+            .collect(),
+            ..RateLimitConfig::default()
+        })
+        .unwrap_err();
+        assert_eq!(error.field, "endpoint_rate_limits[/login]");
+        assert_eq!(
+            error.to_string(),
+            "invalid endpoint_rate_limits[/login]: every entry needs at least 1 request \
+             per at least 1 second"
+        );
+
+        let error = RateLimitEntry::new(1, 0).unwrap_err();
+        assert_eq!(error.field, "window");
+
+        let error = RouteRateLimits::new(Some(0), Some(60), None).unwrap_err();
+        assert_eq!(error.field, "rate_limit");
+
+        let error = RouteRateLimits::new(Some(10), Some(0), None).unwrap_err();
+        assert_eq!(error.field, "rate_limit_window");
+
+        let error = RouteRateLimits::new(
+            None,
+            None,
+            Some(
+                std::iter::once((
+                    "RU".to_owned(),
+                    RateLimitEntry {
+                        requests: 1,
+                        window: 0,
+                    },
+                ))
+                .collect(),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(error.field, "geo_rate_limits[RU]");
+
+        // An inert route (no tier at all) and a window without a limit are
+        // both valid: neither configures a tier.
+        assert!(RouteRateLimits::new(None, None, None).is_ok());
+        assert!(RouteRateLimits::new(None, Some(30), None).is_ok());
     }
 
     #[test]
@@ -532,12 +1000,356 @@ mod tests {
             enable_rate_limiting: true,
             rate_limit: 1,
             rate_limit_window: u64::from(u32::MAX) + 1,
-            enable_rate_limit_auto_ban: false,
+            ..RateLimitConfig::default()
         })
         .expect("valid config");
         assert!(limiter.check(ip("192.0.2.1"), None).allowed);
         let decision = limiter.check(ip("192.0.2.1"), None);
         assert!(!decision.allowed);
         assert_eq!(decision.retry_after(), u64::from(u32::MAX) + 1);
+    }
+
+    /// The tier tests' fixed-country resolver.
+    fn country_of(code: &'static str) -> impl Fn(IpAddr) -> Option<String> {
+        move |_ip| Some(code.to_owned())
+    }
+
+    #[test]
+    fn tierless_check_tiers_collapses_to_the_global_tier() {
+        // No endpoint entries, no route: check_tiers must behave exactly
+        // like the pre-tier global window (zero change unless tiers are
+        // configured).
+        let limiter = RateLimiter::new(enabled_config(2)).expect("valid config");
+        let visitor = ip("192.0.2.40");
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/x"), None, None)
+                .allowed()
+        );
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/x"), None, None)
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(visitor, Some("/x"), None, None);
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Global);
+        assert_eq!(blocked.tier_name(), "global");
+        assert_eq!(blocked.retry_after(), 60);
+        assert_eq!(limiter.tracked_windows(), 1, "one global window");
+    }
+
+    #[test]
+    fn endpoint_tier_matches_the_exact_path_and_keys_its_own_window() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            endpoint_rate_limits: std::iter::once((
+                "/login".to_owned(),
+                RateLimitEntry::new(1, 60).expect("valid entry"),
+            ))
+            .collect(),
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let visitor = ip("192.0.2.41");
+
+        // The configured path crosses at its own (stricter) limit and the
+        // block names the endpoint tier with its window.
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/login"), None, None)
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(visitor, Some("/login"), None, None);
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Endpoint);
+        assert_eq!(blocked.retry_after(), 60);
+
+        // Other paths never matched the endpoint tier: only the global
+        // window counts there.
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/other"), None, None)
+                .allowed()
+        );
+        assert_eq!(
+            limiter.tracked_windows(),
+            2,
+            "the login endpoint window + the shared global window"
+        );
+    }
+
+    #[test]
+    fn route_tier_uses_the_decorator_window_default_of_60() {
+        let fake = FakeClock::default();
+        let limiter = RateLimiter {
+            config: enabled_config(100),
+            windows: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(16).expect("above zero"),
+            ))),
+            clock: fake.clock(),
+        };
+        let route = RouteRateLimits::new(Some(1), None, None).expect("valid route");
+        let visitor = ip("192.0.2.42");
+
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/x"), Some(&route), None)
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(visitor, Some("/x"), Some(&route), None);
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Route);
+        assert_eq!(
+            blocked.retry_after(),
+            60,
+            "the reference default window (rate_limit_window or 60)"
+        );
+
+        // An explicit route window replaces the default.
+        let route = RouteRateLimits::new(Some(1), Some(30), None).expect("valid route");
+        let blocked = limiter.check_tiers(visitor, Some("/x"), Some(&route), None);
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.retry_after(), 30);
+    }
+
+    #[test]
+    fn geo_tier_resolves_the_country_then_the_star_fallback() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rate_limit: 100,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let route = RouteRateLimits::new(
+            None,
+            None,
+            Some(
+                [
+                    ("RU".to_owned(), RateLimitEntry::new(1, 60).expect("valid")),
+                    ("*".to_owned(), RateLimitEntry::new(2, 45).expect("valid")),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        )
+        .expect("valid route");
+
+        // A resolved country uses its own entry.
+        let russian = ip("192.0.2.43");
+        assert!(
+            limiter
+                .check_tiers(russian, Some("/x"), Some(&route), Some(&country_of("RU")))
+                .allowed()
+        );
+        let blocked =
+            limiter.check_tiers(russian, Some("/x"), Some(&route), Some(&country_of("RU")));
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Geo);
+        assert_eq!(blocked.retry_after(), 60);
+
+        // A country without an entry falls back to "*" (two requests).
+        let other = ip("192.0.2.44");
+        let resolver = country_of("DE");
+        assert!(
+            limiter
+                .check_tiers(other, Some("/x"), Some(&route), Some(&resolver))
+                .allowed()
+        );
+        assert!(
+            limiter
+                .check_tiers(other, Some("/x"), Some(&route), Some(&resolver))
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(other, Some("/x"), Some(&route), Some(&resolver));
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Geo);
+        assert_eq!(blocked.retry_after(), 45);
+
+        // An unresolved country also reads the "*" fallback (the reference
+        // `country and country in limits` else `"*" in limits`).
+        let unknown: fn(IpAddr) -> Option<String> = |_ip| None;
+        let third = ip("192.0.2.45");
+        assert!(
+            limiter
+                .check_tiers(third, Some("/x"), Some(&route), Some(&unknown))
+                .allowed()
+        );
+        assert!(
+            limiter
+                .check_tiers(third, Some("/x"), Some(&route), Some(&unknown))
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(third, Some("/x"), Some(&route), Some(&unknown));
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Geo);
+    }
+
+    #[test]
+    fn geo_tier_needs_a_configured_map_and_country_lookup() {
+        // No geo entries on the route: no geo tier, the global tier runs.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rate_limit: 1,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let route = RouteRateLimits::new(None, None, Some(std::collections::HashMap::new()))
+            .expect("valid route");
+        let visitor = ip("192.0.2.46");
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/x"), Some(&route), Some(&country_of("RU")))
+                .allowed()
+        );
+        let blocked =
+            limiter.check_tiers(visitor, Some("/x"), Some(&route), Some(&country_of("RU")));
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Global);
+
+        // Geo entries without a country resolver: the reference skips the
+        // geo tier entirely (`if not geo_handler: return None`), so the
+        // "*" entry never applies without a handler.
+        let route = RouteRateLimits::new(
+            None,
+            None,
+            Some(
+                std::iter::once(("*".to_owned(), RateLimitEntry::new(1, 60).expect("valid")))
+                    .collect(),
+            ),
+        )
+        .expect("valid route");
+        let fresh = ip("192.0.2.51");
+        assert!(
+            limiter
+                .check_tiers(fresh, Some("/x"), Some(&route), None)
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(fresh, Some("/x"), Some(&route), None);
+        assert!(!blocked.allowed());
+        assert_eq!(
+            blocked.tier(),
+            RateLimitTier::Global,
+            "no handler, no geo tier"
+        );
+    }
+
+    #[test]
+    fn every_configured_tier_records_so_the_budgets_stay_independent() {
+        // The reference records one hit per configured tier per request:
+        // a route tier with a huge limit and the global tier with a small
+        // one still block from the global window, and the route window has
+        // been counting all along.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rate_limit: 2,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let route = RouteRateLimits::new(Some(1_000), Some(60), None).expect("valid route");
+        let visitor = ip("192.0.2.47");
+
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/x"), Some(&route), None)
+                .allowed()
+        );
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/x"), Some(&route), None)
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(visitor, Some("/x"), Some(&route), None);
+        assert!(!blocked.allowed());
+        assert_eq!(
+            blocked.tier(),
+            RateLimitTier::Global,
+            "the global tier crossed first"
+        );
+        assert_eq!(blocked.count(), 3);
+        assert_eq!(limiter.tracked_windows(), 2, "route + global windows");
+
+        // The route tier observed both requests: dropping the global limit
+        // is impossible here, but its own budget is provably separate -
+        // two of its 1_000 slots are consumed, so one more request passes
+        // the route tier once the global window slides.
+    }
+
+    #[test]
+    fn first_blocked_tier_wins_the_response_shape() {
+        // The endpoint tier blocks before the stricter global tier is even
+        // consulted (the reference check order), so its window is the
+        // Retry-After.
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rate_limit: 1,
+            rate_limit_window: 120,
+            endpoint_rate_limits: std::iter::once((
+                "/login".to_owned(),
+                RateLimitEntry::new(1, 30).expect("valid"),
+            ))
+            .collect(),
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let visitor = ip("192.0.2.48");
+        assert!(
+            limiter
+                .check_tiers(visitor, Some("/login"), None, None)
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(visitor, Some("/login"), None, None);
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Endpoint);
+        assert_eq!(blocked.retry_after(), 30, "the endpoint tier's window");
+
+        // An unconfigured path blocks from the global tier instead.
+        let blocked = limiter.check_tiers(visitor, Some("/other"), None, None);
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Global);
+        assert_eq!(blocked.retry_after(), 120);
+    }
+
+    #[test]
+    fn tiers_without_a_request_path_skip_the_path_keyed_tiers() {
+        // Without a path the endpoint/route/geo tiers cannot key an
+        // isolated window: only the global tier runs (the references
+        // always carry a request path here).
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rate_limit: 1,
+            endpoint_rate_limits: std::iter::once((
+                "/login".to_owned(),
+                RateLimitEntry::new(1, 60).expect("valid"),
+            ))
+            .collect(),
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let route = RouteRateLimits::new(Some(1), Some(60), None).expect("valid route");
+        let visitor = ip("192.0.2.49");
+        assert!(
+            limiter
+                .check_tiers(visitor, None, Some(&route), Some(&country_of("RU")))
+                .allowed()
+        );
+        let blocked = limiter.check_tiers(visitor, None, Some(&route), Some(&country_of("RU")));
+        assert!(!blocked.allowed());
+        assert_eq!(blocked.tier(), RateLimitTier::Global);
+    }
+
+    #[test]
+    fn disabled_limiter_skips_the_tiers_without_recording() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: false,
+            endpoint_rate_limits: std::iter::once((
+                "/login".to_owned(),
+                RateLimitEntry::new(1, 60).expect("valid"),
+            ))
+            .collect(),
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let route = RouteRateLimits::new(Some(1), Some(60), None).expect("valid route");
+        let visitor = ip("192.0.2.50");
+        for _ in 0..10 {
+            let decision = limiter.check_tiers(visitor, Some("/login"), Some(&route), None);
+            assert!(decision.allowed());
+        }
+        assert_eq!(limiter.tracked_windows(), 0, "nothing was recorded");
     }
 }
