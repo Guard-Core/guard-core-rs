@@ -1340,28 +1340,22 @@ detection result arrive exactly as in tower (an <code>IpGateDecision</code> and 
 respectively), and the trusted-proxies seam stays on the stage builder
 (<code>RateLimitStage::builder(..).trusted_proxies(..)</code>).</p>
 <h2 id="what-is-not-implemented-fail-closed-honesty">What is not implemented (fail-closed honesty)</h2>
-<p>The port targets spec 4.0.2 and is not complete. Do not expect these yet:</p>
+<p>The port targets spec 4.1.0; the detect stage passes the corpus gate
+(184 cases, zero xfail). The remaining parity gaps are pipeline-side and
+listed here rather than hidden:</p>
 <ul>
-<li><strong>The 4.x pattern-table scan stage</strong>: the full reference regex table
-  across all scan views has no Rust counterpart yet; the corpus xfail
-  baseline records the resulting divergences (the dominant cause of xfail
-  entries).</li>
-<li><strong>Config, pipeline, and handler sections</strong> (Python sections 02, 03,
-  07-12): no <code>SecurityConfig</code>, no middleware protocol, no handlers,
-  protocols, or decorators. The global IP gate (<code>whitelist</code>, <code>blacklist</code>,
-  <code>exempt_ips</code>) exists (<code>ip_gate</code>), the in-memory rate limiter and dynamic
-  IP ban store exist (<code>rate_limit</code>, <code>ip_ban</code>), the rate-limit/ban
-  pipeline stage exists for tower stacks (<code>guard_core_rs::tower</code>) and as
-  example wirings for actix-web and Rocket (<code>examples/actix_app</code>,
-  <code>examples/rocket_app</code>), and the route-scoped request size/content gate
-  exists (<code>request_limits</code>), but there
-  is no Redis-backed distributed mode, no cloud provider blocking, no
-  user-agent filtering, and no response factory; the remaining pipeline
-  <code>examples/rocket_app</code>), and the user-agent filter exists (<code>user_agent</code>),
-  but there
-  is no Redis-backed distributed mode, no cloud provider blocking, and no
-  response factory; the remaining pipeline
-  stages and the published framework adapters live in the adapter repos.</li>
+<li><strong>Config, pipeline, and handler parity gaps</strong>: no Redis-backed
+  distributed rate-limit mode, no <code>passive_mode</code> switch, no
+  endpoint/decorator/geo rate-limit tiers, no Redis event pipeline, and no
+  decorator/protocol layer (that is the adapters' job). Present today: the
+  global IP gate (<code>whitelist</code>, <code>blacklist</code>, <code>exempt_ips</code> via <code>ip_gate</code>), the
+  in-memory rate limiter and dynamic IP ban store (<code>rate_limit</code>, <code>ip_ban</code>),
+  the rate-limit/ban pipeline stage for tower stacks (<code>guard_core_rs::tower</code>)
+  plus example wirings for actix-web and Rocket (<code>examples/actix_app</code>,
+  <code>examples/rocket_app</code>), the route-scoped request size/content gate
+  (<code>request_limits</code>), the user-agent filter (<code>user_agent</code>), cloud-provider
+  listing (<code>cloud_provider</code>), and geo country rules (<code>geo</code>). The published
+  framework adapters live in the adapter repos.</li>
 <li><strong><code>PerformanceMonitor</code></strong> and per-scan timeouts, plus a handful of tracked
   detection knobs recorded as unmapped with reasons.</li>
 </ul>

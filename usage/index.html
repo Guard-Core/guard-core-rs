@@ -547,7 +547,7 @@
 
 <h1 id="usage">Usage</h1>
 <h2 id="the-detect-pipeline">The detect pipeline</h2>
-<p><code>guard_core_rs::detect::detect</code> is the top-level entry point: the spec 4.0.2
+<p><code>guard_core_rs::detect::detect</code> is the top-level entry point: the spec 4.1.0
 <code>SusPatternsManager.detect</code> equivalent. It preprocesses the content, runs the
 reference scan views, applies semantic analysis, and scores the result.</p>
 <div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">guard_core_rs</span><span class="p">::</span><span class="n">detect</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">DetectConfig</span><span class="p">};</span>
@@ -676,11 +676,11 @@ directory shows this wiring over hyper.</p>
 <code>validate_pattern_safety</code> (a ReDoS-construct deny list); the <code>regex</code> crate is
 RE2-like and linear-time, so catastrophic backtracking is structurally absent.</p>
 <h2 id="conformance">Conformance</h2>
-<p>The <code>guard-core-conformance</code> crate runs the vendored spec 4.0.2 corpus
+<p>The <code>guard-core-conformance</code> crate runs the vendored spec 4.1.0 corpus
 through the Rust pipeline and compares <code>is_threat</code>, <code>threat_score</code>,
 lengths, detection method, and the threat multiset:</p>
 <div class="highlight"><pre><span></span><code>cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span>-p<span class="w"> </span>guard-core-conformance<span class="w"> </span>--<span class="w"> </span>--nocapture
-<span class="c1"># conformance gate: N passed, N failed, N xfail, N not_run (spec 4.0.2)</span>
+<span class="c1"># conformance gate: N passed, N failed, N xfail, N not_run (spec 4.1.0)</span>
 </code></pre></div>
 <p>Drift handling is fail-closed: unbaselined failures and stale xfails both
 fail the gate.</p>
