@@ -419,22 +419,23 @@ The port targets spec 4.1.0; the detect stage passes the corpus gate
 listed here rather than hidden:
 
 - **Config, pipeline, and handler parity gaps**: no Redis-backed
-  distributed rate-limit mode, no Redis event pipeline, no route
-  `ip_whitelist`/`ip_blacklist`, and no decorator/protocol layer (that is
-  the adapters' job). Present today: the global IP gate (`whitelist`,
-  `blacklist`, `exempt_ips` via `ip_gate`), the in-memory rate limiter and
-  dynamic IP ban store (`rate_limit`, `ip_ban`), the rate-limit/ban
-  pipeline stage for tower stacks (`guard_core_rs::tower`, including the
-  `passive_mode` switch, the endpoint/decorator/geo rate-limit tiers, and
-  the suspicious-activity `400` contract answer) plus example wirings for
-  actix-web and Rocket (`examples/actix_app`, `examples/rocket_app`), the
-  route-scoped request size/content gate (`request_limits`), the user-agent
-  filter (`user_agent`), cloud-provider listing (`cloud_provider`), geo
-  country rules (`geo`), the security-headers manager
-  (`security_headers`), CORS (`cors`), and the response-side
-  `process_response` pass with the behavior-rule engine
-  (`guard_core_rs::process_response`, `behavior`). The published framework
-  adapters live in the adapter repos.
+  distributed rate-limit mode, no Redis event pipeline, and no
+  decorator/protocol layer (that is the adapters' job). Present today: the
+  global IP gate (`whitelist`, `blacklist`, `exempt_ips` via `ip_gate`)
+  and the route decorator's `ip_whitelist`/`ip_blacklist` gate
+  (`ip_gate::RouteIpGate`, the `check_route_ip_access` semantics), the
+  in-memory rate limiter and dynamic IP ban store (`rate_limit`,
+  `ip_ban`), the rate-limit/ban pipeline stage for tower stacks
+  (`guard_core_rs::tower`, including the `passive_mode` switch, the
+  endpoint/decorator/geo rate-limit tiers, and the suspicious-activity
+  `400` contract answer) plus example wirings for actix-web and Rocket
+  (`examples/actix_app`, `examples/rocket_app`), the route-scoped request
+  size/content gate (`request_limits`), the user-agent filter
+  (`user_agent`), cloud-provider listing (`cloud_provider`), geo country
+  rules (`geo`), the security-headers manager (`security_headers`), CORS
+  (`cors`), and the response-side `process_response` pass with the
+  behavior-rule engine (`guard_core_rs::process_response`, `behavior`).
+  The published framework adapters live in the adapter repos.
 - **`PerformanceMonitor`** and per-scan timeouts, plus a handful of tracked
   detection knobs recorded as unmapped with reasons.
 

@@ -32,8 +32,10 @@
 //! (`guard_core_rs::process_response` + `guard_core_engine::behavior`,
 //! sharing the stages' ban store), and the suspicious-activity `400`
 //! answer (the detection feed answers the contract body below the ban
-//! threshold). The remaining gap: route `ip_whitelist` /
-//! `ip_blacklist`.
+//! threshold), and the route IP gate (`guard_core_engine::ip_gate
+//! ::RouteIpGate`, the route `ip_whitelist` / `ip_blacklist` stage that runs
+//! before the global lists). The only documented comparison skip is the
+//! reference-vocabulary event-bus capture (the `events` key).
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -51,7 +53,7 @@ use guard_core_engine::geo::{
     self, CountryGate, GeoIpHandler, check_countries, generic_list_block_reason,
 };
 use guard_core_engine::ip_ban::IpBanManager;
-use guard_core_engine::ip_gate::{IpGateConfig, IpGateVerdict};
+use guard_core_engine::ip_gate::{IpGateConfig, IpGateVerdict, RouteIpGate, RouteIpVerdict};
 use guard_core_engine::rate_limit::{RateLimitEntry, RouteRateLimits};
 use guard_core_engine::security_headers::{
     self as security_headers_engine, CspDirective, HstsConfig, SecurityHeadersConfig,
@@ -183,10 +185,12 @@ pub struct CaseEngine {
     processor: ResponseProcessor,
 }
 
-/// The route table entry: the rate tier the family ports plus the
-/// detection-exclusion surface (`detection_exclusions::resolve` +
-/// `detection_enabled`) where the family ports that too.
+/// The route table entry: the route IP gate, the rate tier the family
+/// ports, plus the detection-exclusion surface
+/// (`detection_exclusions::resolve` + `detection_enabled`) where the family
+/// ports that too.
 struct RouteSpec {
+    ip_gate: Option<RouteIpGate>,
     rate_limits: Option<RouteRateLimits>,
     exclusions: Option<RouteDetectionExclusions>,
     suspicious_detection: Option<bool>,
@@ -402,9 +406,23 @@ impl CaseEngine {
             } else {
                 None
             };
+            let route_gate = if overrides.get("ip_whitelist").is_some()
+                || overrides.get("ip_blacklist").is_some()
+            {
+                Some(
+                    RouteIpGate::new(
+                        list_at("ip_whitelist").unwrap_or_default(),
+                        list_at("ip_blacklist").unwrap_or_default(),
+                    )
+                    .map_err(|e| format!("route {path}: {e}"))?,
+                )
+            } else {
+                None
+            };
             routes.insert(
                 path.clone(),
                 RouteSpec {
+                    ip_gate: route_gate,
                     rate_limits,
                     exclusions,
                     suspicious_detection: overrides
@@ -553,23 +571,49 @@ impl CaseEngine {
             table: self.geo_table.clone(),
         };
 
-        // 1. The global IP gate (whitelist / blacklist / exempt).
-        let decision = match self.gate.evaluate(ip) {
-            // The reference records the skip flags only once the request
-            // has passed the geo stage (a country-blocked exempt IP leaves
-            // both flags unset), so the flags land on the record below.
-            IpGateVerdict::Allowed(decision) => Some(decision),
-            IpGateVerdict::Denied(_) => {
-                // The reference denial reason is the generic list reason
-                // for both the blacklist and the restrictive-whitelist
-                // mode (`IP {ip} not in global allowlist/blocklist`).
-                let reason = format!("IP not allowed: {ip} - {}", generic_list_block_reason(ip));
-                self.record_gate_block(&mut record, ip, path, method, &reason);
-                return record;
+        // 1. The route IP gate (the reference `_check_route_ip_access`,
+        //    which runs inside the ip_security check before the global
+        //    lists): a route blacklist match denies, a configured route
+        //    whitelist takes over the route verdict, no lists leave the
+        //    request to the global gate.
+        let route_spec = self.routes.get(path);
+        if let Some(gate) = route_spec.and_then(|spec| spec.ip_gate.as_ref())
+            && gate.evaluate(ip) == RouteIpVerdict::Denied
+        {
+            let reason = format!("IP not allowed by route config: {ip}");
+            self.record_gate_block(&mut record, ip, path, method, &reason);
+            return record;
+        }
+        // A configured route whitelist overrides the global IP lists for the
+        // request (the reference `_route_overrides_ip_lists` / `skip_ip_lists`):
+        // the global gate's deny paths are skipped and the skip flags stay
+        // unset (`_resolve_is_whitelisted` / `_resolve_is_exempt`).
+        let skip_ip_lists = route_spec
+            .and_then(|spec| spec.ip_gate.as_ref())
+            .is_some_and(RouteIpGate::whitelist_configured);
+
+        // 2. The global IP gate (whitelist / blacklist / exempt).
+        let decision = if skip_ip_lists {
+            None
+        } else {
+            match self.gate.evaluate(ip) {
+                // The reference records the skip flags only once the request
+                // has passed the geo stage (a country-blocked exempt IP leaves
+                // both flags unset), so the flags land on the record below.
+                IpGateVerdict::Allowed(decision) => Some(decision),
+                IpGateVerdict::Denied(_) => {
+                    // The reference denial reason is the generic list reason
+                    // for both the blacklist and the restrictive-whitelist
+                    // mode (`IP {ip} not in global allowlist/blocklist`).
+                    let reason =
+                        format!("IP not allowed: {ip} - {}", generic_list_block_reason(ip));
+                    self.record_gate_block(&mut record, ip, path, method, &reason);
+                    return record;
+                }
             }
         };
 
-        // 2. The geo country rules (a global whitelist match skips them,
+        // 3. The geo country rules (a global whitelist match skips them,
         //    the reference `skip_countries` flag).
         let whitelisted = decision.is_some_and(|d| d.is_whitelisted);
         if let Some(block) = check_countries(ip, &self.geo_gate, &handler, whitelisted) {
@@ -582,13 +626,13 @@ impl CaseEngine {
             record.is_whitelisted = Some(decision.is_whitelisted);
         }
 
-        // 3. The detection feed result (computed before the stages that
+        // 4. The detection feed result (computed before the stages that
         //    consume it, the way the adapters attach the finding), honoring
         //    the route's detection surface through the engine's
         //    `detection_exclusions` seam.
         let finding = self.scan(drive, self.routes.get(path));
 
-        // 4. The user-agent stage (route filter first, then the global
+        // 5. The user-agent stage (route filter first, then the global
         //    filter; skipped for a whitelisted or exempt IP).
         let agent = drive
             .headers
@@ -616,7 +660,7 @@ impl CaseEngine {
             return record;
         }
 
-        // 5. The rate-limit stage (bans, tiers, and the detection feed).
+        // 6. The rate-limit stage (bans, tiers, and the detection feed).
         let observation = RequestObservation {
             method: Some(method.to_owned()),
             url: Some(path.to_owned()),

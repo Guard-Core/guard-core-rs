@@ -12,10 +12,11 @@ headers, events, responses), with a spec 4.1.0 conformance harness.
 The detect stage passes the vendored spec 4.1.0 corpus (184 cases, zero
 xfail) and the pipeline gate replays the five spec 4.1.0 pipeline suites
 (security headers, CORS, the response-side `process_response` pass with the
-behavior-rule engine, and the suspicious-activity `400` answer included); the
-remaining parity gaps are pipeline-side (distributed Redis rate limiting,
-route `ip_whitelist`/`ip_blacklist`, the reference-vocabulary event bus) and
-are listed in the configuration guide's honesty section rather than hidden.
+behavior-rule engine, the suspicious-activity `400` answer, and the route
+`ip_whitelist`/`ip_blacklist` gate included, zero xfail); the remaining
+parity gaps are pipeline-side (distributed Redis rate limiting, the
+reference-vocabulary event bus) and are listed in the configuration guide's
+honesty section rather than hidden.
 
 ## What it provides
 

@@ -353,6 +353,137 @@ impl IpGateConfig {
     }
 }
 
+/// The outcome of the route-level IP gate for one request IP
+/// (`check_route_ip_access`'s tri-state, the country arms aside).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteIpVerdict {
+    /// The route IP lists leave the request alone: neither list matched in a
+    /// denying way and no restrictive whitelist claims the route. The global
+    /// gate decides as usual.
+    Unrestricted,
+    /// A configured route whitelist matched the IP (or nothing denied): the
+    /// route stage passes.
+    Allowed,
+    /// A route blacklist match, or a miss under a configured route
+    /// whitelist: the route stage denies.
+    Denied,
+}
+
+/// The route-level IP gate: a route decorator's `ip_whitelist` and
+/// `ip_blacklist` (`RouteConfig.ip_whitelist` / `.ip_blacklist`).
+///
+/// This is the Rust family's port of the reference engine's route IP stage
+/// (`guard_core/core/checks/helpers.py::check_route_ip_access`, the IP-list
+/// arms; the Go and PHP family ports run the same order). One call,
+/// [`RouteIpGate::evaluate`], decides a request IP against one route:
+///
+/// ```text
+/// blacklist match:            deny (a blacklisted IP is denied even when a
+///                             whitelist would take it)
+/// whitelist configured, miss: deny (the whitelist takes over the route verdict)
+/// whitelist match:            pass the route stage
+/// neither list configured:    unrestricted (the global gate decides)
+/// ```
+///
+/// Matching semantics are the global gate's ([`IpGateConfig`]): a bare IP or
+/// a CIDR range per entry, IPv4-mapped request addresses canonicalized,
+/// families never crossing. Invalid entries are config errors:
+/// [`RouteIpGate::new`] fails closed.
+///
+/// The global lists are still enforced afterwards by the caller, so a route
+/// whitelist match never relaxes the global gate; it only clears the route
+/// verdict.
+///
+/// # Example
+///
+/// ```
+/// use std::net::IpAddr;
+/// use std::str::FromStr;
+///
+/// use guard_core_engine::ip_gate::{RouteIpGate, RouteIpVerdict};
+///
+/// let gate = RouteIpGate::new(["192.0.2.40"], ["203.0.113.9"]).expect("valid lists");
+///
+/// // A whitelist member passes the route stage.
+/// assert_eq!(
+///     gate.evaluate(IpAddr::from_str("192.0.2.40").unwrap()),
+///     RouteIpVerdict::Allowed
+/// );
+/// // Everyone else on the route is denied: the whitelist takes over.
+/// assert_eq!(
+///     gate.evaluate(IpAddr::from_str("192.0.2.11").unwrap()),
+///     RouteIpVerdict::Denied
+/// );
+/// // A blacklisted IP is denied even when a whitelist entry would take it.
+/// assert_eq!(
+///     gate.evaluate(IpAddr::from_str("203.0.113.9").unwrap()),
+///     RouteIpVerdict::Denied
+/// );
+///
+/// // No lists: the route leaves the request to the global gate.
+/// let open = RouteIpGate::new([] as [&str; 0], [] as [&str; 0]).expect("valid lists");
+/// assert_eq!(
+///     open.evaluate(IpAddr::from_str("192.0.2.11").unwrap()),
+///     RouteIpVerdict::Unrestricted
+/// );
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteIpGate {
+    whitelist: Vec<Entry>,
+    blacklist: Vec<Entry>,
+}
+
+impl RouteIpGate {
+    /// Parse the route's two lists, failing closed on the first invalid
+    /// entry (the list names in the error are `ip_whitelist` and
+    /// `ip_blacklist`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`IpGateError`] naming the list and the first entry that is
+    /// neither a valid IP nor a valid CIDR range.
+    pub fn new<W, B>(whitelist: W, blacklist: B) -> Result<Self, IpGateError>
+    where
+        W: IntoIterator,
+        W::Item: AsRef<str>,
+        B: IntoIterator,
+        B::Item: AsRef<str>,
+    {
+        Ok(Self {
+            whitelist: parse_list("ip_whitelist", whitelist)?,
+            blacklist: parse_list("ip_blacklist", blacklist)?,
+        })
+    }
+
+    /// Whether a route whitelist is configured (non-empty). The reference
+    /// `_route_overrides_ip_lists`: a configured route whitelist also
+    /// overrides the global IP lists for the request, so the caller skips
+    /// the global gate's deny paths.
+    #[must_use]
+    pub const fn whitelist_configured(&self) -> bool {
+        !self.whitelist.is_empty()
+    }
+
+    /// Evaluate a request IP against the route's lists: the blacklist
+    /// denies first, then a configured whitelist takes over the route
+    /// verdict (a miss denies, a match passes), and no list leaves the
+    /// request unrestricted.
+    #[must_use]
+    pub fn evaluate(&self, ip: IpAddr) -> RouteIpVerdict {
+        if !self.blacklist.is_empty() && list_matches(&self.blacklist, ip) {
+            return RouteIpVerdict::Denied;
+        }
+        if !self.whitelist.is_empty() {
+            return if list_matches(&self.whitelist, ip) {
+                RouteIpVerdict::Allowed
+            } else {
+                RouteIpVerdict::Denied
+            };
+        }
+        RouteIpVerdict::Unrestricted
+    }
+}
+
 /// Parse one list, reporting the first invalid entry with the list's name.
 fn parse_list<I>(list: &'static str, entries: I) -> Result<Vec<Entry>, IpGateError>
 where
@@ -458,6 +589,14 @@ mod tests {
 
     #[test]
     fn new_reports_the_list_and_entry_of_the_first_reject() {
+        let error = RouteIpGate::new(["203.0.113.0/33"], NIL).unwrap_err();
+        assert_eq!(error.list, "ip_whitelist");
+        assert_eq!(error.entry, "203.0.113.0/33");
+
+        let error = RouteIpGate::new(NIL, ["junk"]).unwrap_err();
+        assert_eq!(error.list, "ip_blacklist");
+        assert_eq!(error.entry, "junk");
+
         let error = IpGateConfig::new(["203.0.113.7"], ["ok-but-not-an-ip"], NIL).unwrap_err();
         assert_eq!(error.list, "blacklist");
         assert_eq!(error.entry, "ok-but-not-an-ip");
@@ -618,5 +757,86 @@ mod tests {
                 Self::Denied(denial) => denial,
             }
         }
+    }
+
+    #[test]
+    fn route_gate_whitelist_takes_over_the_route_verdict() {
+        // The corpus shape (pipeline_ip_control::route_ip_whitelist_denies_other_ip).
+        let gate = RouteIpGate::new(["192.0.2.40"], NIL).unwrap();
+        assert!(gate.whitelist_configured());
+        assert_eq!(
+            gate.evaluate(ip("192.0.2.40")),
+            RouteIpVerdict::Allowed,
+            "a whitelist member passes the route stage"
+        );
+        assert_eq!(
+            gate.evaluate(ip("192.0.2.11")),
+            RouteIpVerdict::Denied,
+            "a miss under a configured whitelist denies"
+        );
+    }
+
+    #[test]
+    fn route_gate_blacklist_denies_first() {
+        let gate = RouteIpGate::new(["192.0.2.40"], ["203.0.113.9", "198.51.100.0/24"]).unwrap();
+        assert_eq!(
+            gate.evaluate(ip("203.0.113.9")),
+            RouteIpVerdict::Denied,
+            "a blacklist match denies"
+        );
+        // A blacklisted IP is denied even when the whitelist would take it.
+        assert_eq!(
+            gate.evaluate(ip("198.51.100.7")),
+            RouteIpVerdict::Denied,
+            "blacklist beats the whitelist"
+        );
+        assert_eq!(
+            gate.evaluate(ip("192.0.2.40")),
+            RouteIpVerdict::Allowed,
+            "the whitelist still passes its members"
+        );
+        assert_eq!(
+            gate.evaluate(ip("192.0.2.11")),
+            RouteIpVerdict::Denied,
+            "the whitelist still denies its misses"
+        );
+    }
+
+    #[test]
+    fn route_gate_blacklist_only_denies_its_matches() {
+        let gate = RouteIpGate::new(NIL, ["203.0.113.9"]).unwrap();
+        assert!(!gate.whitelist_configured());
+        assert_eq!(gate.evaluate(ip("203.0.113.9")), RouteIpVerdict::Denied);
+        assert_eq!(
+            gate.evaluate(ip("192.0.2.11")),
+            RouteIpVerdict::Unrestricted,
+            "a non-member is left to the global gate"
+        );
+    }
+
+    #[test]
+    fn route_gate_empty_is_unrestricted() {
+        let gate = RouteIpGate::new(NIL, NIL).unwrap();
+        assert!(!gate.whitelist_configured());
+        assert_eq!(
+            gate.evaluate(ip("192.0.2.11")),
+            RouteIpVerdict::Unrestricted
+        );
+    }
+
+    #[test]
+    fn route_gate_entries_match_like_the_global_gate() {
+        // CIDR entries and IPv4-mapped request addresses go through the
+        // same matcher as the global lists.
+        let gate = RouteIpGate::new(["198.51.100.16/28"], NIL).unwrap();
+        assert_eq!(gate.evaluate(ip("198.51.100.20")), RouteIpVerdict::Allowed);
+        assert_eq!(gate.evaluate(ip("198.51.100.32")), RouteIpVerdict::Denied);
+
+        let gate = RouteIpGate::new(["203.0.113.7"], NIL).unwrap();
+        assert_eq!(
+            gate.evaluate(IpAddr::from_str("::ffff:203.0.113.7").unwrap()),
+            RouteIpVerdict::Allowed,
+            "a v4-mapped request matches its IPv4 entry"
+        );
     }
 }
