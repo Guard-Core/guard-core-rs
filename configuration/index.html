@@ -1345,17 +1345,22 @@ respectively), and the trusted-proxies seam stays on the stage builder
 listed here rather than hidden:</p>
 <ul>
 <li><strong>Config, pipeline, and handler parity gaps</strong>: no Redis-backed
-  distributed rate-limit mode, no <code>passive_mode</code> switch, no
-  endpoint/decorator/geo rate-limit tiers, no Redis event pipeline, and no
-  decorator/protocol layer (that is the adapters' job). Present today: the
-  global IP gate (<code>whitelist</code>, <code>blacklist</code>, <code>exempt_ips</code> via <code>ip_gate</code>), the
-  in-memory rate limiter and dynamic IP ban store (<code>rate_limit</code>, <code>ip_ban</code>),
-  the rate-limit/ban pipeline stage for tower stacks (<code>guard_core_rs::tower</code>)
-  plus example wirings for actix-web and Rocket (<code>examples/actix_app</code>,
-  <code>examples/rocket_app</code>), the route-scoped request size/content gate
-  (<code>request_limits</code>), the user-agent filter (<code>user_agent</code>), cloud-provider
-  listing (<code>cloud_provider</code>), and geo country rules (<code>geo</code>). The published
-  framework adapters live in the adapter repos.</li>
+  distributed rate-limit mode, no Redis event pipeline, no route
+  <code>ip_whitelist</code>/<code>ip_blacklist</code>, and no decorator/protocol layer (that is
+  the adapters' job). Present today: the global IP gate (<code>whitelist</code>,
+  <code>blacklist</code>, <code>exempt_ips</code> via <code>ip_gate</code>), the in-memory rate limiter and
+  dynamic IP ban store (<code>rate_limit</code>, <code>ip_ban</code>), the rate-limit/ban
+  pipeline stage for tower stacks (<code>guard_core_rs::tower</code>, including the
+  <code>passive_mode</code> switch, the endpoint/decorator/geo rate-limit tiers, and
+  the suspicious-activity <code>400</code> contract answer) plus example wirings for
+  actix-web and Rocket (<code>examples/actix_app</code>, <code>examples/rocket_app</code>), the
+  route-scoped request size/content gate (<code>request_limits</code>), the user-agent
+  filter (<code>user_agent</code>), cloud-provider listing (<code>cloud_provider</code>), geo
+  country rules (<code>geo</code>), the security-headers manager
+  (<code>security_headers</code>), CORS (<code>cors</code>), and the response-side
+  <code>process_response</code> pass with the behavior-rule engine
+  (<code>guard_core_rs::process_response</code>, <code>behavior</code>). The published framework
+  adapters live in the adapter repos.</li>
 <li><strong><code>PerformanceMonitor</code></strong> and per-scan timeouts, plus a handful of tracked
   detection knobs recorded as unmapped with reasons.</li>
 </ul>
