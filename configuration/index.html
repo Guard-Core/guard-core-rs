@@ -1364,6 +1364,15 @@ listed here rather than hidden:</p>
   The published framework adapters live in the adapter repos.</li>
 <li><strong><code>PerformanceMonitor</code></strong> and per-scan timeouts, plus a handful of tracked
   detection knobs recorded as unmapped with reasons.</li>
+<li><strong>Behavior-rule storage is in-memory only</strong>: the behavior engine's sliding
+  windows and ban dispatch live in the process-local stores; the reference's
+  Redis-backed layout for behavior rules has no distributed mode in this
+  port.</li>
+<li><strong>Route IP-list order</strong>: this port evaluates the route <code>ip_blacklist</code>
+  first, then a configured route <code>ip_whitelist</code> takes over the route
+  verdict (a miss denies, a match passes); the reference
+  (<code>check_route_ip_access</code>) evaluates the route whitelist first, so a
+  whitelisted IP passes even when also blacklisted. Recorded divergence.</li>
 </ul>
 <h2 id="conformance-knobs">Conformance knobs</h2>
 <p>The conformance harness maps the five <code>DetectConfig</code> fields above from the
