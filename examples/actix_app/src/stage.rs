@@ -156,7 +156,7 @@ where
             self.stage.decide(ip, gate, finding)
         };
         if let Some(answer) = answer {
-            return Box::pin(ready(Ok(render_block(request, answer))));
+            return Box::pin(ready(Ok(render_block(request, &answer))));
         }
         let future = self.service.call(request);
         Box::pin(async move { future.await.map(ServiceResponse::map_into_left_body) })
@@ -170,7 +170,7 @@ where
 /// so the adapter translates through the status number.
 fn render_block<B: MessageBody + 'static>(
     request: ServiceRequest,
-    answer: StageResponse,
+    answer: &StageResponse,
 ) -> ServiceResponse<EitherBody<B>> {
     let status =
         StatusCode::from_u16(answer.status.as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -221,6 +221,7 @@ mod tests {
             },
             ip_ban: IpBanConfig::default(),
             passive_mode: false,
+            custom_error_responses: std::collections::HashMap::new(),
         })
         .clock(clock)
         .build()
@@ -473,6 +474,7 @@ mod tests {
                 ..IpBanConfig::default()
             },
             passive_mode: false,
+            custom_error_responses: std::collections::HashMap::new(),
         })
         .clock(fake.clock())
         .build()

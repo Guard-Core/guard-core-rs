@@ -49,6 +49,7 @@ fn rocket() -> _ {
         },
         ip_ban: IpBanConfig::default(),
         passive_mode: false,
+        custom_error_responses: std::collections::HashMap::new(),
     })
     .expect("valid stage config");
 

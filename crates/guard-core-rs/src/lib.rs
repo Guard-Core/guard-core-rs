@@ -38,6 +38,8 @@
 //! - [`event_types`] / [`events`] - the reference `EVENT_*` constants and
 //!   the `SecurityEventBus` hook seam over the reference `SecurityEvent`
 //!   record
+//! - [`responses`] - the reference `custom_error_responses` map and the
+//!   `on_block` block hook with the reference payload and exclusion set
 //! - [`logging`] - the reference `log_activity` line shapes with the
 //!   `muted_check_logs` and `log_sensitive_*` redaction knobs
 //! - [`redact`] - the merged sensitive-name sets and the
@@ -70,6 +72,7 @@ pub mod headers_auth;
 pub mod logging;
 pub mod redact;
 pub mod request_limits;
+pub mod responses;
 pub mod tower;
 pub mod user_agent;
 

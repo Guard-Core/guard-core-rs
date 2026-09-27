@@ -93,6 +93,7 @@
 //!     },
 //!     ip_ban: IpBanConfig::default(),
 //!     passive_mode: false,
+//!     custom_error_responses: std::collections::HashMap::new(),
 //! })
 //! .expect("valid stage config");
 //! let visitor = IpAddr::from_str("192.0.2.1").unwrap();
@@ -143,6 +144,7 @@ use crate::events::{
 };
 use crate::logging::{LogLevel, LogType, log_activity};
 use crate::redact::SensitiveNames;
+use crate::responses::{CustomErrorResponses, OnBlockHook, build_block_payload, fire_block_hook};
 
 pub use guard_core_engine::geo::GeoIpHandler;
 pub use guard_core_engine::ip_ban::{
@@ -234,7 +236,7 @@ pub struct ThreatFinding {
 /// The stage's block answer, one of the three family shapes: the status, the
 /// default message body, and the `Retry-After` seconds for the throttled
 /// shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageResponse {
     /// The HTTP status (`403` for the banned shapes, `429` for throttling).
     pub status: StatusCode,
@@ -242,6 +244,11 @@ pub struct StageResponse {
     pub body: &'static str,
     /// `Retry-After` seconds (set only for the throttled shape).
     pub retry_after: Option<u64>,
+    /// The `custom_error_responses` body override for this status; the
+    /// renderer prefers it over `body` when set (the reference
+    /// `ErrorResponseFactory.create_error_response`'s
+    /// `custom_error_responses.get(status_code, default_message)`).
+    pub custom_body: Option<String>,
 }
 
 /// The stage knobs: the two stateful configs the reference pipeline reads,
@@ -264,6 +271,10 @@ pub struct RateLimitStageConfig {
     /// counts, but renders no block answer and runs no auto-ban feed,
     /// exactly the reference's passive paths.
     pub passive_mode: bool,
+    /// The reference `SecurityConfig.custom_error_responses` map: status
+    /// code to message body, overriding the family default for that
+    /// status. Empty by default (every answer keeps its default body).
+    pub custom_error_responses: CustomErrorResponses,
 }
 
 /// An invalid stage config: the error [`RateLimitStage::new`] fails closed
@@ -359,6 +370,7 @@ pub struct RateLimitStage {
     geo_handler: Option<Arc<dyn GeoIpHandler>>,
     events: Option<Arc<SecurityEventBus>>,
     observability: Option<Arc<ObservabilityConfig>>,
+    on_block: Option<OnBlockHook>,
 }
 
 impl fmt::Debug for RateLimitStage {
@@ -394,6 +406,7 @@ impl RateLimitStage {
             geo_handler: None,
             events: None,
             observability: None,
+            on_block: None,
         }
     }
 
@@ -457,6 +470,7 @@ impl RateLimitStage {
     /// `log_activity` "suspicious" lines, redacted through the installed
     /// [`ObservabilityConfig`]). The request pieces arrive through
     /// `observation`; `None` composes from what the decision carries.
+    #[allow(clippy::too_many_lines)]
     pub fn decide_for_path_observed(
         &self,
         ip: Option<IpAddr>,
@@ -470,11 +484,15 @@ impl RateLimitStage {
         let passive = self.config.passive_mode;
 
         if self.bans.is_banned(ip) && !passive {
-            return Some(StageResponse {
-                status: StatusCode::FORBIDDEN,
-                body: BANNED_BODY,
-                retry_after: None,
-            });
+            return Some(self.error_response(
+                StatusCode::FORBIDDEN,
+                BANNED_BODY,
+                None,
+                "ip_security",
+                "IP is banned",
+                ip,
+                observation,
+            ));
         }
 
         let whitelisted = gate.is_some_and(|gate| gate.is_whitelisted);
@@ -528,11 +546,19 @@ impl RateLimitStage {
                             RATE_LIMIT_BAN_REASON,
                         );
                     }
-                    return Some(StageResponse {
-                        status: StatusCode::TOO_MANY_REQUESTS,
-                        body: THROTTLED_BODY,
-                        retry_after: Some(decision.retry_after()),
-                    });
+                    return Some(self.error_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        THROTTLED_BODY,
+                        Some(decision.retry_after()),
+                        "rate_limit",
+                        &format!(
+                            "Rate limit exceeded: {} requests in {}s window",
+                            decision.count(),
+                            decision.retry_after()
+                        ),
+                        ip,
+                        observation,
+                    ));
                 }
             }
         }
@@ -547,6 +573,27 @@ impl RateLimitStage {
                 // `logged_only` penetration_attempt event.
                 self.counters.record(ip, &categories);
                 self.observe_penetration(ip, finding, observation, true, None);
+                // The reference's passive-mode log_activity fires the
+                // hook with `status_code = None`: no response is ever
+                // sent, the request is only flagged.
+                if let Some(sensitive) = self.sensitive_names() {
+                    let payload = build_block_payload(
+                        "suspicious_activity",
+                        &format!("Suspicious activity detected: {ip}"),
+                        &finding.trigger_info,
+                        true,
+                        &ip.to_string(),
+                        observation
+                            .and_then(|obs| obs.url.as_deref())
+                            .unwrap_or("/"),
+                        observation
+                            .and_then(|obs| obs.method.as_deref())
+                            .unwrap_or(""),
+                        None,
+                        &sensitive,
+                    );
+                    fire_block_hook(self.on_block.as_ref(), &payload);
+                }
             } else {
                 let resolved = self.bans.register_violations(
                     &self.counters,
@@ -577,11 +624,15 @@ impl RateLimitStage {
                 };
                 self.observe_penetration(ip, finding, observation, false, log_reason.as_deref());
                 if resolved.is_some() {
-                    return Some(StageResponse {
-                        status: StatusCode::FORBIDDEN,
-                        body: BAN_CROSSED_BODY,
-                        retry_after: None,
-                    });
+                    return Some(self.error_response(
+                        StatusCode::FORBIDDEN,
+                        BAN_CROSSED_BODY,
+                        None,
+                        "suspicious_activity",
+                        &format!("Penetration attempt detected: {}", finding.trigger_info),
+                        ip,
+                        observation,
+                    ));
                 }
             }
         }
@@ -665,6 +716,62 @@ impl RateLimitStage {
             "",
             "rate_limit",
         );
+    }
+
+    /// The block answer with the reference `custom_body` and `on_block`
+    /// semantics: the body resolves through `custom_error_responses`
+    /// (`get(status, default)`), and the hook fires exactly once with the
+    /// reference payload keys (check name, reason, redacted path, method,
+    /// status).
+    #[allow(clippy::too_many_arguments)]
+    fn error_response(
+        &self,
+        status: StatusCode,
+        default: &'static str,
+        retry_after: Option<u64>,
+        check_name: &str,
+        reason: &str,
+        ip: IpAddr,
+        observation: Option<&RequestObservation>,
+    ) -> StageResponse {
+        let custom_body = self
+            .config
+            .custom_error_responses
+            .get(&status.as_u16())
+            .cloned();
+        if let Some(sensitive) = self.sensitive_names() {
+            let payload = build_block_payload(
+                check_name,
+                reason,
+                "",
+                false,
+                &ip.to_string(),
+                observation
+                    .and_then(|obs| obs.url.as_deref())
+                    .unwrap_or("/"),
+                observation
+                    .and_then(|obs| obs.method.as_deref())
+                    .unwrap_or(""),
+                Some(status.as_u16()),
+                &sensitive,
+            );
+            fire_block_hook(self.on_block.as_ref(), &payload);
+        }
+        StageResponse {
+            status,
+            body: default,
+            retry_after,
+            custom_body,
+        }
+    }
+
+    /// The merged sensitive sets for the payload redaction, when the
+    /// observability seam is installed (the reference passes its config
+    /// sets into `build_block_payload`).
+    fn sensitive_names(&self) -> Option<SensitiveNames> {
+        self.observability
+            .as_deref()
+            .map(|knobs| knobs.sensitive.clone())
     }
 
     /// The rate-limit crossing emission (`_send_rate_limit_event` +
@@ -832,6 +939,7 @@ pub struct RateLimitStageBuilder {
     geo_handler: Option<Arc<dyn GeoIpHandler>>,
     events: Option<Arc<SecurityEventBus>>,
     observability: Option<Arc<ObservabilityConfig>>,
+    on_block: Option<OnBlockHook>,
 }
 
 impl RateLimitStageBuilder {
@@ -892,6 +1000,15 @@ impl RateLimitStageBuilder {
         self
     }
 
+    /// Install the reference `on_block` callback: fired exactly once per
+    /// blocked request (and once per passive-mode-flagged request, with
+    /// `status_code = None`) with the reference payload keys. Never fired
+    /// for the excluded check names; a raising callback is swallowed.
+    pub fn on_block(mut self, hook: OnBlockHook) -> Self {
+        self.on_block = Some(hook);
+        self
+    }
+
     /// Install the log knobs (`log_suspicious_level`,
     /// `muted_check_logs`, and the `log_sensitive_*` redaction sets) the
     /// stage's `log_activity` emissions read. Without one the reference
@@ -933,6 +1050,7 @@ impl RateLimitStageBuilder {
             geo_handler: self.geo_handler,
             events: self.events,
             observability: self.observability,
+            on_block: self.on_block,
         })
     }
 }
@@ -986,7 +1104,7 @@ impl<S, B, ResBody> ::tower::Service<Request<B>> for RateLimitStageService<S>
 where
     S: ::tower::Service<Request<B>, Response = Response<ResBody>>,
     S::Future: Send + 'static,
-    ResBody: From<&'static str> + Send + 'static,
+    ResBody: From<&'static str> + From<String> + Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -1040,8 +1158,11 @@ where
 /// Render the stage's block answer into the wrapped service's response body
 /// type: status, default message body, and the `Retry-After` header for the
 /// throttled shape.
-fn render<ResBody: From<&'static str>>(answer: StageResponse) -> Response<ResBody> {
-    let mut response = Response::new(ResBody::from(answer.body));
+fn render<ResBody: From<&'static str> + From<String>>(answer: StageResponse) -> Response<ResBody> {
+    let mut response = Response::new(match answer.custom_body {
+        Some(custom) => ResBody::from(custom),
+        None => ResBody::from(answer.body),
+    });
     *response.status_mut() = answer.status;
     if let Some(value) = answer
         .retry_after
@@ -1098,18 +1219,19 @@ mod tests {
                 },
                 ip_ban: IpBanConfig::default(),
                 passive_mode: false,
+                custom_error_responses: CustomErrorResponses::default(),
             },
             clock,
         )
     }
 
-    fn assert_banned_shape(answer: StageResponse) {
+    fn assert_banned_shape(answer: &StageResponse) {
         assert_eq!(answer.status, StatusCode::FORBIDDEN);
         assert_eq!(answer.body, BANNED_BODY);
         assert_eq!(answer.retry_after, None);
     }
 
-    fn assert_crossing_ban_shape(answer: StageResponse) {
+    fn assert_crossing_ban_shape(answer: &StageResponse) {
         assert_eq!(answer.status, StatusCode::FORBIDDEN);
         assert_eq!(answer.body, BAN_CROSSED_BODY);
         assert_eq!(answer.retry_after, None);
@@ -1147,7 +1269,7 @@ mod tests {
         // The violation that reaches the flat threshold bans and answers
         // with the crossing-ban shape on the same request.
         assert_crossing_ban_shape(
-            stage
+            &stage
                 .decide(Some(attacker), None, Some(&finding))
                 .expect("threshold crossed"),
         );
@@ -1207,7 +1329,7 @@ mod tests {
         // check.
         stage.bans().ban_ip(exempt, 60, "x").expect("ban");
         assert_banned_shape(
-            stage
+            &stage
                 .decide(Some(exempt), Some(gate), None)
                 .expect("banned"),
         );
@@ -1239,7 +1361,7 @@ mod tests {
         // Over the limit and exempt, yet the banned shape wins: bans are
         // consulted first.
         assert_banned_shape(
-            stage
+            &stage
                 .decide(Some(attacker), Some(gate), None)
                 .expect("banned"),
         );
@@ -1280,6 +1402,7 @@ mod tests {
                     ..IpBanConfig::default()
                 },
                 passive_mode: false,
+                custom_error_responses: CustomErrorResponses::default(),
             },
             fake.clock(),
         );
@@ -1302,7 +1425,7 @@ mod tests {
         );
 
         // The next request meets the ban check first: the banned shape.
-        assert_banned_shape(stage.decide(Some(attacker), None, None).expect("banned"));
+        assert_banned_shape(&stage.decide(Some(attacker), None, None).expect("banned"));
     }
 
     #[test]
@@ -1334,6 +1457,7 @@ mod tests {
                     ..IpBanConfig::default()
                 },
                 passive_mode: false,
+                custom_error_responses: CustomErrorResponses::default(),
             },
             fake.clock(),
         );
@@ -1374,6 +1498,7 @@ mod tests {
                     .collect(),
                 },
                 passive_mode: false,
+                custom_error_responses: CustomErrorResponses::default(),
             },
             fake.clock(),
         );
@@ -1405,7 +1530,7 @@ mod tests {
         );
 
         // The next request meets the banned shape, not the throttled one.
-        assert_banned_shape(stage.decide(Some(attacker), None, None).expect("banned"));
+        assert_banned_shape(&stage.decide(Some(attacker), None, None).expect("banned"));
     }
 
     #[test]
@@ -1428,6 +1553,7 @@ mod tests {
                     .collect(),
                 },
                 passive_mode: false,
+                custom_error_responses: CustomErrorResponses::default(),
             },
             fake.clock(),
         );
@@ -1447,7 +1573,7 @@ mod tests {
         // The crossing request itself is answered with the crossing-ban
         // shape.
         assert_crossing_ban_shape(
-            stage
+            &stage
                 .decide(Some(attacker), None, Some(&finding))
                 .expect("banned on the crossing"),
         );
@@ -1457,7 +1583,7 @@ mod tests {
         );
 
         // Every later request meets the ban check first.
-        assert_banned_shape(stage.decide(Some(attacker), None, None).expect("banned"));
+        assert_banned_shape(&stage.decide(Some(attacker), None, None).expect("banned"));
     }
 
     #[test]
@@ -1469,6 +1595,7 @@ mod tests {
                 ..IpBanConfig::default()
             },
             passive_mode: false,
+            custom_error_responses: CustomErrorResponses::default(),
         })
         .expect("valid config");
         let visitor = ip("192.0.2.3");
@@ -1535,6 +1662,7 @@ mod tests {
                     ..IpBanConfig::default()
                 },
                 passive_mode: true,
+                custom_error_responses: CustomErrorResponses::default(),
             },
             fake.clock(),
         );
@@ -1613,6 +1741,7 @@ mod tests {
                 },
                 ip_ban: IpBanConfig::default(),
                 passive_mode: false,
+                custom_error_responses: CustomErrorResponses::default(),
             },
             fake.clock(),
         );
@@ -1650,6 +1779,7 @@ mod tests {
                 },
                 ip_ban: IpBanConfig::default(),
                 passive_mode: false,
+                custom_error_responses: CustomErrorResponses::default(),
             },
             fake.clock(),
         );
@@ -1677,6 +1807,7 @@ mod tests {
             },
             ip_ban: IpBanConfig::default(),
             passive_mode: false,
+            custom_error_responses: CustomErrorResponses::default(),
         })
         .clock(fake.clock())
         .route_resolver(|path| {
@@ -1741,6 +1872,7 @@ mod tests {
             },
             ip_ban: IpBanConfig::default(),
             passive_mode: false,
+            custom_error_responses: CustomErrorResponses::default(),
         })
         .clock(fake.clock())
         .geo_handler(Arc::new(FixedCountry("RU")))
@@ -1816,6 +1948,7 @@ mod tests {
             },
             ip_ban: IpBanConfig::default(),
             passive_mode: false,
+            custom_error_responses: CustomErrorResponses::default(),
         })
         .clock(Arc::new(system_clock))
         .route_resolver(|_path| {
@@ -1856,6 +1989,7 @@ mod tests {
                 ..IpBanConfig::default()
             },
             passive_mode: false,
+            custom_error_responses: CustomErrorResponses::default(),
         })
         .clock(fake.clock())
         .build()
@@ -1890,6 +2024,7 @@ mod tests {
                 },
                 ip_ban: IpBanConfig::default(),
                 passive_mode: false,
+                custom_error_responses: CustomErrorResponses::default(),
             })
             .build()
             .expect("valid stage config"),
@@ -1961,6 +2096,7 @@ mod tests {
             },
             ip_ban: IpBanConfig::default(),
             passive_mode: false,
+            custom_error_responses: CustomErrorResponses::default(),
         })
         .unwrap_err();
         assert_eq!(
@@ -1983,6 +2119,7 @@ mod tests {
                 ..IpBanConfig::default()
             },
             passive_mode: false,
+            custom_error_responses: CustomErrorResponses::default(),
         })
         .unwrap_err();
         assert_eq!(
@@ -2017,7 +2154,7 @@ mod tests {
         // An out-of-band ban through the shared handle is visible to the
         // stage immediately (the admin-unban-endpoint shape).
         stage.bans().ban_ip(visitor, 60, "admin").expect("ban");
-        assert_banned_shape(stage.decide(Some(visitor), None, None).expect("banned"));
+        assert_banned_shape(&stage.decide(Some(visitor), None, None).expect("banned"));
         stage.bans().unban(visitor);
         assert!(stage.decide(Some(visitor), None, None).is_none());
     }
@@ -2134,7 +2271,7 @@ mod tests {
     }
 
     impl ::tower::Service<Request<&'static str>> for Inner {
-        type Response = Response<&'static str>;
+        type Response = Response<String>;
         type Error = Infallible;
         type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
 
@@ -2145,7 +2282,7 @@ mod tests {
         fn call(&mut self, request: Request<&'static str>) -> Self::Future {
             self.calls.fetch_add(1, Ordering::Relaxed);
             drop(request);
-            Box::pin(async move { Ok(Response::new("inner")) })
+            Box::pin(async move { Ok(Response::new("inner".to_owned())) })
         }
     }
 
@@ -2416,5 +2553,179 @@ mod tests {
              Headers: {}"
         );
         assert_eq!(MIDDLEWARE_HANDLER_NAME, "middleware");
+    }
+
+    // ---- custom_error_responses and on_block (the reference response
+    // factory and block-hook contract) ----
+
+    use crate::responses::{BlockPayload, CustomErrorResponses};
+
+    type BlockLog = Arc<Mutex<Vec<BlockPayload>>>;
+
+    fn recording_hook() -> (BlockLog, OnBlockHook) {
+        let seen: BlockLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let hook: OnBlockHook = Arc::new(move |payload: &BlockPayload| {
+            sink.lock().expect("sink").push(payload.clone());
+        });
+        (seen, hook)
+    }
+
+    #[test]
+    fn custom_error_responses_override_the_default_body() {
+        let mut custom = CustomErrorResponses::new();
+        custom.insert(429, "Slow down".to_owned());
+        let stage = RateLimitStage::new(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: false,
+            custom_error_responses: custom,
+            ..RateLimitStageConfig::default()
+        })
+        .expect("config");
+        let visitor = ip("192.0.2.61");
+        let _ = stage.decide(Some(visitor), None, None);
+        let throttled = stage.decide(Some(visitor), None, None).expect("throttled");
+        assert_eq!(throttled.body, THROTTLED_BODY, "default recorded");
+        assert_eq!(throttled.custom_body.as_deref(), Some("Slow down"));
+    }
+
+    #[test]
+    fn statuses_without_an_entry_keep_the_default_body() {
+        let mut custom = CustomErrorResponses::new();
+        custom.insert(403, "Nope".to_owned());
+        let stage = RateLimitStage::new(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: false,
+            custom_error_responses: custom,
+            ..RateLimitStageConfig::default()
+        })
+        .expect("config");
+        let visitor = ip("192.0.2.62");
+        let _ = stage.decide(Some(visitor), None, None);
+        let throttled = stage.decide(Some(visitor), None, None).expect("throttled");
+        assert_eq!(throttled.custom_body, None, "429 not configured");
+    }
+
+    #[test]
+    fn on_block_fires_once_per_block_with_the_reference_keys() {
+        let (seen, hook) = recording_hook();
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: false,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .observability(ObservabilityConfig {
+            log_suspicious_level: Some(LogLevel::Warning),
+            muted_check_logs: None,
+            sensitive: SensitiveNames::default(),
+        })
+        .on_block(hook)
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.63");
+        let _ = stage.decide(Some(visitor), None, None);
+        let _ = stage.decide(Some(visitor), None, None);
+        let events = seen.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        let payload = &events[0];
+        assert_eq!(payload.check_name, "rate_limit");
+        assert_eq!(payload.client_ip, "192.0.2.63");
+        assert_eq!(payload.status_code, Some(429));
+        assert!(!payload.passive_mode);
+        assert!(payload.path.starts_with('/'), "path present");
+    }
+
+    #[test]
+    fn passive_detection_fires_on_block_with_no_status() {
+        let (seen, hook) = recording_hook();
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            passive_mode: true,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .observability(ObservabilityConfig {
+            log_suspicious_level: Some(LogLevel::Warning),
+            muted_check_logs: None,
+            sensitive: SensitiveNames::default(),
+        })
+        .on_block(hook)
+        .build()
+        .expect("config");
+        let finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["xss".to_owned()],
+            trigger_info: "script tag".to_owned(),
+        };
+        assert!(
+            stage
+                .decide(Some(ip("192.0.2.64")), None, Some(&finding))
+                .is_none()
+        );
+        let events = seen.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].check_name, "suspicious_activity");
+        assert_eq!(events[0].status_code, None);
+        assert!(events[0].passive_mode);
+        assert_eq!(events[0].trigger_info, "script tag");
+    }
+
+    #[test]
+    fn the_payload_path_is_redacted_through_the_sensitivity_sets() {
+        let (seen, hook) = recording_hook();
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: false,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .observability(ObservabilityConfig {
+            log_suspicious_level: Some(LogLevel::Warning),
+            muted_check_logs: None,
+            sensitive: SensitiveNames::default(),
+        })
+        .on_block(hook)
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.65");
+        let observation = RequestObservation {
+            method: Some("GET".to_owned()),
+            url: Some("/login?token=abc".to_owned()),
+            user_agent: None,
+        };
+        let _ = stage.decide_for_path_observed(
+            Some(visitor),
+            None,
+            None,
+            None,
+            None,
+            Some(&observation),
+        );
+        let _ = stage.decide_for_path_observed(
+            Some(visitor),
+            None,
+            None,
+            None,
+            None,
+            Some(&observation),
+        );
+        let events = seen.lock().expect("sink").clone();
+        assert_eq!(events[0].path, "/login?token=[REDACTED]");
     }
 }

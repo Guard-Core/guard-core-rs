@@ -204,6 +204,7 @@ impl CloudProviderStage {
                 status: StatusCode::FORBIDDEN,
                 body: CLOUD_PROVIDER_BLOCKED_BODY,
                 retry_after: None,
+                custom_body: None,
             },
             details,
         })
@@ -300,7 +301,7 @@ where
         let ip = (self.stage.extract_ip)(request.headers(), request.extensions());
         let gate = request.extensions().get::<IpGateDecision>().copied();
         if let Some(decision) = self.stage.decide(ip, gate) {
-            let response = render(decision.answer);
+            let response = render(&decision.answer);
             return Box::pin(async move { Ok(response) });
         }
         let future = self.inner.call(request);
@@ -310,7 +311,7 @@ where
 
 /// Render the stage's block answer into the wrapped service's response body
 /// type.
-fn render<ResBody: From<&'static str>>(answer: StageResponse) -> Response<ResBody> {
+fn render<ResBody: From<&'static str>>(answer: &StageResponse) -> Response<ResBody> {
     let mut response = Response::new(ResBody::from(answer.body));
     *response.status_mut() = answer.status;
     response
