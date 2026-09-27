@@ -771,7 +771,7 @@ checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "guard-core-benchmark"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "criterion",
  "guard-core-engine",
@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-conformance"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "guard-core-engine",
  "guard-core-rs",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-engine"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "html-escape",
  "lru",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-python"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "guard-core-engine",
  "pyo3",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "guard-core-rs"
-version = "4.1.0"
+version = "4.2.0"
 dependencies = [
  "guard-core-engine",
  "http 1.5.0",
