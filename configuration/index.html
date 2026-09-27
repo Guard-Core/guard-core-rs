@@ -394,6 +394,23 @@
     </span>
   </a>
   
+    <nav class="md-nav" aria-label="Rate limiting (rate_limit)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#rate-limit-tiers-check_tiers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rate-limit tiers (check_tiers)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
 </li>
       
         <li class="md-nav__item">
@@ -576,6 +593,23 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Rate limiting (rate_limit)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#rate-limit-tiers-check_tiers" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rate-limit tiers (check_tiers)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -779,7 +813,7 @@ when Redis is off; the Redis-distributed mode is a follow-up).</p>
 <tr>
 <td><code>enable_rate_limiting</code></td>
 <td><code>bool</code></td>
-<td><code>false</code></td>
+<td><code>true</code></td>
 <td><code>enable_rate_limiting</code></td>
 </tr>
 <tr>
@@ -800,13 +834,19 @@ when Redis is off; the Redis-distributed mode is a follow-up).</p>
 <td><code>false</code></td>
 <td><code>enable_rate_limit_auto_ban</code></td>
 </tr>
+<tr>
+<td><code>endpoint_rate_limits</code></td>
+<td><code>HashMap&lt;String, RateLimitEntry&gt;</code></td>
+<td>empty</td>
+<td><code>endpoint_rate_limits</code> (per-endpoint <code>(requests, window)</code> tier)</td>
+</tr>
 </tbody>
 </table>
-<p>Two deltas from the Python reference are deliberate: the engine default for
-<code>enable_rate_limiting</code> is <code>false</code> (Python defaults <code>true</code>; the Rust family
-pins the conservative value so enabling is an explicit act), and the config
-constructor fails closed on a zero limit or window (Python's pydantic
-rejects them with <code>ge=1</code>).</p>
+<p>The config constructor fails closed on a zero limit or window (Python's
+pydantic rejects them with <code>ge=1</code>) and on any <code>endpoint_rate_limits</code> entry
+with a zero <code>requests</code> or <code>window</code>, the same bound the tier entries
+inherit. <code>RateLimitEntry::new</code> and <code>RouteRateLimits::new</code> carry the same
+fail-closed validation for the tier overrides.</p>
 <p>Counting semantics: one sliding log of request timestamps per
 <code>(client IP, scope)</code>. Before a request is recorded, every timestamp at or
 before <code>now - window</code> is evicted; the pre-recording count decides
@@ -821,6 +861,29 @@ keys (<code>_MAX_TRACKED_RATE_LIMIT_KEYS</code>).</p>
 tier, every endpoint sharing one budget); <code>check(ip, Some(path))</code> is the
 per-endpoint window keyed by <code>(ip, path)</code> (the reference's
 <code>endpoint_path</code>-keyed tier).</p>
+<h3 id="rate-limit-tiers-check_tiers">Rate-limit tiers (<code>check_tiers</code>)</h3>
+<p><code>check_tiers(ip, url_path, route, country_of_ip)</code> runs the reference
+pipeline's tier order (<code>RateLimitCheck.check</code> in <code>rate_limit.py</code>, via the
+Go port's <code>tiersFor</code>/<code>runTier</code>). Every configured tier records one hit
+into its own <code>(ip, path)</code> window (each tier is an independent budget,
+exactly as the references count), and the first tier that crosses decides
+the outcome with its own window for <code>Retry-After</code>:</p>
+<ol>
+<li><strong>endpoint</strong> - <code>endpoint_rate_limits[url_path]</code> (exact path match);</li>
+<li><strong>route</strong> - the decorator's <code>rate_limit</code> (window default 60,
+   <code>rate_limit_window or 60</code>);</li>
+<li><strong>geo</strong> - the decorator's <code>geo_rate_limits</code>: the resolved country's
+   entry with the <code>"*"</code> fallback (<code>country in limits else "*" in limits</code>).
+   Without a country resolver the tier never applies (the reference's
+   <code>if not geo_handler: return None</code>), even with a <code>"*"</code> entry;</li>
+<li><strong>global</strong> - the flat <code>rate_limit</code>/<code>rate_limit_window</code>, keyed by IP
+   alone.</li>
+</ol>
+<p>Without any tier configured the sequence collapses to the global tier:
+byte-identical to the pre-tier behavior. <code>RouteRateLimits</code> is the validated
+carrier for the decorator tiers (<code>None</code> fields inherit or skip). The
+references always key the route and geo tiers by the request path, so a
+call without a <code>url_path</code> runs the global tier only.</p>
 <h2 id="dynamic-ip-bans-and-the-auto-ban-engine-ip_ban">Dynamic IP bans and the auto-ban engine (ip_ban)</h2>
 <p>The ban store mirrors the reference <code>IPBanManager</code> in its in-memory mode:</p>
 <ul>
@@ -1137,10 +1200,22 @@ behavior for the two checks the stage owns (<code>rate_limit</code>, the ban che
   (<code>RateLimitStageConfig { rate_limit, ip_ban }</code>); construction fails
   closed on any invalid part (rate limit bounds, trusted-proxy entries,
   ban-config validation).</li>
-<li>Not yet mirrored: the endpoint-rate-limit tier (<code>endpoint_rate_limits</code>,
-  route decorators, geo tiers; the stage runs the global per-IP window,
-  the reference default tier), the reference's <code>passive_mode</code> (no
-  counterpart in the Rust config surface yet), and the suspicious-activity
+<li><strong>Rate-limit tiers</strong>: the service resolves the request path
+  (<code>request.uri().path()</code>) and the tier surfaces ride alongside it. The
+  endpoint tier is the config's <code>endpoint_rate_limits</code> map; the decorator
+  tiers arrive either as a <code>RouteRateLimits</code> request extension (what an
+  adapter's routing layer inserts) or through the builder's
+  <code>route_resolver</code> seam (<code>path -&gt; Option&lt;RouteRateLimits&gt;</code>, the same
+  route seam the request-limits and user-agent stages use; an explicit
+  extension wins). The geo tier resolves its country through the builder's
+  <code>geo_handler</code> seam (<code>Arc&lt;dyn GeoIpHandler&gt;</code>); without a handler it never
+  applies. A tier crossing answers the same <code>429</code> shape with the blocking
+  tier's window and feeds the auto-ban engine exactly as the global tier
+  does. With no tiers configured the stage is byte-identical to the
+  pre-tier global-only behavior.</li>
+<li>Not mirrored: the reference's per-tier event emissions and reason
+  strings (<code>EVENT_DECORATOR_VIOLATION</code> payloads; the decision names the
+  tier instead), <code>log_activity</code>, and the suspicious-activity
   <code>400</code> answer for a threat below the ban threshold (the detection stage
   has no tower counterpart yet).</li>
 </ul>
