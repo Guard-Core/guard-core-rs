@@ -458,6 +458,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#per-route-detection-exclusions-detection_exclusions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-route detection exclusions (detection_exclusions)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#request-size-and-content-type-limits-request_limits" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -651,6 +662,17 @@
     <span class="md-ellipsis">
       
         Request contexts
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#per-route-detection-exclusions-detection_exclusions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-route detection exclusions (detection_exclusions)
       
     </span>
   </a>
@@ -1025,6 +1047,70 @@ before the first <code>:</code>) to one of <code>query_param</code>, <code>heade
 <code>request_body</code>, or <code>unknown</code>. Unknown contexts relax the pattern view
 filters; embedded-JSON leaf contexts (a <code>:embedded_json</code> suffix) keep the
 suffix for validator scoping.</p>
+<h2 id="per-route-detection-exclusions-detection_exclusions">Per-route detection exclusions (detection_exclusions)</h2>
+<p>The per-request detection exclusion resolution and the multi-surface
+request scan mirror <code>guard_core/_utils/detection_config.py</code> and the
+pipeline's <code>detectThreat</code> (via the Go port's <code>detectionexclusions.go</code>). The
+decision core is <code>guard_core_engine::detection_exclusions::scan_request</code>;
+adapters resolve <code>Some(&amp;DetectionExclusionConfig), Some(&amp;route)</code> per request
+(the route standing in for <code>request.state.route_config</code>) and translate the
+<code>RequestScanVerdict</code> into the pipeline's <code>ThreatFinding</code>.</p>
+<p>Resolution (<code>resolve</code>), the reference <code>_resolve_*</code> semantics:</p>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>Route <code>None</code></th>
+<th>Route <code>Some</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>excluded_detection_headers</code></td>
+<td>defaults + config</td>
+<td>merged: defaults + config + route (additive, never a replacement)</td>
+</tr>
+<tr>
+<td><code>excluded_detection_params</code></td>
+<td>config</td>
+<td>route replaces</td>
+</tr>
+<tr>
+<td><code>excluded_detection_body_fields</code></td>
+<td>config</td>
+<td>route replaces</td>
+</tr>
+<tr>
+<td><code>enabled_detection_categories</code></td>
+<td>config (<code>None</code> = every category)</td>
+<td>route replaces (an empty set disables every category)</td>
+</tr>
+<tr>
+<td><code>detection_scan_body</code></td>
+<td>config (<code>None</code> = <code>true</code>)</td>
+<td>route overrides both directions</td>
+</tr>
+</tbody>
+</table>
+<p>All sets lowercase at resolution time, so matching is case-insensitive.</p>
+<p>Scan order (<code>scan_request</code>): URL path (<code>url_path</code>), query params skipping
+excluded names (<code>query_param</code>), headers (<code>header</code>; an excluded header is
+not skipped outright - it scans with its known-false-positive categories
+suppressed, <code>ssrf</code> for the address-carrying proxy headers and for
+whole-address-chain values, so a payload in the same header still
+detects), then the body surface when <code>scan_body</code> is set (form pairs,
+multipart parts, JSON walks, and the blob fallback, each honoring the
+excluded body fields). A value that is a threat but whose categories are
+all filtered out ends the scan clean - the reference's per-value filter is
+terminal, not a reason to keep scanning later values. Regex threats carry
+the category; semantic threats carry none (the reference's semantic
+payloads have no <code>category</code> key). Mongo-operator JSON keys
+(<code>$where</code>, <code>$ne</code>, ...) hit from the walk unfiltered by the category set.</p>
+<p>Route toggles: <code>detection_enabled(global, route)</code> applies the route's
+<code>enable_suspicious_detection</code> over the global <code>enable_penetration_detection</code>
+in both directions at request time, and <code>check_applies</code> keeps the
+suspicious-activity check alive while the global flag is on or any route
+enables its toggle (the reference <code>SuspiciousActivityCheck.applies_to</code>).</p>
 <h2 id="request-size-and-content-type-limits-request_limits">Request size and content-type limits (request_limits)</h2>
 <p>The route-scoped size and content gate mirrors the reference engine's
 <code>request_size_content</code> check
