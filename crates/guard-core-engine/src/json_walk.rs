@@ -557,10 +557,16 @@ struct Frame<'a> {
 /// reference order. Entry keys carry the `request_body` context; leaves carry
 /// the walk context (`request_body` for a top-level body walk, or a field
 /// context with the `:embedded_json` suffix per embedded walk level).
+///
+/// `excluded` carries the excluded detection body fields (entries
+/// lowercased at resolution time): an entry key in the set skips its whole
+/// subtree, exactly the reference's excluded-field routing in the JSON walk
+/// (the mongo-operator direct hit sits behind the same check).
 pub(crate) fn append_json_walk_entries(
     mut values: Vec<BodyScanValue>,
     root: &JsonNode,
     context: &str,
+    excluded: crate::body_scan::ExcludedBodyFields<'_>,
 ) -> Vec<BodyScanValue> {
     let allow_leaf_reparse = context != REQUEST_BODY_CONTEXT;
     // Frames are consumed in order; the reference uses a LIFO stack and pushes
@@ -573,6 +579,9 @@ pub(crate) fn append_json_walk_entries(
     }];
     while let Some(frame) = stack.pop() {
         if frame.is_entry {
+            if excluded.contains(&frame.key) {
+                continue;
+            }
             if mongo_operator_key_re().is_match(&frame.key) {
                 // body_json_scan._mongo_operator_key_hit: the reference
                 // reports this hit straight from the walk, unfiltered.
@@ -630,6 +639,7 @@ pub(crate) fn append_json_walk_entries(
                     values,
                     &inner,
                     &format!("{context}{EMBEDDED_JSON_LEAF_CONTEXT_SUFFIX}"),
+                    excluded,
                 );
                 continue;
             }
@@ -728,10 +738,15 @@ mod tests {
     fn walk(context: &str, body: &str) -> Vec<(String, String, Option<&'static str>)> {
         parse_ordered_json(body)
             .map(|root| {
-                append_json_walk_entries(Vec::new(), &root, context)
-                    .into_iter()
-                    .map(|v| (v.context, v.content, v.forced_category))
-                    .collect()
+                append_json_walk_entries(
+                    Vec::new(),
+                    &root,
+                    context,
+                    crate::body_scan::ExcludedBodyFields::default(),
+                )
+                .into_iter()
+                .map(|v| (v.context, v.content, v.forced_category))
+                .collect()
             })
             .unwrap_or_default()
     }

@@ -12,7 +12,6 @@
 //! passes through, every other byte becomes U+FFFD). Assertions are on
 //! detection outcomes, not on byte fixtures.
 
-use guard_core_engine::body_scan::extract_body_scan_values;
 use guard_core_engine::detect::{self, DetectConfig, Threat};
 
 const fn corpus_config() -> DetectConfig {
@@ -30,7 +29,12 @@ const fn corpus_config() -> DetectConfig {
 /// hit is an immediate threat, every other value goes through the normal
 /// detect path, first threat wins.
 fn scan_body(body: &str, content_type: &str, config: &DetectConfig) -> detect::DetectVerdict {
-    for value in extract_body_scan_values(body, content_type, config) {
+    for value in guard_core_engine::body_scan::extract_body_scan_values_with_exclusions(
+        body,
+        content_type,
+        config,
+        guard_core_engine::body_scan::ExcludedBodyFields::default(),
+    ) {
         if value.forced_category.is_some() {
             return detect::DetectVerdict {
                 is_threat: true,
