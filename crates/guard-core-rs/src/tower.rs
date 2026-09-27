@@ -124,6 +124,7 @@
 //!     .layer(RateLimitStageLayer::new(stage));
 //! ```
 
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -136,6 +137,13 @@ use ::tower::Layer;
 use http::header::RETRY_AFTER;
 use http::{Extensions, HeaderMap, HeaderValue, Request, Response, StatusCode};
 
+use crate::event_types::{EVENT_IP_BANNED, EVENT_PENETRATION_ATTEMPT, EVENT_RATE_LIMITED};
+use crate::events::{
+    IP_BAN_HANDLER_NAME, RATE_LIMIT_HANDLER_NAME, SecurityEvent, SecurityEventBus,
+};
+use crate::logging::{LogLevel, LogType, log_activity};
+use crate::redact::SensitiveNames;
+
 pub use guard_core_engine::geo::GeoIpHandler;
 pub use guard_core_engine::ip_ban::{
     BanError, BanRecord, IpBanConfig, IpBanConfigError, IpBanManager, RATE_LIMIT_CATEGORY,
@@ -144,7 +152,7 @@ pub use guard_core_engine::ip_ban::{
 pub use guard_core_engine::ip_gate::{IpGateDecision, IpGateError};
 pub use guard_core_engine::rate_limit::{
     Clock, RateLimitConfig, RateLimitConfigError, RateLimitEntry, RateLimitTier, RateLimiter,
-    RouteRateLimits, system_clock,
+    RouteRateLimits, TierDecision, system_clock,
 };
 
 /// The banned answer body (`ip_security._check_banned_ip`'s default message).
@@ -168,6 +176,39 @@ pub const PENETRATION_BAN_REASON: &str = "penetration_attempt";
 /// (the same seam the request-limits stage's `RouteLimitsResolver` uses).
 /// A resolver returning `None` for a path means the path has no route tier.
 pub type RouteRateResolver = Arc<dyn Fn(&str) -> Option<RouteRateLimits> + Send + Sync>;
+
+/// What the stage needs to know about the request it is emitting events
+/// and log lines for.
+///
+/// These are the pieces the reference's `GuardRequest` carries into
+/// `send_middleware_event` and `log_activity`. Everything is optional; a
+/// field the host cannot supply stays `None` and the composed lines
+/// carry the empty placeholder.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RequestObservation {
+    /// The HTTP method (`request.method`).
+    pub method: Option<String>,
+    /// The full URL the log lines redact and events carry as `endpoint`
+    /// (path plus query, `request.url_path` / `request.url_full`).
+    pub url: Option<String>,
+    /// The raw `User-Agent` header value, redacted into the event's
+    /// `user_agent` field.
+    pub user_agent: Option<String>,
+}
+
+/// The `SecurityConfig` log knobs the stage's emissions read
+/// (`log_suspicious_level`, `muted_check_logs`, and the merged
+/// `log_sensitive_*` redaction sets).
+#[derive(Debug, Clone, Default)]
+pub struct ObservabilityConfig {
+    /// `log_suspicious_level`, `"WARNING"` in the reference; `None` means
+    /// the reference's `level=None` (compose nothing).
+    pub log_suspicious_level: Option<LogLevel>,
+    /// `muted_check_logs`: check names suppressed from pipeline logging.
+    pub muted_check_logs: Option<HashSet<String>>,
+    /// The merged sensitive-name sets for the redaction.
+    pub sensitive: SensitiveNames,
+}
 
 /// The detection result a prior pipeline stage may attach to the request
 /// extensions.
@@ -316,6 +357,8 @@ pub struct RateLimitStage {
     extract_ip: ExtractIp,
     route_resolver: Option<RouteRateResolver>,
     geo_handler: Option<Arc<dyn GeoIpHandler>>,
+    events: Option<Arc<SecurityEventBus>>,
+    observability: Option<Arc<ObservabilityConfig>>,
 }
 
 impl fmt::Debug for RateLimitStage {
@@ -349,6 +392,8 @@ impl RateLimitStage {
             extract_ip: None,
             route_resolver: None,
             geo_handler: None,
+            events: None,
+            observability: None,
         }
     }
 
@@ -393,6 +438,7 @@ impl RateLimitStage {
     /// tier answers, and feeds the auto-ban engine identically (the
     /// reference records the crossing under every tier's reason with the
     /// same `rate_limit` category).
+    #[must_use]
     pub fn decide_for_path(
         &self,
         ip: Option<IpAddr>,
@@ -400,6 +446,25 @@ impl RateLimitStage {
         route: Option<&RouteRateLimits>,
         gate: Option<IpGateDecision>,
         finding: Option<&ThreatFinding>,
+    ) -> Option<StageResponse> {
+        self.decide_for_path_observed(ip, path, route, gate, finding, None)
+    }
+
+    /// [`RateLimitStage::decide_for_path`] plus the reference's event and
+    /// log emissions: every crossing, ban, and passive observation on the
+    /// paths this stage owns emits what the reference emits (the
+    /// `penetration_attempt`, `rate_limited`, and `ip_banned` events, the
+    /// `log_activity` "suspicious" lines, redacted through the installed
+    /// [`ObservabilityConfig`]). The request pieces arrive through
+    /// `observation`; `None` composes from what the decision carries.
+    pub fn decide_for_path_observed(
+        &self,
+        ip: Option<IpAddr>,
+        path: Option<&str>,
+        route: Option<&RouteRateLimits>,
+        gate: Option<IpGateDecision>,
+        finding: Option<&ThreatFinding>,
+        observation: Option<&RequestObservation>,
     ) -> Option<StageResponse> {
         let ip = ip?;
         let passive = self.config.passive_mode;
@@ -441,28 +506,34 @@ impl RateLimitStage {
                     .as_ref()
                     .map(|f| f as &dyn Fn(IpAddr) -> Option<String>),
             );
-            if !decision.allowed() && !passive {
-                // The crossing feeds the auto-ban engine with the
-                // `rate_limit` pseudo-category; the 429 still goes out (the
-                // reference returns the limit response either way) and the
-                // ban answers the next request.
-                if self.config.rate_limit.enable_rate_limit_auto_ban {
-                    // Whether the ban resolved or was refused does not
-                    // change this response: the 429 goes out either way and
-                    // the ban (if any) answers the next request.
-                    let _ = self.bans.register_violations(
-                        &self.counters,
-                        ip,
-                        &[RATE_LIMIT_CATEGORY],
-                        &self.config.ip_ban,
-                        RATE_LIMIT_BAN_REASON,
-                    );
+            if !decision.allowed() {
+                // The reference logs and emits the rate-limited event on
+                // every crossing, passive mode included; only the 429 and
+                // the auto-ban feed are passive-suppressed.
+                self.observe_rate_limited(ip, &decision, observation);
+                if !passive {
+                    // The crossing feeds the auto-ban engine with the
+                    // `rate_limit` pseudo-category; the 429 still goes out
+                    // (the reference returns the limit response either way)
+                    // and the ban answers the next request.
+                    if self.config.rate_limit.enable_rate_limit_auto_ban {
+                        // Whether the ban resolved or was refused does not
+                        // change this response: the 429 goes out either way
+                        // and the ban (if any) answers the next request.
+                        let _ = self.bans.register_violations(
+                            &self.counters,
+                            ip,
+                            &[RATE_LIMIT_CATEGORY],
+                            &self.config.ip_ban,
+                            RATE_LIMIT_BAN_REASON,
+                        );
+                    }
+                    return Some(StageResponse {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        body: THROTTLED_BODY,
+                        retry_after: Some(decision.retry_after()),
+                    });
                 }
-                return Some(StageResponse {
-                    status: StatusCode::TOO_MANY_REQUESTS,
-                    body: THROTTLED_BODY,
-                    retry_after: Some(decision.retry_after()),
-                });
             }
         }
 
@@ -471,24 +542,47 @@ impl RateLimitStage {
             if passive {
                 // Log-only: the categories still count (the reference's
                 // `_increment_suspicious_counts` runs either way) but the
-                // threshold ban and the block answer are suppressed.
+                // threshold ban and the block answer are suppressed. The
+                // reference still logs the passive line and emits the
+                // `logged_only` penetration_attempt event.
                 self.counters.record(ip, &categories);
-            } else if self
-                .bans
-                .register_violations(
+                self.observe_penetration(ip, finding, observation, true, None);
+            } else {
+                let resolved = self.bans.register_violations(
                     &self.counters,
                     ip,
                     &categories,
                     &self.config.ip_ban,
                     PENETRATION_BAN_REASON,
-                )
-                .is_some()
-            {
-                return Some(StageResponse {
-                    status: StatusCode::FORBIDDEN,
-                    body: BAN_CROSSED_BODY,
-                    retry_after: None,
-                });
+                );
+                if let Some(resolved) = &resolved {
+                    self.observe_ban_fired(ip, resolved);
+                }
+                // The reference's suspicious-activity check logs and emits
+                // on every active detection, crossing or not; only the
+                // ban crossing turns this request into the 403.
+                let log_reason = match resolved.as_ref().and_then(|r| r.category.as_deref()) {
+                    Some(category) => Some(format!(
+                        "IP banned due to {category} threshold: {ip} - {}",
+                        finding.trigger_info
+                    )),
+                    None if resolved.is_some() => Some(format!(
+                        "IP banned due to suspicious activity: {ip} - {}",
+                        finding.trigger_info
+                    )),
+                    None => Some(format!(
+                        "Suspicious activity detected for IP: {ip} - {}",
+                        finding.trigger_info
+                    )),
+                };
+                self.observe_penetration(ip, finding, observation, false, log_reason.as_deref());
+                if resolved.is_some() {
+                    return Some(StageResponse {
+                        status: StatusCode::FORBIDDEN,
+                        body: BAN_CROSSED_BODY,
+                        retry_after: None,
+                    });
+                }
             }
         }
 
@@ -523,6 +617,207 @@ impl RateLimitStage {
     ) -> Option<StageResponse> {
         self.decide_for_path(ip, None, None, gate, finding)
     }
+
+    /// Compose the reference "suspicious" log line (`log_activity` with
+    /// `log_type="suspicious"`): the reference wording, the redacted URL
+    /// and headers, the `muted_check_logs` and `log_suspicious_level`
+    /// knobs. `Some(line)` is the composed message the host logs; `None`
+    /// mirrors the reference logging nothing (level `None`, muted check).
+    #[must_use]
+    pub fn compose_suspicious_log(
+        &self,
+        ip: IpAddr,
+        reason: &str,
+        observation: Option<&RequestObservation>,
+        passive_mode: bool,
+        trigger_info: &str,
+        check_name: &str,
+    ) -> Option<String> {
+        let knobs = self.observability.as_deref().cloned().unwrap_or_default();
+        log_activity(
+            LogType::Suspicious,
+            knobs.log_suspicious_level.or(Some(LogLevel::Warning)),
+            reason,
+            Some(&ip.to_string()),
+            observation.and_then(|obs| obs.method.as_deref()),
+            observation.and_then(|obs| obs.url.as_deref()),
+            None,
+            passive_mode,
+            trigger_info,
+            Some(check_name),
+            knobs.muted_check_logs.as_ref(),
+            &knobs.sensitive,
+        )
+    }
+
+    /// The reference `log_activity` emission for a crossing: composed with
+    /// this stage's knobs, dropped on the floor when nothing would log.
+    fn log_rate_limited(&self, ip: IpAddr, decision: &TierDecision) {
+        let _ = self.compose_suspicious_log(
+            ip,
+            &format!(
+                "Rate limit exceeded for IP: {ip} ({} requests in {}s window)",
+                decision.count(),
+                decision.retry_after()
+            ),
+            None,
+            false,
+            "",
+            "rate_limit",
+        );
+    }
+
+    /// The rate-limit crossing emission (`_send_rate_limit_event` +
+    /// `log_activity`): the `rate_limited` event under
+    /// `handler_name = "rate_limit"` with the reference metadata, and the
+    /// `log_activity` suspicious line. Passive mode flips the action to
+    /// `logged_only`, exactly `_send_rate_limit_event`'s passive branch.
+    fn observe_rate_limited(
+        &self,
+        ip: IpAddr,
+        decision: &TierDecision,
+        observation: Option<&RequestObservation>,
+    ) {
+        self.log_rate_limited(ip, decision);
+        let Some(bus) = &self.events else {
+            return;
+        };
+        let passive = self.config.passive_mode;
+        let knobs = self.observability.as_deref().cloned().unwrap_or_default();
+        let endpoint = observation
+            .and_then(|obs| obs.url.as_deref())
+            .map(|url| crate::redact::redact_url_for_display(url, &knobs.sensitive));
+        let mut event = SecurityEvent::new(
+            EVENT_RATE_LIMITED,
+            &ip.to_string(),
+            if passive {
+                "logged_only"
+            } else {
+                "request_blocked"
+            },
+            &format!(
+                "Rate limit exceeded: {} requests in {}s window",
+                decision.count(),
+                decision.retry_after()
+            ),
+            RATE_LIMIT_HANDLER_NAME,
+        );
+        event.endpoint = endpoint;
+        event.method = observation.and_then(|obs| obs.method.clone());
+        event.user_agent = observation
+            .and_then(|obs| obs.user_agent.as_deref())
+            .map(|agent| crate::redact::redact_blob_for_display(agent, &knobs.sensitive));
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "request_count".to_owned(),
+            serde_json::json!(decision.count()),
+        );
+        metadata.insert(
+            "rate_limit".to_owned(),
+            serde_json::json!(self.config.rate_limit.rate_limit),
+        );
+        metadata.insert(
+            "window".to_owned(),
+            serde_json::json!(decision.retry_after()),
+        );
+        event.metadata = metadata;
+        bus.send_event(&event);
+    }
+
+    /// The ban-fired emission (`IpBanEventMixin._send_ban_event`): the
+    /// `ip_banned` event under `handler_name = "ip_ban"` with the applied
+    /// duration, exactly when a ban now stands.
+    fn observe_ban_fired(&self, ip: IpAddr, resolved: &ResolvedBan) {
+        let Some(bus) = &self.events else {
+            return;
+        };
+        let mut event = SecurityEvent::new(
+            EVENT_IP_BANNED,
+            &ip.to_string(),
+            "banned",
+            &resolved.reason,
+            IP_BAN_HANDLER_NAME,
+        );
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("duration".to_owned(), serde_json::json!(resolved.duration));
+        event.metadata = metadata;
+        bus.send_event(&event);
+    }
+
+    /// The penetration-attempt emission (`suspicious_activity.py`): the
+    /// `log_activity` suspicious line plus the `penetration_attempt`
+    /// event, active (`request_blocked`) or passive (`logged_only` with
+    /// the reference passive reason and `passive_mode` metadata).
+    fn observe_penetration(
+        &self,
+        ip: IpAddr,
+        finding: &ThreatFinding,
+        observation: Option<&RequestObservation>,
+        passive: bool,
+        log_reason: Option<&str>,
+    ) {
+        let trigger_info = &finding.trigger_info;
+        if passive {
+            let _ = self.compose_suspicious_log(
+                ip,
+                &format!("Suspicious activity detected: {ip}"),
+                observation,
+                true,
+                trigger_info,
+                "suspicious_activity",
+            );
+        } else if let Some(log_reason) = log_reason {
+            let _ = self.compose_suspicious_log(
+                ip,
+                log_reason,
+                observation,
+                false,
+                "",
+                "suspicious_activity",
+            );
+        }
+        let Some(bus) = &self.events else {
+            return;
+        };
+        let knobs = self.observability.as_deref().cloned().unwrap_or_default();
+        let total_count: u64 = self.counters.snapshot(ip).values().sum();
+        let mut event = if passive {
+            let mut event = SecurityEvent::new(
+                EVENT_PENETRATION_ATTEMPT,
+                &ip.to_string(),
+                "logged_only",
+                &format!("Suspicious pattern detected (passive mode): {trigger_info}"),
+                crate::events::MIDDLEWARE_HANDLER_NAME,
+            );
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("passive_mode".to_owned(), serde_json::json!(true));
+            metadata.insert("request_count".to_owned(), serde_json::json!(total_count));
+            metadata.insert("trigger_info".to_owned(), serde_json::json!(trigger_info));
+            event.metadata = metadata;
+            event
+        } else {
+            let mut event = SecurityEvent::new(
+                EVENT_PENETRATION_ATTEMPT,
+                &ip.to_string(),
+                "request_blocked",
+                &format!("Penetration attempt detected: {trigger_info}"),
+                crate::events::MIDDLEWARE_HANDLER_NAME,
+            );
+            let mut metadata = serde_json::Map::new();
+            metadata.insert("request_count".to_owned(), serde_json::json!(total_count));
+            metadata.insert("trigger_info".to_owned(), serde_json::json!(trigger_info));
+            event.metadata = metadata;
+            event
+        };
+        event.endpoint = observation
+            .and_then(|obs| obs.url.as_deref())
+            .map(|url| crate::redact::redact_url_for_display(url, &knobs.sensitive));
+        event.method = observation.and_then(|obs| obs.method.clone());
+        event.user_agent = observation
+            .and_then(|obs| obs.user_agent.as_deref())
+            .map(|agent| crate::redact::redact_blob_for_display(agent, &knobs.sensitive));
+        bus.send_event(&event);
+    }
 }
 
 /// The fail-closed builder for [`RateLimitStage`]: every seam is optional
@@ -535,6 +830,8 @@ pub struct RateLimitStageBuilder {
     extract_ip: Option<ExtractIp>,
     route_resolver: Option<RouteRateResolver>,
     geo_handler: Option<Arc<dyn GeoIpHandler>>,
+    events: Option<Arc<SecurityEventBus>>,
+    observability: Option<Arc<ObservabilityConfig>>,
 }
 
 impl RateLimitStageBuilder {
@@ -587,6 +884,24 @@ impl RateLimitStageBuilder {
         self
     }
 
+    /// Install the event bus the stage's emissions dispatch through (the
+    /// reference `event_bus` / `agent_handler` pair). Without one the
+    /// stage still composes the reference log lines but sends no events.
+    pub fn events(mut self, bus: Arc<SecurityEventBus>) -> Self {
+        self.events = Some(bus);
+        self
+    }
+
+    /// Install the log knobs (`log_suspicious_level`,
+    /// `muted_check_logs`, and the `log_sensitive_*` redaction sets) the
+    /// stage's `log_activity` emissions read. Without one the reference
+    /// defaults apply: `WARNING` suspicious level, nothing muted, the
+    /// hardcoded sensitive sets.
+    pub fn observability(mut self, config: ObservabilityConfig) -> Self {
+        self.observability = Some(Arc::new(config));
+        self
+    }
+
     /// Validate everything and build the stage.
     ///
     /// # Errors
@@ -616,6 +931,8 @@ impl RateLimitStageBuilder {
                 .unwrap_or_else(|| Arc::new(default_extract_ip)),
             route_resolver: self.route_resolver,
             geo_handler: self.geo_handler,
+            events: self.events,
+            observability: self.observability,
         })
     }
 }
@@ -687,10 +1004,31 @@ where
         // adapter's routing layer inserts) when the stack provides one.
         let route = request.extensions().get::<RouteRateLimits>();
         let path = request.uri().path();
-        if let Some(answer) = self
-            .stage
-            .decide_for_path(ip, Some(path), route, gate, finding)
-        {
+        // The request pieces the event and log emissions carry (the
+        // reference's GuardRequest fields for `send_middleware_event` and
+        // `log_activity`).
+        let observation = RequestObservation {
+            method: Some(request.method().to_string()),
+            url: Some(
+                request
+                    .uri()
+                    .path_and_query()
+                    .map_or_else(|| path.to_owned(), std::string::ToString::to_string),
+            ),
+            user_agent: request
+                .headers()
+                .get(http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned),
+        };
+        if let Some(answer) = self.stage.decide_for_path_observed(
+            ip,
+            Some(path),
+            route,
+            gate,
+            finding,
+            Some(&observation),
+        ) {
             let response = render(answer);
             return Box::pin(async move { Ok(response) });
         }
@@ -1888,5 +2226,195 @@ mod tests {
         let second_response =
             block_on(second.call(request_from_client("192.0.2.23"))).expect("ready");
         assert_eq!(second_response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    // ---- Event and log emissions (the reference event surface) ----
+
+    use std::sync::Mutex;
+
+    use crate::event_types::{EVENT_IP_BANNED, EVENT_PENETRATION_ATTEMPT, EVENT_RATE_LIMITED};
+    use crate::events::{EventFilter, MIDDLEWARE_HANDLER_NAME};
+
+    type EventLog = Arc<Mutex<Vec<(String, String, String)>>>;
+
+    fn recording_bus() -> (EventLog, Arc<SecurityEventBus>) {
+        let seen: EventLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let bus = Arc::new(SecurityEventBus::new(true).on_event(Arc::new(
+            move |event: &SecurityEvent| {
+                sink.lock().expect("sink").push((
+                    event.event_type.clone(),
+                    event.action_taken.clone(),
+                    event.reason.clone(),
+                ));
+            },
+        )));
+        (seen, bus)
+    }
+
+    fn event_stage(
+        config: RateLimitStageConfig,
+        clock: Clock,
+        bus: Arc<SecurityEventBus>,
+    ) -> RateLimitStage {
+        RateLimitStage::builder(config)
+            .clock(clock)
+            .events(bus)
+            .build()
+            .expect("valid stage config")
+    }
+
+    #[test]
+    fn rate_limit_crossing_emits_the_reference_rate_limited_event() {
+        let (seen, bus) = recording_bus();
+        let stage = event_stage(
+            RateLimitStageConfig {
+                rate_limit: RateLimitConfig {
+                    enable_rate_limiting: true,
+                    rate_limit: 1,
+                    ..RateLimitConfig::default()
+                },
+                ..RateLimitStageConfig::default()
+            },
+            Arc::new(system_clock),
+            bus,
+        );
+        let visitor = ip("192.0.2.41");
+        assert!(stage.decide(Some(visitor), None, None).is_none());
+        let throttled = stage.decide(Some(visitor), None, None).expect("throttled");
+        assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
+
+        let events = seen.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        let (event_type, action_taken, reason) = &events[0];
+        assert_eq!(event_type, EVENT_RATE_LIMITED);
+        assert_eq!(action_taken, "request_blocked");
+        assert_eq!(reason, "Rate limit exceeded: 2 requests in 60s window");
+    }
+
+    #[test]
+    fn detection_crossing_emits_penetration_attempt_and_ip_banned() {
+        let (seen, bus) = recording_bus();
+        let stage = event_stage(
+            RateLimitStageConfig {
+                ip_ban: IpBanConfig::new(true, 1, 3600, Vec::<(String, ThreatBanEntry)>::new())
+                    .expect("valid ban config"),
+                ..RateLimitStageConfig::default()
+            },
+            Arc::new(system_clock),
+            bus,
+        );
+        let finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["sqli".to_owned()],
+            trigger_info: "sqli in ?q=1".to_owned(),
+        };
+        let answer = stage
+            .decide(Some(ip("192.0.2.42")), None, Some(&finding))
+            .expect("ban crossing");
+        assert_eq!(answer.body, BAN_CROSSED_BODY);
+
+        let events = seen.lock().expect("sink").clone();
+        let types: Vec<&str> = events.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(types, [EVENT_IP_BANNED, EVENT_PENETRATION_ATTEMPT]);
+        assert_eq!(events[0].1, "banned");
+        assert_eq!(events[1].1, "request_blocked");
+        assert_eq!(events[1].2, "Penetration attempt detected: sqli in ?q=1");
+    }
+
+    #[test]
+    fn passive_detection_emits_logged_only_penetration_attempt() {
+        let (seen, bus) = recording_bus();
+        let stage = event_stage(
+            RateLimitStageConfig {
+                passive_mode: true,
+                ..RateLimitStageConfig::default()
+            },
+            Arc::new(system_clock),
+            bus,
+        );
+        let finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["xss".to_owned()],
+            trigger_info: "script tag".to_owned(),
+        };
+        assert!(
+            stage
+                .decide(Some(ip("192.0.2.43")), None, Some(&finding))
+                .is_none()
+        );
+
+        let events = seen.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, EVENT_PENETRATION_ATTEMPT);
+        assert_eq!(events[0].1, "logged_only");
+        assert_eq!(
+            events[0].2,
+            "Suspicious pattern detected (passive mode): script tag"
+        );
+    }
+
+    #[test]
+    fn muted_event_types_never_reach_the_bus() {
+        let (seen, _bus) = recording_bus();
+        let filtered = Arc::new(
+            SecurityEventBus::new(true)
+                .with_filter(EventFilter {
+                    muted_event_types: HashSet::from([EVENT_RATE_LIMITED.to_owned()]),
+                })
+                .on_event({
+                    let sink = seen.clone();
+                    Arc::new(move |event: &SecurityEvent| {
+                        sink.lock().expect("sink").push((
+                            event.event_type.clone(),
+                            String::new(),
+                            String::new(),
+                        ));
+                    })
+                }),
+        );
+        let stage = event_stage(
+            RateLimitStageConfig {
+                rate_limit: RateLimitConfig {
+                    enable_rate_limiting: true,
+                    rate_limit: 1,
+                    ..RateLimitConfig::default()
+                },
+                ..RateLimitStageConfig::default()
+            },
+            Arc::new(system_clock),
+            filtered,
+        );
+        let visitor = ip("192.0.2.44");
+        let _ = stage.decide(Some(visitor), None, None);
+        let _ = stage.decide(Some(visitor), None, None);
+        assert!(seen.lock().expect("sink").is_empty());
+    }
+
+    #[test]
+    fn compose_suspicious_log_matches_the_reference_wording_and_redaction() {
+        let stage = RateLimitStage::new(RateLimitStageConfig::default()).expect("config");
+        let observation = RequestObservation {
+            method: Some("GET".to_owned()),
+            url: Some("/login?token=abc".to_owned()),
+            user_agent: None,
+        };
+        let line = stage
+            .compose_suspicious_log(
+                ip("192.0.2.45"),
+                "Rate limit exceeded for IP: 192.0.2.45 (11 requests in 60s window)",
+                Some(&observation),
+                false,
+                "",
+                "rate_limit",
+            )
+            .expect("logged");
+        assert_eq!(
+            line,
+            "Suspicious activity detected from 192.0.2.45: GET /login?token=[REDACTED] - \
+             Reason: Rate limit exceeded for IP: 192.0.2.45 (11 requests in 60s window) - \
+             Headers: {}"
+        );
+        assert_eq!(MIDDLEWARE_HANDLER_NAME, "middleware");
     }
 }

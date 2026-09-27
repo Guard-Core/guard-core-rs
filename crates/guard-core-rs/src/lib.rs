@@ -35,6 +35,13 @@
 //!   stage as a `tower::Layer` (dynamic 400 required-header shapes, fixed
 //!   401 authentication shape, route rules with a global verifier
 //!   fallback)
+//! - [`event_types`] / [`events`] - the reference `EVENT_*` constants and
+//!   the `SecurityEventBus` hook seam over the reference `SecurityEvent`
+//!   record
+//! - [`logging`] - the reference `log_activity` line shapes with the
+//!   `muted_check_logs` and `log_sensitive_*` redaction knobs
+//! - [`redact`] - the merged sensitive-name sets and the
+//!   `[REDACTED]` redaction the log lines run through
 //!
 //! # Usage
 //!
@@ -56,8 +63,12 @@
 //! ```
 
 pub mod cloud_provider;
+pub mod event_types;
+pub mod events;
 pub mod geo;
 pub mod headers_auth;
+pub mod logging;
+pub mod redact;
 pub mod request_limits;
 pub mod tower;
 pub mod user_agent;
