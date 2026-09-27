@@ -488,6 +488,7 @@ impl RateLimitStage {
     /// `log_activity` "suspicious" lines, redacted through the installed
     /// [`ObservabilityConfig`]). The request pieces arrive through
     /// `observation`; `None` composes from what the decision carries.
+    #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn decide_for_path_observed(
         &self,
@@ -620,6 +621,7 @@ impl RateLimitStage {
     /// `whitelisted` is the global IP gate's skip state (a whitelisted IP
     /// never feeds - the reference skips a whitelisted IP only; exemption
     /// never shields counting).
+    #[must_use]
     pub fn feed_finding(
         &self,
         ip: Option<IpAddr>,
@@ -627,9 +629,7 @@ impl RateLimitStage {
         finding: Option<&ThreatFinding>,
         observation: Option<&RequestObservation>,
     ) -> Option<StageResponse> {
-        let Some(ip) = ip else {
-            return None;
-        };
+        let ip = ip?;
         let passive = self.config.passive_mode;
         if let Some(finding) = finding.filter(|finding| finding.is_threat && !whitelisted) {
             let categories: Vec<&str> = finding.categories.iter().map(String::as_str).collect();
