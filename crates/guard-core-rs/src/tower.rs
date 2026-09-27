@@ -416,6 +416,8 @@ impl RateLimitStage {
             config,
             clock: None,
             trusted_proxies: Vec::new(),
+            limiter: None,
+            bans: None,
             extract_ip: None,
             route_resolver: None,
             geo_handler: None,
@@ -966,6 +968,8 @@ pub struct RateLimitStageBuilder {
     config: RateLimitStageConfig,
     clock: Option<Clock>,
     trusted_proxies: Vec<String>,
+    limiter: Option<RateLimiter>,
+    bans: Option<(IpBanManager, ViolationCounters)>,
     extract_ip: Option<ExtractIp>,
     route_resolver: Option<RouteRateResolver>,
     geo_handler: Option<Arc<dyn GeoIpHandler>>,
@@ -991,6 +995,31 @@ impl RateLimitStageBuilder {
         I::Item: Into<String>,
     {
         self.trusted_proxies = entries.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Bring your own limiter handle: the stage drives this shared
+    /// [`RateLimiter`] (its clock, its distributed store, its already
+    /// recorded windows) instead of building one from the config. The
+    /// stage's [`RateLimitStage::limiter`] returns the same handle, so
+    /// hosts can keep out-of-band views of the sliding windows. Only the
+    /// limiter's config part of [`RateLimitStageConfig`] matters for
+    /// decisions; validation still reads it.
+    pub fn limiter(mut self, limiter: RateLimiter) -> Self {
+        self.limiter = Some(limiter);
+        self
+    }
+
+    /// Bring your own ban handles: the stage consults this shared
+    /// [`IpBanManager`] and accumulates into this shared
+    /// [`ViolationCounters`] instead of building fresh ones. The stage's
+    /// [`RateLimitStage::bans`] and [`RateLimitStage::counters`] return
+    /// the same handles, so hosts can keep out-of-band ban and count
+    /// views (admin unban endpoints, stats) alongside the installed
+    /// layer. The config part of [`RateLimitStageConfig`] still gates
+    /// banning; the manager's own clock and trusted proxies apply.
+    pub fn ban_manager(mut self, bans: IpBanManager, counters: ViolationCounters) -> Self {
+        self.bans = Some((bans, counters));
         self
     }
 
@@ -1099,11 +1128,25 @@ impl RateLimitStageBuilder {
             .validate()
             .map_err(RateLimitStageError::IpBan)?;
         let clock = self.clock.unwrap_or_else(|| Arc::new(system_clock));
-        let mut limiter =
-            RateLimiter::with_config_and_clock(self.config.rate_limit.clone(), Arc::clone(&clock))
-                .map_err(RateLimitStageError::RateLimit)?;
-        let mut bans = IpBanManager::with_trusted_proxies_and_clock(self.trusted_proxies, clock)
-            .map_err(RateLimitStageError::TrustedProxy)?;
+        let mut limiter = match self.limiter {
+            // An injected handle carries its own clock, trusted state, and
+            // possibly a distributed store already; only the config part of
+            // the stage config drives its decisions.
+            Some(limiter) => limiter,
+            None => RateLimiter::with_config_and_clock(
+                self.config.rate_limit.clone(),
+                Arc::clone(&clock),
+            )
+            .map_err(RateLimitStageError::RateLimit)?,
+        };
+        let (mut bans, counters) = match self.bans {
+            Some((bans, counters)) => (bans, counters),
+            None => (
+                IpBanManager::with_trusted_proxies_and_clock(self.trusted_proxies, clock)
+                    .map_err(RateLimitStageError::TrustedProxy)?,
+                ViolationCounters::new(),
+            ),
+        };
         if let Some(seam) = &self.distributed {
             if let Some(ban_store) = &seam.ban_store {
                 bans = bans
@@ -1120,7 +1163,7 @@ impl RateLimitStageBuilder {
             config: self.config,
             limiter,
             bans,
-            counters: ViolationCounters::new(),
+            counters,
             extract_ip: self
                 .extract_ip
                 .unwrap_or_else(|| Arc::new(default_extract_ip)),
@@ -2904,5 +2947,55 @@ mod tests {
                 .contains_key("guard_core:rate_limit:rate:192.0.2.93")
         );
         let _ = StoreError(String::new());
+    }
+
+    // ---- the handle-injection seams (limiter / ban_manager) ----
+
+    #[test]
+    fn an_injected_limiter_handle_shares_its_windows_with_the_stage() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            enable_rate_limiting: true,
+            rate_limit: 1,
+            ..RateLimitConfig::default()
+        })
+        .expect("valid config");
+        let stage = RateLimitStage::builder(RateLimitStageConfig::default())
+            .limiter(limiter.clone())
+            .build()
+            .expect("config");
+        let visitor = ip("192.0.2.94");
+        assert!(stage.decide(Some(visitor), None, None).is_none());
+        let throttled = stage.decide(Some(visitor), None, None).expect("throttled");
+        assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
+        // The out-of-band handle sees the same window: the injected handle
+        // is the stage's, not a rebuilt one.
+        assert!(!stage.limiter().check(visitor, None).allowed);
+        let _ = &limiter;
+    }
+
+    #[test]
+    fn an_injected_ban_handle_shares_bans_and_counters_with_the_stage() {
+        let manager = IpBanManager::new();
+        let counters = ViolationCounters::new();
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            ip_ban: IpBanConfig {
+                enable_ip_banning: true,
+                ..IpBanConfig::default()
+            },
+            ..RateLimitStageConfig::default()
+        })
+        .ban_manager(manager.clone(), counters.clone())
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.95");
+        // Out-of-band ban (an operator did it) is visible to the stage.
+        manager.ban_ip(visitor, 60, "operator").expect("ban");
+        let banned = stage.decide(Some(visitor), None, None).expect("banned");
+        assert_eq!(banned.status, StatusCode::FORBIDDEN);
+        assert_eq!(banned.body, BANNED_BODY);
+        // And the stage counts into the injected counters.
+        stage.counters().record(visitor, &["sqli"]);
+        let snapshot = counters.snapshot(visitor);
+        assert_eq!(snapshot.get("sqli"), Some(&1));
     }
 }
