@@ -315,3 +315,49 @@ mod tests {
         assert_eq!(parts[0].payload, "payload");
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_boundary_yields_no_parts() {
+        let body = "Content-Disposition: form-data; name=\"f\"\r\n\r\nbody";
+        let parts = parse_multipart_parts(body, "NO_SUCH_BOUNDARY");
+        assert!(parts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn a_part_with_no_payload_lines_yields_an_empty_payload() {
+        // the blank header terminator sits directly against the final boundary
+        let body = "--B0\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\n--B0--\r\n";
+        let parts = parse_multipart_parts(body, "B0");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].payload, "");
+    }
+
+    #[test]
+    fn a_bare_newline_before_the_boundary_stays_in_the_payload() {
+        // the payload's last line ends in a bare LF (no CR), so the delimiter
+        // strips only the LF
+        let body = "--B0\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nabc\n--B0--\r\n";
+        let parts = parse_multipart_parts(body, "B0");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].payload, "abc");
+    }
+
+    #[test]
+    fn a_lone_newline_payload_collapses_to_empty() {
+        // a payload of exactly one LF whose preceding line ended in CRLF:
+        // both decrement below the payload start
+        let body = "--B0\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\n\n--B0--\r\n";
+        let parts = parse_multipart_parts(body, "B0");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].payload, "");
+    }
+}

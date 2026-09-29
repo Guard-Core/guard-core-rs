@@ -501,3 +501,34 @@ mod tests {
         assert!(!is_valid_header_name(""));
     }
 }
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_header_with_an_unsanitizable_value_is_rejected() {
+        let config = SecurityHeadersConfig {
+            custom: std::iter::once(("X-Custom".to_owned(), "bad\nvalue".to_owned())).collect(),
+            ..SecurityHeadersConfig::reference_default()
+        };
+        let error = config.validate().expect_err("newline value");
+        assert_eq!(
+            error,
+            SecurityHeadersError::InvalidValue {
+                name: "X-Custom".to_owned(),
+                reason: validate_header_value("bad\nvalue").unwrap_err(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_invalid_custom_header_name_displays_the_reference_message() {
+        let config = SecurityHeadersConfig {
+            custom: std::iter::once(("X Custom".to_owned(), "value".to_owned())).collect(),
+            ..SecurityHeadersConfig::reference_default()
+        };
+        let error = config.validate().expect_err("space in name");
+        assert_eq!(error.to_string(), "invalid header name: X Custom");
+    }
+}

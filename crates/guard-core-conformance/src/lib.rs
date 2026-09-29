@@ -107,3 +107,102 @@ pub struct MatchEvidence {
     pub matched: String,
     pub position: u64,
 }
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    use crate::corpus::{Case, CaseInput, LoadedSuite};
+    use serde_json::json;
+
+    fn corpus_case(id: &str, expected: Value) -> Corpus {
+        Corpus {
+            index: crate::corpus::IndexFile {
+                spec_version: crate::corpus::EXPECTED_SPEC_VERSION.to_owned(),
+                engine_version: "4.2.0".to_owned(),
+                engine_commit: "deadbeef".to_owned(),
+                fixed_ip: "10.0.0.1".to_owned(),
+                config_knobs: json!({}),
+                suites: std::collections::BTreeMap::new(),
+                comparison: crate::corpus::Comparison {
+                    threat_order: "position".to_owned(),
+                    excluded_fields: Vec::new(),
+                    float_precision: 6,
+                },
+            },
+            suites: vec![LoadedSuite {
+                name: "detect_sqli".to_owned(),
+                cases: vec![Case {
+                    id: id.to_owned(),
+                    input: CaseInput {
+                        content: "nothing bad".to_owned(),
+                        context: "arg".to_owned(),
+                    },
+                    expected,
+                }],
+            }],
+        }
+    }
+
+    fn knobs() -> Knobs {
+        Knobs {
+            max_content_length: 10_000,
+            max_truncate_bytes: 262_144,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            unmapped: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn run_case_marks_diverging_expectations_failed() {
+        let corpus = corpus_case("clean_case", serde_json::json!({"is_threat": true}));
+        let results = run_corpus(&corpus, &knobs());
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].status, Status::Failed));
+        assert!(!results[0].diffs.is_empty());
+    }
+
+    #[test]
+    fn run_case_marks_matching_expectations_passed() {
+        // the clean verdict matches its full expected record (`threats` is
+        // the documented skip)
+        let corpus = corpus_case(
+            "clean_case",
+            serde_json::json!({
+                "is_threat": false,
+                "threat_score": 0.0,
+                "original_length": 11,
+                "processed_length": 11,
+                "detection_method": "enhanced",
+            }),
+        );
+        let results = run_corpus(&corpus, &knobs());
+        assert_eq!(
+            results[0].status,
+            Status::Passed,
+            "diffs: {:?}",
+            results[0].diffs
+        );
+        assert!(results[0].diffs.is_empty());
+    }
+
+    #[test]
+    fn corpus_patterns_skips_cases_without_expected_threats() {
+        let mut corpus = corpus_case(
+            "clean_case",
+            serde_json::json!({"is_threat": false, "threats": []}),
+        );
+        // a second case with no `threats` key at all: skipped entirely
+        corpus.suites[0].cases.push(Case {
+            id: "no_threats_key".to_owned(),
+            input: CaseInput {
+                content: "nothing".to_owned(),
+                context: "arg".to_owned(),
+            },
+            expected: serde_json::json!({"is_threat": false}),
+        });
+        let evidence = corpus_patterns(&corpus);
+        assert!(evidence.is_empty(), "no expected threats: {evidence:?}");
+    }
+}

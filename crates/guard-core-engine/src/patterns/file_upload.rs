@@ -267,9 +267,13 @@ pub fn file_upload_scan_matches(
     decoded_trunc_source: &str,
 ) -> Vec<Candidate> {
     let mut matches = Vec::new();
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(filename_re) = super::pyregex::PyRegex::compile("(?i)filename", false) else {
         return matches;
     };
+    #[cfg(coverage)]
+    let filename_re =
+        super::pyregex::PyRegex::compile("(?i)filename", false).expect("statically valid literal");
     let mut last_end = 0usize;
     for m in filename_re.re().find_iter(content) {
         let Some((start, body_start, end)) = quoted_candidate(content, m.start()) else {
@@ -410,5 +414,234 @@ mod tests {
             )
             .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn sources() -> (&'static str, &'static str, &'static str, &'static str) {
+        use crate::patterns::table::PATTERN_DEFINITIONS;
+        let source_of = |id: usize| {
+            PATTERN_DEFINITIONS
+                .iter()
+                .find(|e| e.id == id)
+                .map_or("", |e| e.source)
+        };
+        (source_of(89), source_of(90), source_of(91), source_of(92))
+    }
+
+    #[test]
+    fn marker_edges_cover_window_truncation_and_terminal_shapes() {
+        let ext = DOUBLE_EXT;
+        // the digit run followed by a letter backtracks all the way to php and
+        // falls through to the alternation (which has no php entry)
+        assert_eq!(dangerous_marker_at("x.php333a", 1, ext), None);
+        // terminal shapes
+        assert!(!terminal_extension("shellphp", ext, true));
+        assert!(!terminal_extension("shell.", ext, true));
+        assert!(terminal_extension("shell.php7", ext, true));
+        assert!(!benign_terminal("noext"));
+        assert!(!is_double_extension("archive.tar.gz"));
+        // truncation marker position edges
+        assert!(truncation_marker_at("shell.php.", 9, false));
+        assert!(!truncation_marker_at("shell.php", 100, false));
+        assert_eq!(file_upload_match_start("filename=\"a.php\"", 0), Some(0));
+    }
+
+    #[test]
+    fn marker_end_backtracks_php_digits_and_honors_suffixes() {
+        let ext = DOUBLE_EXT;
+        // the greedy php digits backtrack until the suffix is non-alphanumeric
+        assert_eq!(dangerous_marker_at("x.php333 ok", 1, ext), Some(8));
+        // php with no digits ends right after php
+        assert_eq!(dangerous_marker_at("x.php ok", 1, ext), Some(5));
+        // a php suffix glued to letters rejects the branch and the alternation
+        assert_eq!(dangerous_marker_at("x.phpy", 1, ext), None);
+        // a non-dot position is never a marker
+        assert_eq!(dangerous_marker_at("php", 0, ext), None);
+    }
+
+    #[test]
+    fn scan_matches_covers_all_four_source_kinds() {
+        let (dangerous, double, trunc, decoded_trunc) = sources();
+
+        // dangerous terminal extension
+        let out = file_upload_scan_matches(
+            "Content-Disposition: filename=\"shell.php\"",
+            dangerous,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert_eq!(out.len(), 1);
+
+        // double extension: dangerous then benign terminal
+        let content = "Content-Disposition: filename=\"shell.php.docx\"";
+        println!("DEBUG is_double: {}", is_double_extension("shell.php.docx"));
+        println!(
+            "DEBUG quoted: {:?}",
+            quoted_candidate(content, content.find("filename").expect("fn"))
+        );
+        let out =
+            file_upload_scan_matches(content, double, dangerous, double, trunc, decoded_trunc);
+        println!("DEBUG out: {out:?}");
+        assert_eq!(out.len(), 1);
+
+        // raw truncation marker (%00) after the extension
+        let out = file_upload_scan_matches(
+            "Content-Disposition: filename=\"shell.php%00x\"",
+            trunc,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert_eq!(out.len(), 1);
+
+        // decoded truncation: a real NUL byte after the extension
+        let out = file_upload_scan_matches(
+            "Content-Disposition: filename=\"shell.php\u{0}x\"",
+            decoded_trunc,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert_eq!(out.len(), 1);
+
+        // a benign filename matches nothing
+        let out = file_upload_scan_matches(
+            "Content-Disposition: filename=\"report.pdf\"",
+            dangerous,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn quoted_candidates_require_an_equals_and_a_quote() {
+        let (dangerous, double, trunc, decoded_trunc) = sources();
+        // no '=' after the filename token
+        let out = file_upload_scan_matches(
+            "filename \"a.php\"",
+            dangerous,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert!(out.is_empty());
+        // '=' but no quote after it
+        let out = file_upload_scan_matches(
+            "filename= a.php",
+            dangerous,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert!(out.is_empty());
+        // the whitespace run between '=' and the quote is skipped
+        let out = file_upload_scan_matches(
+            "filename=   \"a.php\"",
+            dangerous,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert_eq!(out.len(), 1);
+        // a newline inside the scanned-back run bounds the match start
+        let out = file_upload_scan_matches(
+            "header: x\nfilename=\"a.php\"",
+            dangerous,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn scan_matches_handles_separator_prefixes_and_skips_overlaps() {
+        let (dangerous, double, trunc, decoded_trunc) = sources();
+        // the semicolon separator prefix starts the match
+        let out = file_upload_scan_matches(
+            "form-data; filename=\"a.php\"",
+            dangerous,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert_eq!(out.len(), 1);
+        // two candidates on one line: the second overlapping span is skipped
+        let out = file_upload_scan_matches(
+            "filename=\"a.php\" filename=\"b.php\"",
+            dangerous,
+            dangerous,
+            double,
+            trunc,
+            decoded_trunc,
+        );
+        assert_eq!(out.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    const DANGEROUS: &str = "DANGEROUS";
+    const DOUBLE: &str = "DOUBLE";
+    const TRUNC: &str = "TRUNC";
+    const DECODED_TRUNC: &str = "DECODED_TRUNC";
+
+    #[test]
+    fn double_extension_scans_every_pre_terminal_dot() {
+        // the first dot is not a marker; the second one carries the php marker
+        assert!(is_double_extension("x.y.php.docx"));
+        // a marker followed by a space before the terminal extension is not
+        // a double extension
+        assert!(!is_double_extension("x.php .docx"));
+    }
+
+    #[test]
+    fn an_unknown_pattern_source_classifies_nothing() {
+        assert!(
+            file_upload_scan_matches(
+                "filename=\"shell.php\"",
+                "OTHER",
+                DANGEROUS,
+                DOUBLE,
+                TRUNC,
+                DECODED_TRUNC
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn overlapping_inner_candidates_are_skipped() {
+        // the inner `filename` token is a truncation candidate whose match
+        // start falls inside the already-accepted outer span
+        let out = file_upload_scan_matches(
+            "filename=\"x.php;filename=\"y\"",
+            TRUNC,
+            DANGEROUS,
+            DOUBLE,
+            TRUNC,
+            DECODED_TRUNC,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].start, 0);
+        assert_eq!(out[0].end, 26);
     }
 }

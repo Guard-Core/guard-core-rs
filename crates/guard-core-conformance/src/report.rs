@@ -260,3 +260,111 @@ mod tests {
         assert!(table.contains('1'));
     }
 }
+
+#[cfg(test)]
+mod describe_tests {
+    use super::*;
+
+    fn result(case: &str, status: Status) -> CaseResult {
+        CaseResult {
+            case: case.to_owned(),
+            suite: case.split("::").next().unwrap_or("s").to_owned(),
+            status,
+            diffs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn empty_drift_describes_to_the_header_only() {
+        let drift = Drift {
+            unbaselined_failures: Vec::new(),
+            stale_xfails: Vec::new(),
+            unbaselined_not_run: Vec::new(),
+        };
+        assert!(drift.is_empty());
+        assert_eq!(drift.describe(), "CONFORMANCE DRIFT (fail-closed):\n");
+    }
+
+    #[test]
+    fn describe_lists_every_drift_family() {
+        let drift = Drift {
+            unbaselined_failures: vec!["s::c1".to_owned(), "s::c2".to_owned()],
+            stale_xfails: vec!["s::c3".to_owned()],
+            unbaselined_not_run: vec!["s::c4".to_owned()],
+        };
+        assert!(!drift.is_empty());
+        let described = drift.describe();
+        assert!(described.contains("failing cases missing from the xfail baseline (2)"));
+        assert!(described.contains("s::c1"));
+        assert!(
+            described.contains("baselined cases that now pass; remove them from the baseline (1)")
+        );
+        assert!(described.contains("s::c3"));
+        assert!(described.contains("cases not executed and not baselined (1)"));
+        assert!(described.contains("s::c4"));
+    }
+
+    #[test]
+    fn not_run_cases_land_in_drift_and_the_not_run_bucket() {
+        let results = vec![result("s::c1", Status::NotRun)];
+        let drift = evaluate(&results, &HashSet::new()).expect_err("unbaselined not-run is drift");
+        assert_eq!(drift.unbaselined_not_run, vec!["s::c1"]);
+
+        let baselined = HashSet::from(["s::c1".to_owned()]);
+        let report = evaluate(&results, &baselined).expect("baselined not-run is fine");
+        assert_eq!(report.not_run.len(), 1);
+    }
+
+    #[test]
+    fn stale_xfail_and_mixed_results_aggregate() {
+        let results = vec![
+            result("s::c1", Status::Passed),
+            result("s::c2", Status::Failed),
+            result("s::c4", Status::NotRun),
+        ];
+        let baselined = HashSet::from(["s::c1".to_owned()]);
+        let drift = evaluate(&results, &baselined).expect_err("stale xfail plus failure");
+        assert_eq!(drift.stale_xfails, vec!["s::c1"]);
+        assert_eq!(drift.unbaselined_failures, vec!["s::c2"]);
+        assert_eq!(drift.unbaselined_not_run, vec!["s::c4"]);
+    }
+
+    #[test]
+    fn suite_table_counts_per_suite_and_totals() {
+        let report = GateReport {
+            passed: vec![result("alpha::c1", Status::Passed)],
+            failed: vec![
+                result("alpha::c2", Status::Failed),
+                result("beta::c3", Status::Failed),
+            ],
+            xfail: Vec::new(),
+            not_run: Vec::new(),
+        };
+        let table = suite_table(&report, &["alpha".to_owned(), "beta".to_owned()]);
+        assert!(table.contains("alpha"));
+        assert!(table.contains("beta"));
+        assert!(table.contains("TOTAL"));
+        let total_row = table.lines().last().unwrap_or("");
+        assert!(total_row.contains('1'), "one passed: {total_row}");
+        assert!(total_row.contains('2'), "two failed: {total_row}");
+    }
+}
+
+#[cfg(test)]
+mod evaluate_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "evaluate input never carries Xfail")]
+    fn evaluate_refuses_xfail_inputs() {
+        // the runner resolves xfails before aggregation, so an Xfail result
+        // here is a runner bug: evaluate refuses it
+        let results = vec![CaseResult {
+            case: "detect::sqli::union_select".to_owned(),
+            suite: "detect_sqli".to_owned(),
+            status: Status::Xfail,
+            diffs: Vec::new(),
+        }];
+        let _ = evaluate(&results, &HashSet::new());
+    }
+}

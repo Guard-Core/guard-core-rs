@@ -1272,4 +1272,38 @@ mod tests {
         assert!(!manager.is_banned(ip("127.0.0.1")));
         assert_eq!(counters.snapshot(ip("127.0.0.1")).get("xss"), Some(&1));
     }
+
+    #[test]
+    fn manager_debug_and_default_render_and_construct() {
+        let manager = IpBanManager::default();
+        assert!(format!("{manager:?}").contains("IpBanManager"));
+        assert!(format!("{:?}", ViolationCounters::default()).contains("ViolationCounters"));
+        assert!(manager.ban_record(ip("192.0.2.8")).is_none());
+    }
+
+    #[test]
+    fn trusted_proxies_parse_cidr_entries() {
+        let manager = IpBanManager::with_trusted_proxies_and_clock(
+            ["10.0.0.0/8", "192.168.1.1"],
+            Arc::new(system_clock),
+        )
+        .expect("valid proxies");
+        assert!(format!("{manager:?}").contains("IpBanManager"));
+        // a trusted-proxy IP is not treated as the client
+        assert!(!manager.is_banned(ip("10.1.2.3")));
+    }
+
+    #[test]
+    fn expired_bans_are_evicted_on_read() {
+        let fake = FakeClock::default();
+        let manager = IpBanManager::with_clock(fake.clock());
+        manager
+            .ban_ip(ip("192.0.2.9"), 60, "rate_limit")
+            .expect("ban recorded");
+        assert!(manager.ban_record(ip("192.0.2.9")).is_some());
+        fake.advance(120);
+        // the expired ban is popped on read
+        assert!(manager.ban_record(ip("192.0.2.9")).is_none());
+        assert!(!manager.is_banned(ip("192.0.2.9")));
+    }
 }

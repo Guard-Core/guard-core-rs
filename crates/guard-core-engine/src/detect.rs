@@ -338,7 +338,13 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t, Threat::Regex(r) if r.category == "sqli"))
         );
-        let miss = detect("a/**/b", "url_path", &corpus_config());
+        // a url_path verdict carrying other threats has no sqli comment hit
+        let miss = detect("/files?name=../../etc/passwd", "url_path", &corpus_config());
+        assert!(
+            miss.threats
+                .iter()
+                .any(|t| matches!(t, Threat::Regex(r) if r.category == "dir_traversal"))
+        );
         assert!(!miss.threats.iter().any(
             |t| matches!(t, Threat::Regex(r) if r.category == "sqli" && r.pattern.contains("/\\*"))
         ));
@@ -379,5 +385,98 @@ mod tests {
             })
             .sum();
         assert!((anomaly - 1.0).abs() < 1e-9, "anomaly {anomaly}");
+
+        // a mixed verdict: semantic threats carry no anomaly weight
+        let content = format!(
+            "select union insert update delete drop from where order group having concat \
+             substring database table column (1 OR 1=1) {}",
+            "A".repeat(120)
+        );
+        let mixed = detect(&content, "request_body", &corpus_config());
+        assert!(
+            mixed
+                .threats
+                .iter()
+                .any(|t| matches!(t, Threat::Semantic(_)))
+        );
+        let mixed_anomaly: f64 = mixed
+            .threats
+            .iter()
+            .filter_map(|t| match t {
+                Threat::Regex(r) => Some(r.weight),
+                Threat::Semantic(_) => None,
+            })
+            .sum();
+        assert!(mixed_anomaly > 0.0, "regex hits still carry weight");
+        assert!(mixed.is_threat);
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    fn corpus_config() -> DetectConfig {
+        DetectConfig {
+            max_content_length: 10_000,
+            max_full_scan_bytes: 262_144,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            binary_min_run_length: 16,
+        }
+    }
+
+    #[test]
+    fn a_semantic_fallback_threat_reports_suspicious() {
+        // high aggregate score without any single attack class above the
+        // threshold: the fallback "suspicious" semantic threat fires
+        let mut content = String::from("from where drop select ");
+        content.push_str(&"A".repeat(120));
+        content.push_str(" ({}$x==) foo(");
+        let v = detect(&content, "request_body", &corpus_config());
+        assert!(v.is_threat, "verdict: {v:?}");
+        assert!(
+            v.threats.iter().any(
+                |t| matches!(t, Threat::Semantic(s) if s.attack_type == "suspicious" && s.fallback)
+            ),
+            "verdict: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_verdict_scores_the_semantic_maximum_against_the_anomaly() {
+        // regex sqli hits plus a semantic sql threat: the threat score folds
+        // over both lists
+        let content = format!(
+            "select union insert update delete drop from where order group having concat \
+             substring database table column (1 OR 1=1) {}",
+            "A".repeat(120)
+        );
+        let v = detect(&content, "request_body", &corpus_config());
+        assert!(v.is_threat);
+        assert!(
+            v.threats
+                .iter()
+                .any(|t| matches!(t, Threat::Regex(r) if r.category == "sqli"))
+        );
+        assert!(v.threats.iter().any(|t| matches!(t, Threat::Semantic(_))));
+        let semantic_max = v
+            .threats
+            .iter()
+            .filter_map(|t| match t {
+                Threat::Semantic(s) => Some(s.score),
+                Threat::Regex(_) => None,
+            })
+            .fold(0.0_f64, f64::max);
+        let anomaly = v
+            .threats
+            .iter()
+            .filter_map(|t| match t {
+                Threat::Regex(r) => Some(r.weight),
+                Threat::Semantic(_) => None,
+            })
+            .sum::<f64>();
+        assert!((v.threat_score - anomaly.max(semantic_max).min(1.0)).abs() < 1e-9);
     }
 }

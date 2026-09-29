@@ -311,3 +311,53 @@ mod tests {
         assert!(EVENT_TYPE_VALUES.contains(&EVENT_PATTERN_ANOMALY_STATISTICAL_ANOMALY));
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn a_registered_sink_receives_the_sent_event() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let bus = SecurityEventBus::new(true).on_event(Arc::new(move |_: &SecurityEvent| {
+            sink.lock().expect("sink").push("fired".to_owned());
+        }));
+        let event = SecurityEvent::new(
+            "rate_limited",
+            "192.0.2.9",
+            "request_blocked",
+            "rate limited",
+            "rate_limit",
+        );
+        bus.send_event(&event);
+        assert_eq!(seen.lock().expect("sink").len(), 1);
+    }
+
+    #[test]
+    fn chaining_two_registrations_keeps_both_handlers() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // registering on a bus already holding a handler takes the shared
+        // clone path: both handlers fire, in registration order
+        let first = std::sync::Arc::clone(&seen);
+        let bus = SecurityEventBus::new(true).on_event(Arc::new(move |_: &SecurityEvent| {
+            first.lock().expect("sink").push("first".to_owned());
+        }));
+        let second = std::sync::Arc::clone(&seen);
+        let bus = bus.on_event(Arc::new(move |_: &SecurityEvent| {
+            second.lock().expect("sink").push("second".to_owned());
+        }));
+        let event = SecurityEvent::new(
+            "rate_limited",
+            "192.0.2.9",
+            "request_blocked",
+            "rate limited",
+            "rate_limit",
+        );
+        bus.send_event(&event);
+        let log = seen.lock().expect("sink").clone();
+        assert_eq!(log, vec!["first".to_owned(), "second".to_owned()]);
+    }
+}

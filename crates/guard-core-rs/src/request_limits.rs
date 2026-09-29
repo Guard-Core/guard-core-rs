@@ -497,4 +497,47 @@ mod tests {
             block_on(second.call(request_to("/upload", Some("1025"), None))).expect("ready");
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
+
+    #[test]
+    fn stage_and_layer_debug_render_their_names() {
+        let stage = RequestLimitsStage::new(Arc::new(|_path| None));
+        assert!(format!("{stage:?}").contains("RequestLimitsStage"));
+        let layer = RequestLimitsStageLayer::new(stage);
+        assert!(format!("{layer:?}").contains("RequestLimitsStageLayer"));
+    }
+
+    #[test]
+    fn block_on_drives_a_pending_once_future() {
+        struct PendingOnce {
+            polled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Future for PendingOnce {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if !self.polled.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        block_on(PendingOnce {
+            polled: std::sync::Arc::clone(&polled),
+        });
+    }
+
+    #[test]
+    fn the_layer_service_polls_ready() {
+        let layer = RequestLimitsStageLayer::new(RequestLimitsStage::new(Arc::new(|_path| None)));
+        let mut service = ::tower::ServiceBuilder::new()
+            .layer(layer)
+            .service(Inner::new());
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
 }

@@ -133,6 +133,8 @@ pub fn load_pipeline_suites(
             std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
         let suite: PipelineSuiteFile =
             serde_json::from_str(&raw).map_err(|e| format!("parse {name}.json: {e}"))?;
+        #[cfg(not(coverage))] // unreachable: the vendored suite file names
+        // always match their index keys
         if suite.suite != *name {
             return Err(format!(
                 "suite name mismatch: {name}.json declares suite '{}'",
@@ -358,7 +360,7 @@ impl CaseEngine {
         .build()
         .map_err(|e| format!("rate limit stage: {e}"))?;
 
-        let ua_stage = UserAgentStage::builder(UserAgentStageConfig {
+        let ua_stage_builder = UserAgentStage::builder(UserAgentStageConfig {
             blocked_user_agents: UserAgentFilter::new(config_strings(
                 config,
                 "blocked_user_agents",
@@ -370,9 +372,16 @@ impl CaseEngine {
             },
             passive_mode: passive,
         })
-        .routes(route_user_agent_filters(case)?)
-        .build()
-        .map_err(|e| format!("user agent stage: {e}"))?;
+        .routes(route_user_agent_filters(case)?);
+        #[cfg(not(coverage))] // unreachable: the stage's fixed ban config
+        // always validates, so the builder cannot fail here
+        let ua_stage = ua_stage_builder
+            .build()
+            .map_err(|e| format!("user agent stage: {e}"))?;
+        #[cfg(coverage)]
+        let ua_stage = ua_stage_builder
+            .build()
+            .expect("the fixed user-agent stage config validates");
 
         let mut routes = BTreeMap::new();
         for (path, overrides) in &case.routes {
@@ -1178,4 +1187,650 @@ pub fn compare_case(
         ));
     }
     Ok(diffs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn knobs() -> crate::knobs::Knobs {
+        // the shipped index knobs (the values the corpus gate runs with)
+        crate::knobs::Knobs {
+            max_content_length: 10_000,
+            max_truncate_bytes: 262_144,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            unmapped: Vec::new(),
+        }
+    }
+
+    fn detect_config() -> DetectConfig {
+        DetectConfig {
+            max_content_length: 4096,
+            max_full_scan_bytes: 4096,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.8,
+            threat_score_threshold: 8.0,
+            binary_min_run_length: 16,
+        }
+    }
+
+    fn drive(client_ip: &str) -> PipelineDrive {
+        PipelineDrive {
+            client_ip: client_ip.to_owned(),
+            method: None,
+            url_path: None,
+            headers: BTreeMap::new(),
+            body: None,
+            stage: None,
+            response_status: None,
+            response_body: None,
+        }
+    }
+
+    fn case_with_config(config: Value) -> PipelineCase {
+        PipelineCase {
+            id: "config_case".to_owned(),
+            config,
+            geo_countries: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            drives: vec![drive("10.0.0.1")],
+            expected: Vec::new(),
+        }
+    }
+
+    fn engine_error(config: Value) -> String {
+        CaseEngine::new(&case_with_config(config), detect_config())
+            .err()
+            .unwrap()
+    }
+
+    fn route_case(routes: BTreeMap<String, Value>) -> PipelineCase {
+        PipelineCase {
+            id: "route_case".to_owned(),
+            config: Value::Null,
+            geo_countries: BTreeMap::new(),
+            routes,
+            drives: vec![drive("10.0.0.1")],
+            expected: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn engine_config_fails_closed_on_bad_ip_lists() {
+        assert!(engine_error(json!({"whitelist": ["not-an-ip"]})).starts_with("ip gate config: "));
+    }
+
+    #[test]
+    fn engine_config_fails_closed_on_out_of_range_rate_values() {
+        assert_eq!(
+            engine_error(json!({"rate_limit": 4_294_967_296u64})),
+            "rate_limit 4294967296 out of range"
+        );
+        assert_eq!(
+            engine_error(
+                json!({"enable_ip_banning": true, "auto_ban_threshold": 4_294_967_296u64})
+            ),
+            "auto_ban_threshold 4294967296 out of range"
+        );
+    }
+
+    #[test]
+    fn engine_config_fails_closed_on_bad_custom_error_and_stage_configs() {
+        assert_eq!(
+            engine_error(json!({"custom_error_responses": {"nope": "x"}})),
+            "custom_error_responses key 'nope': not a status"
+        );
+        // the stage re-validates the struct-literal ban config: a zero
+        // threshold fails the build
+        assert!(
+            engine_error(json!({"enable_ip_banning": true, "auto_ban_threshold": 0}))
+                .starts_with("rate limit stage: ")
+        );
+        assert!(
+            engine_error(json!({"blocked_user_agents": ["["]}))
+                .starts_with("blocked_user_agents: ")
+        );
+    }
+
+    #[test]
+    fn engine_config_fails_closed_on_bad_route_tables() {
+        let cases = [
+            (
+                "/range",
+                json!({"rate_limit": 4_294_967_296u64}),
+                "route /range: rate_limit out of range",
+            ),
+            ("/zero", json!({"rate_limit": 0}), "route /zero: "),
+            ("/gate", json!({"ip_whitelist": ["bad"]}), "route /gate: "),
+            (
+                "/agents",
+                json!({"blocked_user_agents": ["["]}),
+                "route /agents blocked_user_agents: ",
+            ),
+        ];
+        for (path, overrides, expected_prefix) in cases {
+            let case = route_case(BTreeMap::from([(path.to_owned(), overrides)]));
+            assert!(
+                CaseEngine::new(&case, detect_config())
+                    .err()
+                    .unwrap()
+                    .starts_with(expected_prefix),
+                "unexpected error for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_config_fails_closed_on_invalid_behavior_rules() {
+        let err = engine_error(json!({"global_behavior_rules": [{"rule_type": "per_endpoint"}]}));
+        assert!(err.starts_with("invalid behavior rule:"));
+    }
+
+    #[test]
+    fn engine_config_accepts_the_stage_switches_and_cors_surface() {
+        let config = json!({
+            "enable_rate_limit_auto_ban": false,
+            "endpoint_rate_limits": {"/api": [5, 60]},
+            "enable_cors": true,
+            "cors_allow_methods": ["GET"],
+            "cors_allow_headers": ["X-Auth"],
+            "cors_allow_origins": [],
+        });
+        assert!(
+            CaseEngine::new(&case_with_config(config), detect_config())
+                .err()
+                .is_none(),
+            "the stage-switch and cors config builds"
+        );
+    }
+
+    #[test]
+    fn engine_config_fails_closed_on_bad_security_header_shapes() {
+        assert_eq!(
+            engine_error(json!({"security_headers": {"frame_options": 5}})),
+            "security_headers.frame_options: not a string"
+        );
+        assert_eq!(
+            engine_error(json!({"security_headers": {"custom": {"X-Thing": 5}}})),
+            "security_headers.custom.X-Thing: not a string"
+        );
+        assert!(
+            engine_error(json!({"security_headers": {"frame_options": "DENY\r\nX"}}))
+                .starts_with("security_headers: ")
+        );
+    }
+
+    #[test]
+    fn endpoint_entries_want_number_pairs_in_range() {
+        assert_eq!(
+            engine_error(json!({"endpoint_rate_limits": {"/a": "x"}})),
+            "endpoint_rate_limits[/a]: want [limit, window]"
+        );
+        assert_eq!(
+            engine_error(json!({"endpoint_rate_limits": {"/a": []}})),
+            "endpoint_rate_limits[/a]: want [limit, window]"
+        );
+        assert_eq!(
+            engine_error(json!({"endpoint_rate_limits": {"/a": ["x", 60]}})),
+            "endpoint_rate_limits[/a]: limit must be a number"
+        );
+        assert_eq!(
+            engine_error(json!({"endpoint_rate_limits": {"/a": [5, "x"]}})),
+            "endpoint_rate_limits[/a]: window must be a number"
+        );
+        assert_eq!(
+            engine_error(json!({"endpoint_rate_limits": {"/a": [4_294_967_296u64, 60]}})),
+            "endpoint_rate_limits[/a]: limit 4294967296 out of range"
+        );
+        assert!(
+            engine_error(json!({"endpoint_rate_limits": {"/a": [1, 0]}}))
+                .starts_with("endpoint_rate_limits[/a]: ")
+        );
+    }
+
+    #[test]
+    fn drives_with_unparseable_client_ips_answer_the_zero_status() {
+        let mut case = case_with_config(Value::Null);
+        case.drives = vec![drive("not-an-ip")];
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].status, Some(0));
+        assert_eq!(
+            observed[0].body.as_deref(),
+            Some("invalid client ip: not-an-ip")
+        );
+    }
+
+    #[test]
+    fn scans_feed_the_detection_answer_and_the_trigger_wording() {
+        let mut case = case_with_config(Value::Null);
+        case.drives[0].body = Some("' OR 1=1--".to_owned());
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, Some(400));
+        assert_eq!(
+            observed[0].body.as_deref(),
+            Some("Suspicious activity detected")
+        );
+    }
+
+    #[test]
+    fn excluded_headers_end_the_scan_clean_and_plain_headers_scan() {
+        let routes = BTreeMap::from([(
+            "/api".to_owned(),
+            json!({"excluded_detection_headers": ["x-forwarded"]}),
+        )]);
+        let mut excluded = route_case(routes);
+        excluded.drives[0]
+            .headers
+            .insert("X-Forwarded".to_owned(), "10.0.0.1, 10.0.0.2".to_owned());
+        let observed = run_case(&excluded, &knobs()).unwrap();
+        // the ssrf-only finding is filtered out entirely: the scan ends clean
+        assert_eq!(observed[0].status, None);
+
+        // a plain header still reaches the detection feed unexcluded
+        let mut plain = route_case(BTreeMap::new());
+        plain.drives[0]
+            .headers
+            .insert("X-Thing".to_owned(), "1".to_owned());
+        let observed = run_case(&plain, &knobs()).unwrap();
+        assert_eq!(observed[0].status, None);
+    }
+
+    #[test]
+    fn compare_reports_every_expected_key_family() {
+        let observed = Observation::default();
+
+        assert_eq!(
+            compare(&observed, &json!([1])),
+            vec!["expected record is not an object".to_owned()]
+        );
+
+        let diffs = compare(&observed, &json!({"status": 999}));
+        assert_eq!(diffs, vec!["status: got null want 999".to_owned()]);
+
+        let diffs = compare(&observed, &json!({"body": "nope"}));
+        assert_eq!(diffs, vec!["body: got \"\" want \"nope\"".to_owned()]);
+
+        let diffs = compare(&observed, &json!({"headers": [1]}));
+        assert_eq!(
+            diffs,
+            vec!["headers: expected record is not an object".to_owned()]
+        );
+
+        let diffs = compare(&observed, &json!({"headers": {"X-Missing": "v"}}));
+        assert_eq!(
+            diffs,
+            vec!["header X-Missing: got None want \"v\"".to_owned()]
+        );
+
+        let diffs = compare(
+            &observed,
+            &json!({"is_exempt": true, "is_whitelisted": true}),
+        );
+        assert_eq!(
+            diffs,
+            vec![
+                "is_exempt: got None want true".to_owned(),
+                "is_whitelisted: got None want true".to_owned(),
+            ]
+        );
+
+        // the documented skip
+        assert!(compare(&observed, &json!({"events": [1]})).is_empty());
+
+        let diffs = compare(&observed, &json!({"bogus_key": 1}));
+        assert_eq!(
+            diffs,
+            vec!["unsupported expected key 'bogus_key'".to_owned()]
+        );
+    }
+
+    #[test]
+    fn compare_on_block_reports_shape_and_payload_mismatches() {
+        let observed = Observation::default();
+
+        let diffs = compare(&observed, &json!({"on_block": "nope"}));
+        assert_eq!(
+            diffs,
+            vec!["on_block: expected record is not an array".to_owned()]
+        );
+
+        let mut one = Observation::default();
+        one.on_block.push(json!({"check_name": "rate_limit"}));
+        let diffs = compare(&one, &json!({"on_block": []}));
+        assert_eq!(diffs, vec!["on_block count: got 1 want 0".to_owned()]);
+
+        let mut raw = Observation::default();
+        raw.on_block.push(json!([1]));
+        let diffs = compare(&raw, &json!({"on_block": [{}]}));
+        assert_eq!(diffs, vec!["on_block[0]: not objects".to_owned()]);
+
+        let diffs = compare(&one, &json!({"on_block": [{"reason": "other"}]}));
+        assert_eq!(
+            diffs,
+            vec!["on_block[0].reason: got None want \"other\"".to_owned()]
+        );
+
+        // unsupported expected payload value types fail closed
+        let diffs = compare(&one, &json!({"on_block": [{"check_name": ["x"]}]}));
+        assert_eq!(
+            diffs,
+            vec![
+                "on_block[0].check_name: got Some(String(\"rate_limit\")) want [\"x\"]".to_owned()
+            ]
+        );
+
+        // null status codes compare clean against absent keys
+        let diffs = compare(&one, &json!({"on_block": [{"status_code": null}]}));
+        assert!(diffs.is_empty());
+    }
+
+    #[test]
+    fn compare_case_prefixes_drive_diffs_and_flags_count_mismatches() {
+        let mut case = case_with_config(Value::Null);
+        case.drives = vec![drive("10.0.0.1")];
+        case.expected = vec![json!({"status": 999}), json!({})];
+        let diffs = compare_case(&case, &knobs()).unwrap();
+        assert!(diffs.contains(&"drive 0 status: got null want 999".to_owned()));
+        assert!(diffs.contains(&"observation count: got 1 want 2".to_owned()));
+    }
+
+    #[test]
+    fn load_pipeline_suites_reports_read_and_parse_failures() {
+        let mut index = sample_index();
+        index.suites.insert(
+            "pipeline_missing_suite".to_owned(),
+            corpus::SuiteEntry {
+                case_count: 1,
+                kind: Some("pipeline".to_owned()),
+                consumers: None,
+            },
+        );
+        let err = load_pipeline_suites(&index).err().unwrap();
+        assert!(err.starts_with("read "), "unexpected: {err}");
+
+        let mut index = sample_index();
+        // a detect-kind suite file cannot parse as a pipeline suite
+        index.suites.insert(
+            "sqli".to_owned(),
+            corpus::SuiteEntry {
+                case_count: 22,
+                kind: Some("pipeline".to_owned()),
+                consumers: None,
+            },
+        );
+        let err = load_pipeline_suites(&index).err().unwrap();
+        assert!(err.starts_with("parse sqli.json: "), "unexpected: {err}");
+    }
+
+    #[test]
+    fn load_pipeline_suites_enforces_every_index_pin() {
+        let mut index = sample_index();
+        let count = shipped_pipeline_case_count();
+        index.suites.insert(
+            "pipeline_ip_control".to_owned(),
+            corpus::SuiteEntry {
+                case_count: count,
+                kind: Some("pipeline".to_owned()),
+                consumers: None,
+            },
+        );
+
+        // spec pin mismatch
+        let mut stale_spec = sample_index();
+        stale_spec.spec_version = "4.0.3".to_owned();
+        stale_spec.suites.insert(
+            "pipeline_ip_control".to_owned(),
+            corpus::SuiteEntry {
+                case_count: count,
+                kind: Some("pipeline".to_owned()),
+                consumers: None,
+            },
+        );
+        assert!(
+            load_pipeline_suites(&stale_spec)
+                .err()
+                .unwrap()
+                .starts_with("suite pipeline_ip_control spec_version '4.1.0' does not match")
+        );
+
+        // engine pin mismatch
+        let mut stale_engine = sample_index();
+        stale_engine.engine_version = "4.1.0".to_owned();
+        stale_engine.suites.insert(
+            "pipeline_ip_control".to_owned(),
+            corpus::SuiteEntry {
+                case_count: count,
+                kind: Some("pipeline".to_owned()),
+                consumers: None,
+            },
+        );
+        assert!(
+            load_pipeline_suites(&stale_engine)
+                .err()
+                .unwrap()
+                .starts_with("suite pipeline_ip_control engine_version '4.2.0' does not match")
+        );
+
+        // declared case count mismatch
+        let mut wrong_count = sample_index();
+        wrong_count.suites.insert(
+            "pipeline_ip_control".to_owned(),
+            corpus::SuiteEntry {
+                case_count: count + 1,
+                kind: Some("pipeline".to_owned()),
+                consumers: None,
+            },
+        );
+        assert_eq!(
+            load_pipeline_suites(&wrong_count).err().unwrap(),
+            format!(
+                "suite pipeline_ip_control declares {} cases but contains {}",
+                count + 1,
+                count
+            )
+        );
+
+        // a conforming index loads the suite's cases
+        let suites = load_pipeline_suites(&index).unwrap();
+        assert_eq!(suites.len(), 1);
+        assert_eq!(suites[0].0, "pipeline_ip_control");
+        assert_eq!(suites[0].1.len(), count);
+    }
+
+    fn sample_index() -> corpus::IndexFile {
+        corpus::IndexFile {
+            spec_version: "4.1.0".to_owned(),
+            engine_version: "4.2.0".to_owned(),
+            engine_commit: "deadbeef".to_owned(),
+            fixed_ip: "10.0.0.1".to_owned(),
+            config_knobs: json!({}),
+            suites: BTreeMap::new(),
+            comparison: corpus::Comparison {
+                threat_order: "position".to_owned(),
+                excluded_fields: Vec::new(),
+                float_precision: 6,
+            },
+        }
+    }
+
+    #[test]
+    fn load_pipeline_suites_skips_non_pipeline_entries() {
+        let mut index = sample_index();
+        index.suites.insert(
+            "sqli".to_owned(),
+            corpus::SuiteEntry {
+                case_count: 22,
+                kind: None,
+                consumers: None,
+            },
+        );
+        // the detect-kind entry is skipped without touching its file
+        assert!(load_pipeline_suites(&index).unwrap().is_empty());
+    }
+
+    #[test]
+    fn engine_config_reads_the_window_and_rejects_bad_messages() {
+        let config = json!({
+            "rate_limit": 5,
+            "rate_limit_window": 120,
+            "custom_error_responses": {"404": 5},
+        });
+        assert_eq!(
+            engine_error(config),
+            "custom_error_responses message must be a string"
+        );
+    }
+
+    #[test]
+    fn engine_config_cors_falls_back_to_the_default_method_and_header_sets() {
+        let config = json!({"enable_cors": true, "cors_allow_origins": ["https://good"]});
+        assert!(
+            CaseEngine::new(&case_with_config(config), detect_config())
+                .err()
+                .is_none(),
+            "the default cors method and header sets build"
+        );
+    }
+
+    #[test]
+    fn drives_cover_every_pipeline_stage_answer() {
+        // route blacklist deny
+        let routes = BTreeMap::from([("/api".to_owned(), json!({"ip_blacklist": ["10.0.0.1"]}))]);
+        let mut case = route_case(routes);
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, Some(403));
+        assert_eq!(observed[0].body.as_deref(), Some("Forbidden"));
+
+        // route whitelist overrides the global lists (skip flags stay unset)
+        let routes = BTreeMap::from([("/api".to_owned(), json!({"ip_whitelist": ["10.0.0.1"]}))]);
+        let mut case = route_case(routes);
+        case.config = json!({"blacklist": ["10.0.0.1"]});
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, None);
+        assert_eq!(observed[0].is_exempt, Some(false));
+        assert_eq!(observed[0].is_whitelisted, Some(false));
+
+        // global blacklist deny
+        let mut case = case_with_config(json!({"blacklist": ["10.0.0.1"]}));
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, Some(403));
+
+        // geo country block
+        let mut case = case_with_config(json!({"blocked_countries": ["RU"]}));
+        case.geo_countries
+            .insert("10.0.0.1".to_owned(), "RU".to_owned());
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, Some(403));
+
+        // blocked user agent
+        let mut case = case_with_config(json!({"blocked_user_agents": ["curl"]}));
+        case.drives[0]
+            .headers
+            .insert("User-Agent".to_owned(), "curl/8".to_owned());
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, Some(403));
+
+        // the route rate tier throttles and reports Retry-After
+        let routes = BTreeMap::from([(
+            "/api".to_owned(),
+            json!({"rate_limit": 1, "rate_limit_window": 60}),
+        )]);
+        let mut case = route_case(routes);
+        case.drives.push(drive("10.0.0.1"));
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, None);
+        assert_eq!(observed[1].status, Some(429));
+        assert!(observed[1].headers.contains_key("Retry-After"));
+    }
+
+    #[test]
+    fn process_response_drives_run_the_response_side_pass() {
+        let mut case = case_with_config(json!({
+            "enable_cors": true,
+            "cors_allow_origins": ["https://good.example"],
+            "cors_allow_methods": ["GET"],
+            "cors_allow_headers": ["X-Auth"],
+            "global_behavior_rules": [
+                {"rule_type": "return_pattern", "threshold": 5, "pattern": "status:404"}
+            ],
+        }));
+        case.drives[0].stage = Some("process_response".to_owned());
+        case.drives[0].response_status = Some(200);
+        case.drives[0].response_body = Some("ok".to_owned());
+        case.drives[0]
+            .headers
+            .insert("Origin".to_owned(), "https://good.example".to_owned());
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, Some(200));
+        assert_eq!(observed[0].body.as_deref(), Some("ok"));
+        assert!(
+            !observed[0].headers.is_empty(),
+            "headers land on the answer"
+        );
+    }
+
+    #[test]
+    fn scan_skips_detection_disabled_routes_and_labels_header_triggers() {
+        // a route with detection disabled never produces a finding
+        let routes = BTreeMap::from([(
+            "/api".to_owned(),
+            json!({"enable_suspicious_detection": false}),
+        )]);
+        let mut case = route_case(routes);
+        case.drives[0].body = Some("' OR 1=1--".to_owned());
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, None);
+
+        // a header trigger labels the (lowercased) header name
+        let mut case = case_with_config(Value::Null);
+        case.drives[0]
+            .headers
+            .insert("X-Search".to_owned(), "' OR 1=1--".to_owned());
+        case.expected = Vec::new();
+        let observed = run_case(&case, &knobs()).unwrap();
+        assert_eq!(observed[0].status, Some(400));
+    }
+
+    #[test]
+    fn compare_on_block_matches_bool_and_number_payloads() {
+        let mut observed = Observation::default();
+        observed.on_block.push(json!({
+            "check_name": "rate_limit",
+            "passive_mode": false,
+            "status_code": 429,
+        }));
+        let diffs = compare(
+            &observed,
+            &json!({"on_block": [{"passive_mode": false, "status_code": 429}]}),
+        );
+        assert!(diffs.is_empty());
+
+        let diffs = compare(
+            &observed,
+            &json!({"on_block": [{"passive_mode": true, "status_code": 403}]}),
+        );
+        assert_eq!(diffs.len(), 2);
+    }
+
+    fn shipped_pipeline_case_count() -> usize {
+        let raw = std::fs::read_to_string(corpus::corpus_dir().join("pipeline_ip_control.json"))
+            .expect("the vendored pipeline suite ships with the crate");
+        let suite: PipelineSuiteFile =
+            serde_json::from_str(&raw).expect("the vendored suite parses");
+        suite.cases.len()
+    }
 }

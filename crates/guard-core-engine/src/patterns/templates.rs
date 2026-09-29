@@ -315,3 +315,58 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_frames_and_missing_closers_are_rejected() {
+        // two adjacent regions both match
+        assert_eq!(
+            template_keyword_matches("{{ system }}{{ system }}", &KIND_CURLY_KEYWORD, true).len(),
+            2
+        );
+        // a keyword inside the first char after the opening is not "inside"
+        assert!(template_keyword_matches("{{system}}", &KIND_CURLY_KEYWORD, true).is_empty());
+        // an unterminated frame: no region, nothing matches
+        assert!(template_keyword_matches("{{ system ", &KIND_CURLY_KEYWORD, true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn digit_preceded_arithmetic_candidates_are_rejected() {
+        // the quote forces the arithmetic match to start after the leading
+        // digit, which is exactly the start the (?<!\d) guard rejects
+        assert!(template_expression_matches("#{1\"2*3}", &KIND_HASH, true).is_empty());
+        // the later region in the same content still fires
+        assert_eq!(
+            template_expression_matches("#{1\"2*3}#{eval(x)}", &KIND_HASH, true).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_region_body_shorter_than_the_restart_lookback_restarts_in_place() {
+        // "#{}" has no body to scan for dates: the restart returns the region
+        // start unchanged and the empty region never hits
+        assert_eq!(
+            template_expression_matches("#{}#{eval(x)}", &KIND_HASH, true).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_overlapping_second_region_is_skipped_after_a_hit() {
+        // the inner `<%` region starts inside the first region's accepted
+        // span, so the restart cursor yields it and it is dropped
+        assert_eq!(
+            template_expression_matches("<%eval<%>%>", &KIND_ASP, true).len(),
+            1
+        );
+    }
+}

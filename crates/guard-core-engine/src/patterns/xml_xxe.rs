@@ -242,3 +242,214 @@ mod tests {
         assert!(xml_xxe_public_external_dtd_finditer(w3).is_empty());
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn xml_system_requires_the_system_keyword_and_skips_overlaps() {
+        // SYSTEM present: matched
+        assert_eq!(xml_system_finditer("<!ENTITY x SYSTEM \"file\">").len(), 1);
+        // no SYSTEM keyword: the span is consumed but nothing matches
+        assert!(xml_system_finditer("<!ENTITY x \"file\">").is_empty());
+        // no closing '>' at all: the scan ends with the collected matches
+        assert!(xml_system_finditer("<!ENTITY x SYSTEM \"file\"").is_empty());
+        // two entities: the second overlapping span is skipped
+        assert_eq!(
+            xml_system_finditer("<!ENTITY a SYSTEM \"f\"><!ENTITY b SYSTEM \"g\">").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn internal_entity_needs_the_bracket_section() {
+        // a proper internal-subset DOCTYPE matches
+        assert_eq!(
+            xml_internal_entity_finditer("<!DOCTYPE r [<!ENTITY x \"v\">]>").len(),
+            1
+        );
+        // a DOCTYPE closed by '>' before any '[' never matches
+        assert!(xml_internal_entity_finditer("<!DOCTYPE r SYSTEM \"f\">").is_empty());
+        // a bracket section without an ENTITY inside ends the scan
+        assert!(xml_internal_entity_finditer("<!DOCTYPE r [<!---->]>").is_empty());
+        // no boundary at all: the scan ends
+        assert!(xml_internal_entity_finditer("<!DOCTYPE r ").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod public_dtd_tests {
+    use super::*;
+
+    #[test]
+    fn public_dtd_walks_quote_urls_and_skips_overlaps() {
+        // the canonical PUBLIC DTD with a quoted http URL
+        let doc = "<!DOCTYPE r PUBLIC \"http://example.org/dtd.dtd\">";
+        let spans: Vec<(usize, usize)> = xml_xxe_public_external_dtd_finditer(doc)
+            .iter()
+            .map(|candidate| (candidate.start, candidate.end))
+            .collect();
+        assert_eq!(spans, vec![(0, 48)]);
+        // no http URL anywhere: no quote positions, nothing matches
+        assert!(
+            xml_xxe_public_external_dtd_finditer("<!DOCTYPE r PUBLIC \"-//X//DTD//EN\">")
+                .is_empty()
+        );
+        // a DOCTYPE without PUBLIC never enters the walk
+        assert!(
+            xml_xxe_public_external_dtd_finditer("<!DOCTYPE r SYSTEM \"http://x/d\">").is_empty()
+        );
+        // neither a DOCTYPE nor PUBLIC at all
+        assert!(xml_xxe_public_external_dtd_finditer("<html/>").is_empty());
+        // a scheme not preceded by a quote never becomes a quote position
+        assert!(xml_xxe_public_external_dtd_finditer("<!DOCTYPE r PUBLIC http://x/d>").is_empty());
+        // the w3.org scheme is excluded from the quote positions
+        assert!(
+            xml_xxe_public_external_dtd_finditer("<!DOCTYPE r PUBLIC \"http://www.w3.org/d.dtd\">")
+                .is_empty()
+        );
+        // two PUBLICs each inside their own run: both match
+        assert_eq!(
+            xml_xxe_public_external_dtd_finditer(
+                "<!DOCTYPE a PUBLIC \"http://x/a.dtd\"><!DOCTYPE b PUBLIC \"http://x/b.dtd\">"
+            )
+            .len(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn system_finditer_overlapping_prefix_spans_are_skipped() {
+        // A DOCTYPE carrying an internal subset that itself opens a second
+        // <!ENTITY span: the second prefix starts before last_end and must
+        // take the `prefix_start < last_end` skip.
+        let text = "<!DOCTYPE r [<!ENTITY a SYSTEM \"f\"><!ENTITY b SYSTEM \"g\">]>";
+        assert_eq!(xml_system_finditer(text).len(), 2);
+        // The empty-haystack degenerate keeps the scan honest.
+        assert!(xml_system_finditer("").is_empty());
+        assert!(xml_internal_entity_finditer("").is_empty());
+        assert!(xml_xxe_public_external_dtd_finditer("").is_empty());
+    }
+
+    #[test]
+    fn public_dtd_requires_doctype_well_before_public_in_the_run() {
+        // No DOCTYPE at all: early return through the empty-positions arm.
+        assert!(
+            xml_xxe_public_external_dtd_finditer(r#"PUBLIC "x" "http://evil.example/d" >"#)
+                .is_empty()
+        );
+        // DOCTYPE closer than 10 chars before PUBLIC: the spacing arm
+        // passes here (0 < 11-9), so the candidate matches; the real
+        // spacing rejection needs PUBLIC to overlap the DOCTYPE prefix,
+        // which the grammar cannot express - the arm stays structural.
+        assert_eq!(
+            xml_xxe_public_external_dtd_finditer(
+                r#"<!DOCTYPE r PUBLIC "x" "http://evil.example/d">"#
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn public_dtd_url_needs_a_quoted_scheme_completion() {
+        // A URL without any quote before the closing '>' yields no quote
+        // position, so the whole scan returns empty.
+        assert!(
+            xml_xxe_public_external_dtd_finditer(
+                r#"<!DOCTYPE r PUBLIC long-gap-here "http://evil.example/d>"#
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn public_dtd_scheme_completions_reject_w3_and_unquoted() {
+        // Scheme directly followed by '>' (no class3 boundary): the quoted
+        // completion fails and no quote position is recorded.
+        assert!(
+            xml_xxe_public_external_dtd_finditer(
+                r#"<!DOCTYPE r PUBLIC aaaaaaaaaa "http://evil.example>"#
+            )
+            .is_empty()
+        );
+        // The w3.org allowlist arm: the scheme completes, but the URL host
+        // is w3.org so scheme_completion_end returns None.
+        assert!(
+            xml_xxe_public_external_dtd_finditer(
+                r#"<!DOCTYPE r PUBLIC aaaaaaaaaa "http://www.w3.org/d">"#
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn public_dtd_quote_and_gt_geometry_arms() {
+        // The first URL is empty (quote2 lands on the scheme end):
+        // rejected at completion time, but the second URL in the same run
+        // completes and the candidate renders from the shared DOCTYPE.
+        assert_eq!(
+            xml_xxe_public_external_dtd_finditer(
+                r#"<!DOCTYPE r PUBLIC aaaaaaaaaa "http://"d" aaaaaaaaaa "http://evil.example/d">"#
+            )
+            .len(),
+            1
+        );
+        // The first URL's quote is followed by '>' (quoted_url_end's
+        // starts_with('>') rejection); the second URL completes the run's
+        // quote map and the candidate renders from the DOCTYPE.
+        assert_eq!(
+            xml_xxe_public_external_dtd_finditer(
+                r#"<!DOCTYPE r PUBLIC aaaaaaaaaa "http://evil.example/">x aaaaaaaaaa "http://evil.example/d">"#
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn public_dtd_arms_when_the_quote_or_gt_fall_outside_the_run() {
+        // A '[' inside the URL closes the run before the final '>': the
+        // candidate still renders from the DOCTYPE to the URL's final '>'.
+        assert_eq!(
+            xml_xxe_public_external_dtd_finditer(
+                r#"<!DOCTYPE r PUBLIC aaaaaaaaaa "http://evil.example/d["x">"#
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn search_between_is_bounded() {
+        let re = compile("x").expect("static");
+        // empty window (start == end) and past-the-end both reject
+        assert!(!search_between(&re, "x", 1, 1));
+        assert!(!search_between(&re, "x", 0, 9));
+    }
+
+    #[test]
+    fn system_finditer_with_a_wide_keyword_window_exercises_search_between() {
+        // A SYSTEM keyword search over a zero-width window (prefix_end+1
+        // past the closing '>'): the window's start >= end rejects before
+        // the regex runs, covering search_between's first arm through the
+        // public matcher instead of a synthetic call.
+        assert!(xml_system_finditer("<<!ENTITY").is_empty());
+        // quote2 == scheme_end through the public path: a URL whose first
+        // quote sits exactly at the scheme end is a zero-length quote; the
+        // second URL completes the candidate.
+        assert_eq!(
+            xml_xxe_public_external_dtd_finditer(
+                r#"<!DOCTYPE r PUBLIC aaaaaaaaaa "http://" aaaaaaaaaa "http://evil.example/d">"#
+            )
+            .len(),
+            1
+        );
+    }
+}

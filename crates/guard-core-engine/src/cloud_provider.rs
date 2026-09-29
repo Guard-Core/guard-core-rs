@@ -597,4 +597,32 @@ mod tests {
             .expect("valid ranges");
         assert!(clone.is_cloud_ip(ip("203.0.113.9"), &selectors));
     }
+
+    #[test]
+    fn masks_handle_the_zero_prefixes_and_render_debug() {
+        assert_eq!(masked(ip("192.0.2.9"), 0), ip("0.0.0.0"));
+        assert_eq!(masked(ip("192.0.2.9"), 32), ip("192.0.2.9"));
+        assert_eq!(
+            masked(IpAddr::V6("2001:db8::1".parse().expect("v6")), 0),
+            ip("::")
+        );
+        let table = CloudIpTable::default();
+        assert!(format!("{table:?}").contains("CloudIpTable"));
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn a_provider_without_fed_ranges_has_no_details_and_blocks_nothing() {
+        // the selectors parse (AWS is a known provider) but the table was
+        // never fed its ranges
+        let table = CloudIpTable::default();
+        let selectors = parse_cloud_selectors(["AWS"]).expect("valid selectors");
+        let probe = "203.0.113.9".parse().expect("ip");
+        assert!(table.provider_details(probe, &selectors).is_none());
+        assert!(!table.is_cloud_ip(probe, &selectors));
+    }
 }

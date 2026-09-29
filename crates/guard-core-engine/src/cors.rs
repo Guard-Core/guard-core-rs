@@ -240,3 +240,43 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn cors_headers_require_an_origin_and_a_nonempty_allowlist() {
+        let cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["https://good".to_owned()],
+            ..CorsConfig::default()
+        };
+        // no Origin header: nothing emitted
+        assert!(cors_response_headers(&cors, None).is_empty());
+        // an empty Origin is falsy in the reference: nothing emitted
+        assert!(cors_response_headers(&cors, Some("")).is_empty());
+        // an empty allowlist: nothing emitted
+        let empty = CorsConfig {
+            enabled: true,
+            allow_origins: Vec::new(),
+            allow_methods: Vec::new(),
+            allow_headers: Vec::new(),
+            allow_credentials: false,
+        };
+        assert!(cors_response_headers(&empty, Some("https://good")).is_empty());
+    }
+
+    #[test]
+    fn cors_headers_block_undowngraded_wildcard_credentials() {
+        // a hand-built wildcard policy that still carries credentials is
+        // blocked outright (the second line of defense)
+        let cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["*".to_owned()],
+            allow_credentials: true,
+            ..CorsConfig::default()
+        };
+        assert!(cors_response_headers(&cors, Some("https://good")).is_empty());
+    }
+}

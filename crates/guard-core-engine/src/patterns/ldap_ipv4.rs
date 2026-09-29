@@ -400,3 +400,86 @@ mod tests {
         assert!(ldap_wildcard_chain_is_injection(&compiled, haystack, &cand));
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn source_extension_probe_only_excludes_the_embedded_json_leaf() {
+        assert!(source_extension_path_is_probe("url_path:.php"));
+        assert!(source_extension_path_is_probe("arg"));
+        assert!(!source_extension_path_is_probe("arg:embedded_json"));
+    }
+
+    #[test]
+    fn legacy_ipv4_decode_rejects_out_of_range_and_short_forms() {
+        // a decimal whose first parts overflow 255 rejects
+        assert!(!legacy_ipv4_match_is_blocked("://300.1.1.1"));
+        // a two-part decimal whose tail overflows the remaining bits rejects
+        assert!(!legacy_ipv4_match_is_blocked("://16842751"));
+        // a single-part decimal whose value lands in a blocked range matches
+        assert!(legacy_ipv4_match_is_blocked("://127.0.0.1"));
+        assert!(legacy_ipv4_match_is_blocked("://167772161"));
+    }
+
+    #[test]
+    fn legacy_ipv4_matches_require_a_terminator_or_newline_edge() {
+        // the run ends at end-of-input
+        assert!(!legacy_ipv4_finditer("http://2130706433").is_empty());
+        // the run ends just before a trailing newline (the Python `$` edge)
+        assert!(!legacy_ipv4_finditer("http://2130706433\n").is_empty());
+        // a word character after the run kills the candidate
+        assert!(legacy_ipv4_finditer("http://2130706433x").is_empty());
+    }
+
+    #[test]
+    fn legacy_ipv4_match_blocked_accepts_userinfo_and_rejects_other_schemes() {
+        // userinfo is stripped before the host decode
+        assert!(legacy_ipv4_match_is_blocked("://user@2130706433"));
+        // not a `://`-prefixed span
+        assert!(!legacy_ipv4_match_is_blocked("host 2130706433"));
+        // not a legacy numeric host
+        assert!(!legacy_ipv4_match_is_blocked("://example.com"));
+        // a legacy IPv4 outside the blocked ranges
+        assert!(!legacy_ipv4_match_is_blocked("://1.1.1.1"));
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn hex_and_octal_parts_reject_empty_and_non_digit_runs() {
+        // "0x" with an empty or non-hex digit run does not decode
+        assert_eq!(decode_legacy_ipv4_host("0x"), None);
+        assert_eq!(decode_legacy_ipv4_host("0xg.1.1.1"), None);
+        // an octal run containing 8/9 does not decode
+        assert_eq!(decode_legacy_ipv4_host("08.1.1.1"), None);
+        assert_eq!(decode_legacy_ipv4_host("0192.1.1.1"), None);
+    }
+
+    #[test]
+    fn single_part_decimals_above_the_ipv4_space_do_not_decode() {
+        // 2^32 does not fit the 32 remaining bits of a single-part host
+        assert_eq!(decode_legacy_ipv4_host("4294967296"), None);
+    }
+
+    #[test]
+    fn the_backward_window_stops_at_quote_and_ampersand_boundaries() {
+        // the walk left of the close paren halts at each boundary char and
+        // the window keeps only the chars right of the stop
+        let chars: Vec<char> = "a&b)(uid=".chars().collect();
+        let (window, depth, unresolved) = ldap_breakout_backward_window(&chars, 3);
+        assert_eq!(window, "b");
+        assert_eq!(depth, 0);
+        assert!(!unresolved);
+
+        let chars: Vec<char> = "x\"y)(mail=".chars().collect();
+        let (window, depth, unresolved) = ldap_breakout_backward_window(&chars, 3);
+        assert_eq!(window, "y");
+        assert_eq!(depth, 0);
+        assert!(!unresolved);
+    }
+}

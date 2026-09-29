@@ -861,3 +861,102 @@ mod tests {
         assert_eq!(unquote_header_param("a"), "a");
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::detect::DetectConfig;
+
+    fn config() -> DetectConfig {
+        DetectConfig {
+            max_content_length: 10_000,
+            max_full_scan_bytes: 262_144,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            binary_min_run_length: 8,
+        }
+    }
+
+    #[test]
+    fn excluded_multipart_parts_and_rfc2231_filenames_scan() {
+        let boundary = "XBOUND";
+        let b = boundary;
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"safe\"\r\n\r\nok\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"secret\"; filename=\"a.php\"\r\n\r\n<?php\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"f2\"; filename*0*=utf-8''up%2E;\r\n\
+             filename*1*=\"php\"\r\n\r\npayload\r\n--{b}--\r\n"
+        );
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+
+        // everything scanned without exclusions
+        let all = extract_body_scan_values(&body, &content_type, &config());
+        assert!(!all.is_empty());
+
+        // the excluded part label drops its values entirely
+        let mut excluded = std::collections::HashSet::new();
+        excluded.insert("secret".to_owned());
+        let filtered = extract_body_scan_values_with_exclusions(
+            &body,
+            &content_type,
+            &config(),
+            ExcludedBodyFields::new(&excluded),
+        );
+        assert!(filtered.len() < all.len());
+    }
+
+    #[test]
+    fn empty_and_headerless_parts_are_dropped() {
+        let boundary = "XBOUND";
+        // a completely bare part: no disposition, no headers, empty payload
+        let b = boundary;
+        let body = format!("--{b}\r\n\r\n\r\n--{b}--\r\n");
+        let values = extract_body_scan_values(
+            &body,
+            &format!("multipart/form-data; boundary={boundary}"),
+            &config(),
+        );
+        // a part with no name, no filename, and no entries contributes
+        // nothing (the bare `file` label never renders)
+        assert!(
+            values
+                .iter()
+                .all(|value| value.content != MULTIPART_FILE_LABEL),
+            "unexpected bare file label: {values:?}"
+        );
+
+        // a named part with only headers keeps its entries (the header line
+        // alone is a value)
+        let b = boundary;
+        let body = format!("--{b}\r\nContent-Type: text/plain\r\n\r\n\r\n--{b}--\r\n");
+        let values = extract_body_scan_values(
+            &body,
+            &format!("multipart/form-data; boundary={boundary}"),
+            &config(),
+        );
+        assert!(
+            values
+                .iter()
+                .any(|value| value.content.contains("Content-Type")),
+            "the header entry should survive: {values:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn excluded_body_fields_reports_emptiness() {
+        assert!(ExcludedBodyFields::default().is_empty());
+        let excluded = std::iter::once("password".to_owned()).collect();
+        assert!(!ExcludedBodyFields::new(&excluded).is_empty());
+    }
+
+    #[test]
+    fn percent_decoding_without_escapes_is_the_identity() {
+        assert_eq!(percent_decode_tolerant("plain value"), "plain value");
+    }
+}
