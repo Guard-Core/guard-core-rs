@@ -492,14 +492,8 @@ mod coverage_tests {
 
         // double extension: dangerous then benign terminal
         let content = "Content-Disposition: filename=\"shell.php.docx\"";
-        println!("DEBUG is_double: {}", is_double_extension("shell.php.docx"));
-        println!(
-            "DEBUG quoted: {:?}",
-            quoted_candidate(content, content.find("filename").expect("fn"))
-        );
         let out =
             file_upload_scan_matches(content, double, dangerous, double, trunc, decoded_trunc);
-        println!("DEBUG out: {out:?}");
         assert_eq!(out.len(), 1);
 
         // raw truncation marker (%00) after the extension
