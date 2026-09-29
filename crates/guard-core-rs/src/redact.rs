@@ -691,3 +691,27 @@ mod coverage_tests {
         assert_eq!(redact_pairs_in_text("token   x", &names), "token   x");
     }
 }
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+
+    #[test]
+    fn malformed_and_truncated_escapes_survive_verbatim() {
+        // an invalid hex pair leaves the `%` in place and resyncs on the
+        // next byte
+        assert_eq!(percent_decode_lossy("%zz"), "%zz");
+        // a truncated escape at the very end rides through untouched
+        assert_eq!(percent_decode_lossy("%4"), "%4");
+    }
+
+    #[test]
+    fn plus_reads_as_space_and_valid_escapes_decode() {
+        // the query-string convention: `+` is a space
+        assert_eq!(percent_decode_lossy("a+b"), "a b");
+        // a valid pair decodes
+        assert_eq!(percent_decode_lossy("%41"), "A");
+        // nothing to decode stays untouched
+        assert_eq!(percent_decode_lossy("plain"), "plain");
+    }
+}

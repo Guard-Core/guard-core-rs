@@ -177,3 +177,36 @@ mod tests {
         assert_eq!(script_threat["position"].as_u64(), Some(6));
     }
 }
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use crate::knobs::map_knobs;
+
+    fn corpus_knobs() -> Knobs {
+        map_knobs(&json!({
+            "detection_max_content_length": 10000,
+            "detection_max_body_inspect_bytes": 262_144,
+            "detection_preserve_attack_patterns": true,
+            "detection_semantic_threshold": 0.7,
+            "detection_threat_score_threshold": 1.0
+        }))
+        .expect("corpus knobs must map")
+    }
+
+    #[test]
+    fn a_fallback_semantic_threat_serializes_its_threat_score_shape() {
+        // a payload whose aggregate score clears the threshold without any
+        // single attack class: the fallback threat renders the `threat_score`
+        // shape instead of a per-type probability
+        let content = format!("from where drop select {} ({{}}$x==) foo(", "A".repeat(120));
+        let verdict = detect(&content, "request_body", &corpus_knobs());
+        let fallback = verdict
+            .threats
+            .iter()
+            .find(|t| t["type"] == "semantic" && t["threat_score"].is_number())
+            .expect("the fallback semantic shape renders");
+        assert_eq!(fallback["attack_type"], json!("suspicious"));
+        assert!(fallback["analysis"].is_object());
+    }
+}

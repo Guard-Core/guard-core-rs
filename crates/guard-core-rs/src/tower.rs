@@ -3561,4 +3561,45 @@ mod tests {
         println!("after check3 None: allowed={} count={}", d.allowed, d.count);
         println!("tracked={}", stage.limiter().tracked_windows());
     }
+
+    #[test]
+    fn an_authority_form_request_observes_the_path_only() {
+        // CONNECT requests carry an authority, not a path+query: the
+        // observation falls back to the bare path
+        let layer = RateLimitStageLayer::new(
+            RateLimitStage::new(RateLimitStageConfig::default()).expect("default config"),
+        );
+        let inner = Inner::new();
+        let mut service = ServiceBuilder::new().layer(layer).service(inner.clone());
+        let socket: SocketAddr = "192.0.2.97:65535".parse().expect("socket");
+        let request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("backend.internal:443")
+            .extension(socket)
+            .body("body")
+            .expect("request");
+        let response = block_on(service.call(request)).expect("ready");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(inner.call_count(), 1);
+    }
+
+    #[test]
+    fn block_on_spins_through_a_single_pending_poll() {
+        // a future that answers Pending once: the noop-waker spin polls it
+        // again and lands on the ready value
+        struct PendingOnce(bool);
+        impl Future for PendingOnce {
+            type Output = u8;
+
+            fn poll(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u8> {
+                if self.0 {
+                    Poll::Ready(7)
+                } else {
+                    self.0 = true;
+                    Poll::Pending
+                }
+            }
+        }
+        assert_eq!(block_on(PendingOnce(false)), 7);
+    }
 }

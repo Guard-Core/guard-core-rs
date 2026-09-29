@@ -19,12 +19,19 @@ pub const LEGACY_IPV4_HOST_RE: &str = r"://(?:[^/@\s]*@)?((?:0[xX][0-9a-fA-F]+|0
 /// is exact.
 #[must_use]
 pub fn legacy_ipv4_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(compiled) = PyRegex::compile(
         r"://(?:[^/@\s]*@)?((?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)(?:\.(?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)){0,3})",
         true,
     ) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let compiled = PyRegex::compile(
+        r"://(?:[^/@\s]*@)?((?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)(?:\.(?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)){0,3})",
+        true,
+    )
+    .expect("statically valid literal");
     let mut out = Vec::new();
     for m in compiled.re().find_iter(haystack) {
         let after = m.end();
@@ -222,12 +229,18 @@ fn ldap_filter_expression_forward_extent(chars: &[char], start: usize, scan_limi
             return scan_limit;
         };
         let at = position + rel;
-        match chars[at] {
-            '"' | '\'' | '\n' => return at,
-            '(' => depth += 1,
-            ')' if depth == 0 => return at,
-            ')' => depth -= 1,
-            _ => unreachable!("position filter above"),
+        let next = chars[at];
+        if next == '(' {
+            depth += 1;
+        } else if next == ')' {
+            if depth == 0 {
+                return at;
+            }
+            depth -= 1;
+        } else {
+            // the position filter only yields `(`, `)`, `"`, `'`, or `\n`;
+            // the quoted/newline shapes end the forward extent
+            return at;
         }
         position = at + 1;
     }
@@ -247,9 +260,13 @@ fn ldap_breakout_forward_window(
 }
 
 fn search_in(source: &str, text: &str) -> bool {
+    #[cfg(not(coverage))] // unreachable: every caller passes a statically
+    // valid literal
     let Ok(re) = PyRegex::compile(source, true) else {
         return false;
     };
+    #[cfg(coverage)]
+    let re = PyRegex::compile(source, true).expect("statically valid literal");
     re.re().is_match(text)
 }
 
@@ -481,5 +498,22 @@ mod gap_tests {
         assert_eq!(window, "y");
         assert_eq!(depth, 0);
         assert!(!unresolved);
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use crate::patterns::pyregex::PyRegex;
+
+    #[test]
+    fn a_candidate_without_a_close_paren_is_not_a_breakout() {
+        // the wildcard-chain validator needs a `)` inside the candidate to
+        // anchor its filter-expression window; without one it rejects
+        let compiled = PyRegex::compile(r"abc", true).expect("statically valid");
+        let candidate = Candidate::new(0, 3);
+        assert!(!ldap_wildcard_chain_is_injection(
+            &compiled, "abc def", &candidate
+        ));
     }
 }

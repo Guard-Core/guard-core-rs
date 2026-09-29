@@ -1834,3 +1834,152 @@ mod tests {
         suite.cases.len()
     }
 }
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn body_drive() -> PipelineDrive {
+        PipelineDrive {
+            client_ip: "10.0.0.1".to_owned(),
+            method: Some("POST".to_owned()),
+            url_path: Some("/api".to_owned()),
+            headers: BTreeMap::new(),
+            body: Some("SELECT * FROM users".to_owned()),
+            stage: None,
+            response_status: None,
+            response_body: None,
+        }
+    }
+
+    fn mixed_drive() -> PipelineDrive {
+        // one benign header (no exclusions) plus an attacking header after
+        // the attacking body: the header scan rides with an empty skip list
+        // and finds the trigger label already set
+        let mut headers = BTreeMap::new();
+        headers.insert("Accept".to_owned(), "text/html".to_owned());
+        headers.insert("User-Agent".to_owned(), "SELECT * FROM users".to_owned());
+        headers.insert("X-Probe".to_owned(), "<script>alert(1)</script>".to_owned());
+        PipelineDrive {
+            client_ip: "10.0.0.1".to_owned(),
+            method: Some("POST".to_owned()),
+            url_path: Some("/api".to_owned()),
+            headers,
+            body: Some("SELECT * FROM users".to_owned()),
+            stage: None,
+            response_status: None,
+            response_body: None,
+        }
+    }
+
+    fn semantic_body_drive() -> PipelineDrive {
+        // a body whose verdict is semantic-only: the per-value category
+        // filter ends the scan clean
+        PipelineDrive {
+            client_ip: "10.0.0.1".to_owned(),
+            method: Some("POST".to_owned()),
+            url_path: Some("/api".to_owned()),
+            headers: BTreeMap::new(),
+            body: Some(String::from(
+                "from where drop select WhetherOrNotThisIsPaddingTextWithLetters ({}$x==) foo(",
+            )),
+            stage: None,
+            response_status: None,
+            response_body: None,
+        }
+    }
+
+    fn detect_config() -> DetectConfig {
+        DetectConfig {
+            max_content_length: 4096,
+            max_full_scan_bytes: 4096,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            binary_min_run_length: 16,
+        }
+    }
+
+    #[test]
+    fn a_valid_custom_error_table_builds_into_the_engine() {
+        let case = PipelineCase {
+            id: "config_case".to_owned(),
+            config: json!({"custom_error_responses": {"403": "request blocked"}}),
+            geo_countries: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            drives: vec![body_drive()],
+            expected: Vec::new(),
+        };
+        let engine = CaseEngine::new(&case, detect_config()).expect("valid config");
+        assert_eq!(
+            engine.custom_errors().get(&403).map(String::as_str),
+            Some("request blocked")
+        );
+    }
+
+    #[test]
+    fn a_request_body_hit_reports_the_request_body_label() {
+        let case = PipelineCase {
+            id: "body_case".to_owned(),
+            config: Value::Null,
+            geo_countries: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            drives: vec![body_drive()],
+            expected: Vec::new(),
+        };
+        let engine = CaseEngine::new(&case, detect_config()).expect("valid config");
+        let finding = engine.scan(&body_drive(), None);
+        assert!(finding.is_threat, "the sqli body trips: {finding:?}");
+        assert!(
+            finding
+                .trigger_info
+                .starts_with("Request body: Value matched pattern"),
+            "trigger: {}",
+            finding.trigger_info
+        );
+    }
+
+    #[test]
+    fn headers_scan_with_the_body_and_keep_the_first_trigger_label() {
+        let case = PipelineCase {
+            id: "mixed_case".to_owned(),
+            config: Value::Null,
+            geo_countries: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            drives: vec![mixed_drive()],
+            expected: Vec::new(),
+        };
+        let engine = CaseEngine::new(&case, detect_config()).expect("valid config");
+        let finding = engine.scan(&mixed_drive(), None);
+        assert!(finding.is_threat, "the drives trip: {finding:?}");
+        assert!(
+            finding
+                .trigger_info
+                .starts_with("Request body: Value matched pattern"),
+            "the body's label wins: {}",
+            finding.trigger_info
+        );
+    }
+
+    #[test]
+    fn a_semantic_only_body_ends_the_scan_clean() {
+        let case = PipelineCase {
+            id: "semantic_case".to_owned(),
+            config: Value::Null,
+            geo_countries: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            drives: vec![semantic_body_drive()],
+            expected: Vec::new(),
+        };
+        let engine = CaseEngine::new(&case, detect_config()).expect("valid config");
+        let finding = engine.scan(&semantic_body_drive(), None);
+        assert!(
+            !finding.is_threat,
+            "semantic-only evidence is not a regex finding: {finding:?}"
+        );
+        assert!(finding.categories.is_empty());
+        assert!(finding.trigger_info.is_empty());
+    }
+}

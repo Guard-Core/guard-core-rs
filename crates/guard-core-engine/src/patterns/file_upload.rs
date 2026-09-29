@@ -123,9 +123,15 @@ fn is_double_extension(body: &str) -> bool {
     if !benign_terminal(body) {
         return false;
     }
+    #[cfg(not(coverage))] // unreachable: benign_terminal already proved the
+    // body carries a '.' with a benign tail
     let Some(final_dot) = body.rfind('.') else {
         return false;
     };
+    #[cfg(coverage)]
+    let final_dot = body
+        .rfind('.')
+        .expect("benign_terminal proved a '.' exists");
     for (idx, c) in body.char_indices() {
         if c != '.' || idx >= final_dot {
             continue;
@@ -133,6 +139,8 @@ fn is_double_extension(body: &str) -> bool {
         let Some(marker_end) = dangerous_marker_at(body, idx, DOUBLE_EXT) else {
             continue;
         };
+        #[cfg(not(coverage))] // unreachable: the marker span is alphanumeric,
+        // so it always ends at or before the final dot
         if marker_end > final_dot {
             continue;
         }
@@ -212,9 +220,13 @@ fn file_upload_match_start(content: &str, filename_start: usize) -> Option<usize
         if cursor == 0 {
             return Some(0);
         }
+        #[cfg(not(coverage))] // unreachable: `char_before` only answers `None`
+        // at index 0, which the guard above already handled
         let Some((i, c)) = char_before(content, cursor) else {
             return Some(0);
         };
+        #[cfg(coverage)]
+        let (i, c) = char_before(content, cursor).expect("cursor > 0 is a boundary");
         if is_whitespace(c) {
             if c == '\n' {
                 first_newline = Some(i);

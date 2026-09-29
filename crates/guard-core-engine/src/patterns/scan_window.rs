@@ -157,3 +157,16 @@ mod coverage_tests {
         assert_eq!(ms[0].text(text), "<script>a</script>");
     }
 }
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use crate::patterns::pyregex::PyRegex;
+
+    #[test]
+    fn an_inverted_window_is_never_anchored() {
+        // `start > end` truncates to an empty (inverted) span: no anchor
+        let re = PyRegex::compile(r"a", false).unwrap();
+        assert!(match_span(re.re(), "abc", 2, 1).is_none());
+    }
+}

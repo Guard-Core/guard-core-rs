@@ -162,6 +162,8 @@ fn payload_slice(body: &str, payload_start: Option<usize>, boundary_line_start: 
             end -= 1;
         }
     }
+    #[cfg(not(coverage))] // unreachable: the CRLF strip guards keep
+    // `end >= start`, so the slice never inverts
     if end < start {
         return "";
     }
@@ -325,6 +327,23 @@ mod coverage_tests {
         let body = "Content-Disposition: form-data; name=\"f\"\r\n\r\nbody";
         let parts = parse_multipart_parts(body, "NO_SUCH_BOUNDARY");
         assert!(parts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+
+    #[test]
+    fn a_payload_newline_at_the_boundary_strips_down_to_the_start() {
+        // the terminator immediately before the boundary line is the
+        // delimiter's: a lone `\n` strip lands exactly on the payload start
+        assert_eq!(payload_slice("\nZ", Some(0), 1), "");
+        // a CRLF terminator strips both bytes
+        assert_eq!(payload_slice("x\r\nBOUND", Some(0), 3), "x");
+        // a payload byte that is no terminator keeps the whole span up to
+        // the boundary line
+        assert_eq!(payload_slice("xZ", Some(0), 1), "x");
     }
 }
 

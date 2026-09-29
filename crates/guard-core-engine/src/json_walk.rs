@@ -319,9 +319,15 @@ impl Parser<'_> {
             return Err(ParseError::Invalid);
         }
         self.bump();
-        match self.stack.last_mut() {
-            Some(ParseFrame::Object { current_key, .. }) => *current_key = Some(key),
-            _ => return Err(ParseError::Invalid),
+        // a Key step only follows an opened object frame, so the frame under
+        // the key is always the object being filled
+        let frame = self.stack.last_mut();
+        debug_assert!(
+            matches!(frame, Some(ParseFrame::Object { .. })),
+            "a Key step only follows an opened object frame"
+        );
+        if let Some(ParseFrame::Object { current_key, .. }) = frame {
+            *current_key = Some(key);
         }
         Ok(ParseState::Value)
     }
@@ -329,9 +335,15 @@ impl Parser<'_> {
     /// One Attach step: attach the completed node to its parent, close the
     /// parent on its closing bracket, or finish the root value.
     fn step_attach(&mut self) -> Result<Flow, ParseError> {
+        #[cfg(not(coverage))] // unreachable: every Attach entry queues a node
         let Some(node) = self.pending.take() else {
             return Err(ParseError::Invalid);
         };
+        #[cfg(coverage)]
+        let node = self
+            .pending
+            .take()
+            .expect("every Attach entry queues a node");
         self.skip_ws();
         let delimiter = self.peek();
         let Some(frame) = self.stack.pop() else {

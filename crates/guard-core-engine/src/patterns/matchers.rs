@@ -2173,3 +2173,27 @@ mod tests {
         assert_eq!(rfind_in("abcabc", "zz", 0, 6), None);
     }
 }
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use crate::patterns::pyregex::PyRegex;
+
+    #[test]
+    fn a_misaligned_token_stops_the_env_prefix_walk() {
+        // after the newline prefix the text holds `;a=b `: the first token
+        // match starts past the resume point, so the anchor check abandons
+        // the prefix and no candidate renders
+        let compiled = PyRegex::compile(r"\n[^\S\r\n]*evil\s+-c", false).unwrap();
+        assert!(shell_dash_c_finditer("\n;a=b ", &compiled).is_empty());
+    }
+
+    #[test]
+    fn a_query_tail_after_a_sensitive_path_scans_to_the_whitespace_edge() {
+        // the extension ends before a `?query`: the tail consumes the query
+        // and the candidate spans the whole string
+        let hits = sensitive_path_scan_ext("/x/world.map?a=1", &["map"]);
+        assert_eq!(hits.len(), 1, "the query tail keeps the match: {hits:?}");
+        assert_eq!((hits[0].start, hits[0].end), (0, 16));
+    }
+}

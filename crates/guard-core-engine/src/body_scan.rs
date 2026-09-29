@@ -918,12 +918,26 @@ mod coverage_tests {
             &config(),
         );
         // a part with no name, no filename, and no entries contributes
-        // nothing (the bare `file` label never renders)
+        // nothing at all
+        assert!(values.is_empty(), "unexpected values: {values:?}");
+
+        // a part that DOES produce values: a named part's payload renders
+        // under its own name, never a bare `file`
+        let b = boundary;
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"field\"\r\n\r\nhello\r\n--{b}--\r\n"
+        );
+        let named = extract_body_scan_values(
+            &body,
+            &format!("multipart/form-data; boundary={boundary}"),
+            &config(),
+        );
+        assert!(!named.is_empty(), "the named part keeps its values");
         assert!(
-            values
+            named
                 .iter()
                 .all(|value| value.content != MULTIPART_FILE_LABEL),
-            "unexpected bare file label: {values:?}"
+            "unexpected bare file label: {named:?}"
         );
 
         // a named part with only headers keeps its entries (the header line

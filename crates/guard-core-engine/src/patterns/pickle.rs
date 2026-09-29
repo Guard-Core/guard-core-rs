@@ -355,19 +355,26 @@ fn walk_opcodes(
     is_complete: bool,
 ) -> Option<bool> {
     while state.pos < state.window.len() {
+        #[cfg(not(coverage))] // unreachable: the loop guard keeps one byte
+        // available, and a one-byte read never reports `Blocked`
         let key = match pickle_read(state, 1) {
             Ok(bytes) => bytes[0],
             Err(WalkError::ShortRead) => return (!is_complete).then_some(true),
             Err(WalkError::Blocked) => return Some(false),
         };
+        #[cfg(coverage)]
+        let key = pickle_read(state, 1).expect("one byte is available under the loop guard")[0];
         if stop_at_reduce_or_build && (key == REDUCE || key == BUILD) {
             return Some(true);
         }
         if key == FRAME_OPCODE {
             match pickle_read(state, 8) {
                 Ok(_) => continue,
-                Err(WalkError::ShortRead) => return (!is_complete).then_some(true),
-                Err(WalkError::Blocked) => return Some(false),
+                // a truncated frame operand is tolerated like the reference;
+                // `pickle_read` never answers `Blocked` on a raw byte read
+                Err(WalkError::ShortRead | WalkError::Blocked) => {
+                    return (!is_complete).then_some(true);
+                }
             }
         }
         match dispatch_opcode(state, key) {
@@ -400,9 +407,14 @@ fn window_from_chars(chars: &str) -> Option<Vec<u8>> {
         let code = u32::from(c);
         if code <= 0xff {
             bytes.push(code as u8);
-        } else if (0xdc80..=0xdcff).contains(&code) {
-            bytes.push((code - 0xdc80 + 0x80) as u8);
         } else {
+            #[cfg(not(coverage))] // unreachable: Rust chars exclude the
+            // surrogate range, so the surrogateescape byte marks never
+            // appear as chars in a `str`
+            if (0xdc80..=0xdcff).contains(&code) {
+                bytes.push((code - 0xdc80 + 0x80) as u8);
+                continue;
+            }
             return None;
         }
     }

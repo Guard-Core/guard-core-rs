@@ -1307,3 +1307,112 @@ mod tests {
         assert!(!manager.is_banned(ip("192.0.2.9")));
     }
 }
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use std::str::FromStr;
+
+    fn ip(text: &str) -> IpAddr {
+        IpAddr::from_str(text).expect("test address")
+    }
+
+    /// A ban store the test scripts per call: one expiry or a backend
+    /// failure, so every distributed-lookup arm runs.
+    struct ScriptedBanStore {
+        answer: Result<Option<f64>, crate::distributed::StoreError>,
+    }
+
+    impl crate::distributed::BanStore for ScriptedBanStore {
+        fn set_ban(
+            &self,
+            _key: &str,
+            _expiry: f64,
+            _ttl_seconds: u64,
+        ) -> Result<(), crate::distributed::StoreError> {
+            Ok(())
+        }
+
+        fn get_ban(&self, _key: &str) -> Result<Option<f64>, crate::distributed::StoreError> {
+            self.answer.clone()
+        }
+
+        fn delete_ban(&self, _key: &str) -> Result<(), crate::distributed::StoreError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_lists_accept_and_reject_entries_fail_closed() {
+        // one call site drives both outcomes: valid CIDR and bare-IP entries
+        // land in the trusted list, an unparsable entry fails closed exactly
+        // like the gate
+        for (entry, valid) in [
+            ("10.0.0.0/8", true),
+            ("192.168.1.1", true),
+            ("not-a-network", false),
+        ] {
+            let built =
+                IpBanManager::with_trusted_proxies_and_clock([entry], Arc::new(system_clock));
+            assert_eq!(built.is_ok(), valid, "entry {entry}");
+            if let Ok(manager) = built {
+                assert!(!manager.is_banned(ip("10.1.2.3")));
+            }
+        }
+    }
+
+    #[test]
+    fn distributed_lookups_answer_live_stale_missing_and_failed_backends() {
+        let now = 1_000.0_f64;
+        // a live distributed ban reads as banned and caches locally
+        let live = IpBanManager::with_trusted_proxies_and_clock(
+            Vec::<String>::new(),
+            Arc::new(move || now),
+        )
+        .expect("manager")
+        .with_distributed_store(
+            Arc::new(ScriptedBanStore {
+                answer: Ok(Some(2_000.0)),
+            }),
+            "gc:",
+        );
+        assert!(live.is_banned(ip("192.0.2.71")));
+        // banning through the manager writes the expiry into the store
+        live.ban_ip(ip("192.0.2.72"), 60, "penetration_attempt")
+            .expect("ban");
+        // a stale expiry deletes the key and reads unbanned
+        let stale = IpBanManager::with_trusted_proxies_and_clock(
+            Vec::<String>::new(),
+            Arc::new(move || now),
+        )
+        .expect("manager")
+        .with_distributed_store(
+            Arc::new(ScriptedBanStore {
+                answer: Ok(Some(500.0)),
+            }),
+            "gc:",
+        );
+        assert!(!stale.is_banned(ip("192.0.2.71")));
+        // a missing key reads unbanned
+        let missing = IpBanManager::with_trusted_proxies_and_clock(
+            Vec::<String>::new(),
+            Arc::new(move || now),
+        )
+        .expect("manager")
+        .with_distributed_store(Arc::new(ScriptedBanStore { answer: Ok(None) }), "gc:");
+        assert!(!missing.is_banned(ip("192.0.2.71")));
+        // a backend error reads unbanned
+        let failed = IpBanManager::with_trusted_proxies_and_clock(
+            Vec::<String>::new(),
+            Arc::new(move || now),
+        )
+        .expect("manager")
+        .with_distributed_store(
+            Arc::new(ScriptedBanStore {
+                answer: Err(crate::distributed::StoreError(String::from("down"))),
+            }),
+            "gc:",
+        );
+        assert!(!failed.is_banned(ip("192.0.2.71")));
+    }
+}

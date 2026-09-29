@@ -548,13 +548,15 @@ fn base64_token_spans(content: &str) -> Vec<(usize, usize)> {
             continue;
         };
         let end = chars.get(end_char).map_or(content.len(), |(idx, _)| *idx);
-        if end > start {
-            spans.push((start, end));
-            // resume after the match, like re.sub
-            i = end_char;
+        #[cfg(not(coverage))] // unreachable: every alternative end lands past
+        // the token start, so the resume below always runs
+        if end <= start {
+            i += 1;
             continue;
         }
-        i += 1;
+        spans.push((start, end));
+        // resume after the match, like re.sub
+        i = end_char;
     }
     spans
 }
@@ -594,6 +596,9 @@ pub fn decode_base64_candidates(content: &str, gunzip_attempts_left: &mut u32) -
     let mut out = String::with_capacity(content.len());
     let mut last = 0usize;
     for (start, end) in spans {
+        #[cfg(not(coverage))] // unreachable: `base64_token_spans` yields
+        // strictly ascending spans, so a later span never starts before the
+        // previous end
         if start < last {
             continue;
         }
@@ -1479,5 +1484,57 @@ mod gap_tests {
         );
         let out = truncate_safely(&content, 420, true, 10_000);
         assert_eq!(out.chars().count(), 420);
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+
+    #[test]
+    fn eleven_data_chars_anchor_on_a_single_pad() {
+        // alternative 2 of the token shape: 11 data chars plus one `=`
+        assert_eq!(base64_token_spans("AAAAAAAAAAA="), vec![(0, 12)]);
+        // a trailing separator after the `=`: the rightmost `=` whose
+        // successor is not `=` still anchors the match end (the `?` stays
+        // outside the token)
+        assert_eq!(base64_token_spans("AAAAAAAAAAA=?"), vec![(0, 12)]);
+    }
+
+    #[test]
+    fn ten_data_chars_anchor_on_a_double_pad() {
+        // alternative 3 of the token shape: 10 data chars plus `==`
+        assert_eq!(base64_token_spans("AAAAAAAAAA=="), vec![(0, 12)]);
+        // a trailing separator after the `==`: the `==` pair not followed by
+        // another `=` anchors the match end
+        assert_eq!(base64_token_spans("AAAAAAAAAA==."), vec![(0, 12)]);
+    }
+
+    #[test]
+    fn gap_budget_shapes_the_collapsed_gap() {
+        let gap = ['a', 'b', 'c'];
+        // within budget: the gap rides through whole and the budget spends
+        // only the difference
+        assert_eq!(consume_gap(&gap, 0, 2, 3), (String::from("ab"), 1));
+        // over budget with room: the leading chunk rides and one space
+        // separates
+        assert_eq!(consume_gap(&gap, 0, 3, 2), (String::from("a "), 0));
+        // over budget at a zero-length piece: only the separating space
+        assert_eq!(consume_gap(&gap, 0, 3, 1), (String::from(" "), 0));
+    }
+
+    #[test]
+    fn the_additive_view_stops_after_twenty_thousand_candidates() {
+        // more base64-looking tokens than the candidate cap: the walk stops
+        // at the cap instead of decoding the whole input. `IyMj` decodes to
+        // `###`, which passes the printable and marker gates; one oversize
+        // token rides the oversize skip and one unprintable decode
+        // (`CQkJCQ==` is four tabs) rides the ratio gate.
+        let content = format!("CQkJCQ== IyMjIyMjIyMjIyMj {}", "IyMj ".repeat(20_001));
+        let view = short_base64_additive_view(&content, usize::MAX, false, usize::MAX);
+        assert!(view.contains('\n'), "decoded fragments join on newlines");
+        // the cap stopped the walk: the two skipped candidates never render
+        let fragments = view.split('\n').count();
+        assert_eq!(fragments, 19_998);
     }
 }
