@@ -482,3 +482,158 @@ mod tests {
         assert_eq!(rule_from_config(&cfg), Some(rule("status:404", 2)));
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct FakeClock(Arc<AtomicU64>);
+
+    impl FakeClock {
+        fn now(&self) -> SystemTime {
+            let secs = self.0.load(Ordering::Relaxed);
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+        }
+    }
+
+    fn return_rule(threshold: u32) -> BehaviorRule {
+        BehaviorRule {
+            rule_type: "return_pattern".to_owned(),
+            threshold,
+            window: 60,
+            pattern: "status:403".to_owned(),
+            action: "log".to_owned(),
+            ban_duration: None,
+            correlate_with_detection: false,
+        }
+    }
+
+    #[test]
+    fn reset_forgets_every_window() {
+        let fake = FakeClock::default();
+        let mut tracker = BehaviorTracker::new();
+        let rule = return_rule(1);
+        assert!(!tracker.track_return_pattern("ep", "1.2.3.4", 403, None, &rule, 1024, fake.now()));
+        tracker.reset();
+        // after the reset the window is gone: the same observation is the
+        // first hit again, not a threshold cross
+        assert!(!tracker.track_return_pattern("ep", "1.2.3.4", 403, None, &rule, 1024, fake.now()));
+    }
+
+    #[test]
+    fn non_return_rules_and_unevaluated_patterns_never_trip() {
+        let fake = FakeClock::default();
+        let mut tracker = BehaviorTracker::new();
+        let frequency = BehaviorRule {
+            rule_type: "frequency".to_owned(),
+            threshold: 0,
+            window: 60,
+            pattern: String::new(),
+            action: "log".to_owned(),
+            ban_duration: None,
+            correlate_with_detection: false,
+        };
+        // a body pattern with no captured prefix cannot be evaluated
+        let body_rule = BehaviorRule {
+            pattern: "regex:secret".to_owned(),
+            ..return_rule(0)
+        };
+        assert!(!tracker.track_return_pattern(
+            "ep",
+            "1.2.3.4",
+            403,
+            None,
+            &frequency,
+            1024,
+            fake.now()
+        ));
+        assert!(!tracker.track_return_pattern(
+            "ep",
+            "1.2.3.4",
+            403,
+            None,
+            &body_rule,
+            1024,
+            fake.now()
+        ));
+    }
+
+    #[test]
+    fn json_scalars_render_like_python_str() {
+        use crate::behavior::json_scalar_to_string;
+        assert_eq!(json_scalar_to_string(&serde_json::json!(true)), "true");
+        assert_eq!(json_scalar_to_string(&serde_json::json!(false)), "false");
+        assert_eq!(json_scalar_to_string(&serde_json::json!(null)), "None");
+        assert_eq!(json_scalar_to_string(&serde_json::json!(1)), "1");
+    }
+
+    #[test]
+    fn json_array_membership_matches_any_element() {
+        use crate::behavior::match_json_array;
+        let value = serde_json::json!({"tags": ["a", "b"]});
+        assert!(match_json_array(&value, "tags", "B"));
+        assert!(!match_json_array(&value, "tags", "c"));
+        assert!(!match_json_array(&value, "missing", "a"));
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    fn rule(pattern: &str) -> BehaviorRule {
+        BehaviorRule {
+            rule_type: "return_pattern".to_owned(),
+            threshold: 1,
+            window: 3600,
+            pattern: pattern.to_owned(),
+            action: "log".to_owned(),
+            ban_duration: None,
+            correlate_with_detection: false,
+        }
+    }
+
+    #[test]
+    fn an_uncompilable_regex_pattern_cannot_be_evaluated() {
+        let mut tracker = BehaviorTracker::new();
+        assert_eq!(
+            tracker.check_response_pattern(200, Some(b"body"), "regex:([unclosed", 1024),
+            None
+        );
+        // and the rule treats "could not evaluate" as a no-match
+        let now = SystemTime::now();
+        assert!(!tracker.track_return_pattern(
+            "GET:/x",
+            "192.0.2.9",
+            200,
+            Some(b"body"),
+            &rule("regex:([unclosed"),
+            1024,
+            now,
+        ));
+    }
+
+    #[test]
+    fn a_compiled_regex_pattern_is_cached_across_calls() {
+        let mut tracker = BehaviorTracker::new();
+        let first = tracker.check_response_pattern(200, Some(b"error text"), "regex:err\\w+", 1024);
+        assert_eq!(first, Some(true));
+        // the second call reuses the cached compile
+        let second =
+            tracker.check_response_pattern(200, Some(b"error text"), "regex:err\\w+", 1024);
+        assert_eq!(second, Some(true));
+    }
+
+    #[test]
+    fn an_object_valued_json_field_never_matches_a_scalar_expectation() {
+        let mut tracker = BehaviorTracker::new();
+        let body = br#"{"meta":{"a":1}}"#;
+        assert_eq!(
+            tracker.check_response_pattern(200, Some(body), "json:meta==zzz", 1024),
+            Some(false)
+        );
+    }
+}

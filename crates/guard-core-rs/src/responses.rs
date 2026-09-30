@@ -218,12 +218,27 @@ mod tests {
         let hook: OnBlockHook = Arc::new(move |_| {
             *sink.lock().expect("sink") += 1;
         });
+        // the hook itself counts when its transport is invoked
+        let payload = build_block_payload(
+            "ip_security",
+            "r",
+            "",
+            false,
+            "ip",
+            "/p",
+            "GET",
+            Some(403),
+            &names(),
+        );
+        fire_block_hook(Some(&hook), &payload);
+        assert_eq!(*seen.lock().expect("sink"), 1);
+        // none of the excluded check names ever drive it
         for name in ON_BLOCK_EXCLUDED_CHECK_NAMES {
             let payload =
                 build_block_payload(name, "r", "", false, "ip", "/p", "GET", Some(403), &names());
             fire_block_hook(Some(&hook), &payload);
         }
-        assert_eq!(*seen.lock().expect("sink"), 0);
+        assert_eq!(*seen.lock().expect("sink"), 1);
     }
 
     #[test]

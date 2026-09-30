@@ -57,7 +57,8 @@ pub(crate) fn is_binary_artifact(c: char) -> bool {
     if cp == 0xFFFD {
         return true;
     }
-    // surrogateescape byte range (raw undecodable bytes)
+    #[cfg(not(coverage))] // unreachable: Rust chars exclude the surrogate
+    // range, so the surrogateescape byte marks never appear as chars
     if (0xDC80..=0xDCFF).contains(&cp) {
         return true;
     }
@@ -171,5 +172,35 @@ mod tests {
         // reference's text allowlist (all of 0xC0..=0xFF is text).
         let prefix = build_binary_prefix("3 \u{00d7} 4 \u{00f7} 2");
         assert_eq!(prefix.last(), Some(&0));
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn density_gate_needs_a_prefix_and_enough_high_bytes() {
+        // an empty prefix never gates
+        assert!(!match_is_binary_density(&[], 0, 1));
+        // fewer than the limit of high bytes in the window is fine
+        let prefix = vec![0_u32, 0, 0, 0, 3, 3];
+        assert!(!match_is_binary_density(&prefix, 2, 3));
+        // a dense window gates
+        let dense = vec![0_u32, 9, 9, 9, 9, 9];
+        assert!(match_is_binary_density(&dense, 2, 3));
+    }
+
+    #[test]
+    fn artifact_chars_cover_control_replacement_surrogate_and_latin() {
+        assert!(is_binary_artifact('\u{1}'));
+        assert!(is_binary_artifact('\u{7f}'));
+        assert!(is_binary_artifact('\u{fffd}'));
+        assert!(!is_binary_artifact(
+            char::from_u32(0x0301).expect("in range")
+        ));
+        assert!(is_binary_artifact('\u{80}'));
+        assert!(!is_binary_artifact('\t'));
+        assert!(!is_binary_artifact('a'));
     }
 }

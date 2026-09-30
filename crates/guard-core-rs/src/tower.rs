@@ -2080,6 +2080,16 @@ mod tests {
                     .is_none()
             );
         }
+        // without the explicit route the resolver's tier applies
+        assert!(
+            stage
+                .decide_for_path(Some(visitor), Some("/x"), None, None, None)
+                .is_none()
+        );
+        let answered = stage
+            .decide_for_path(Some(visitor), Some("/x"), None, None, None)
+            .expect("throttled by the resolver tier");
+        assert_eq!(answered.status, StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
@@ -2190,6 +2200,34 @@ mod tests {
             );
         }
         assert_eq!(stage.limiter().tracked_windows(), 0);
+        // a non-exempt visitor still runs the resolver's tier
+        let plain = ip("192.0.2.67");
+        let plain_gate = IpGateDecision {
+            is_whitelisted: false,
+            is_exempt: false,
+        };
+        assert!(
+            stage
+                .decide_for_path(
+                    Some(plain),
+                    Some("/resolver-only"),
+                    None,
+                    Some(plain_gate),
+                    None
+                )
+                .is_none()
+        );
+        assert!(
+            stage
+                .decide_for_path(
+                    Some(plain),
+                    Some("/resolver-only"),
+                    None,
+                    Some(plain_gate),
+                    None
+                )
+                .is_some()
+        );
     }
 
     #[test]
@@ -2230,6 +2268,282 @@ mod tests {
             stage.bans().ban_record(attacker).expect("record").reason,
             RATE_LIMIT_BAN_REASON
         );
+    }
+
+    #[test]
+    fn stage_error_display_and_source_cover_the_ban_and_proxy_variants() {
+        use std::error::Error as _;
+        let error = RateLimitStage::builder(RateLimitStageConfig {
+            ip_ban: IpBanConfig {
+                enable_ip_banning: true,
+                auto_ban_threshold: 0,
+                ..IpBanConfig::default()
+            },
+            ..RateLimitStageConfig::default()
+        })
+        .build()
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .starts_with("invalid ip ban config: invalid auto_ban_threshold"),
+            "unexpected: {error}"
+        );
+        assert!(error.source().is_some());
+
+        let proxy = RateLimitStage::builder(RateLimitStageConfig::default())
+            .trusted_proxies(["not-an-ip"])
+            .build()
+            .unwrap_err();
+        assert!(proxy.source().is_some());
+    }
+
+    #[test]
+    fn stage_and_layer_debug_render_their_names() {
+        let stage = RateLimitStage::new(RateLimitStageConfig::default()).expect("config");
+        assert!(format!("{stage:?}").contains("RateLimitStage"));
+        let layer = RateLimitStageLayer::new(stage);
+        assert!(format!("{layer:?}").contains("RateLimitStageLayer"));
+    }
+
+    #[test]
+    fn decide_for_path_observed_resolves_route_tiers_from_the_path() {
+        let fake = FakeClock::default();
+        let stage = RateLimitStage::builder(RateLimitStageConfig::default())
+            .clock(fake.clock())
+            .route_resolver(|_path| {
+                Some(RouteRateLimits::new(Some(1), None, None).expect("valid route"))
+            })
+            .build()
+            .expect("valid stage config");
+        let visitor = ip("192.0.2.72");
+        let observation = RequestObservation {
+            method: Some("GET".to_owned()),
+            url: Some("/resolver".to_owned()),
+            user_agent: Some("probe/1".to_owned()),
+        };
+        assert!(
+            stage
+                .decide_for_path_observed(
+                    Some(visitor),
+                    Some("/resolver"),
+                    None,
+                    None,
+                    None,
+                    Some(&observation)
+                )
+                .is_none()
+        );
+        let answer = stage
+            .decide_for_path_observed(
+                Some(visitor),
+                Some("/resolver"),
+                None,
+                None,
+                None,
+                Some(&observation),
+            )
+            .expect("throttled through the resolver");
+        assert_eq!(answer.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn decide_for_path_observed_answers_the_fail_closed_503() {
+        let store = Arc::new(MemoryStore::default());
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 10,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: false,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .distributed_store(
+            Arc::clone(&store) as Arc<dyn SlidingWindowStore>,
+            "guard_core:",
+            false,
+        )
+        .build()
+        .expect("config");
+        let observation = RequestObservation {
+            method: Some("GET".to_owned()),
+            url: Some("/x".to_owned()),
+            user_agent: None,
+        };
+        let answer = stage
+            .decide_for_path_observed(
+                Some(ip("192.0.2.92")),
+                Some("/x"),
+                None,
+                None,
+                None,
+                Some(&observation),
+            )
+            .expect("fail closed");
+        assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(answer.body, REDIS_UNAVAILABLE_BODY);
+    }
+
+    #[test]
+    fn rate_limit_events_carry_the_redacted_observation() {
+        let (seen, bus) = recording_bus();
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                ..RateLimitConfig::default()
+            },
+            passive_mode: true,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .events(bus)
+        .observability(ObservabilityConfig::default())
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.93");
+        let observation = RequestObservation {
+            method: Some("GET".to_owned()),
+            url: Some("/login?token=abc".to_owned()),
+            user_agent: Some("curl/8".to_owned()),
+        };
+        let _ = stage.decide_for_path_observed(
+            Some(visitor),
+            Some("/login"),
+            None,
+            None,
+            None,
+            Some(&observation),
+        );
+        let _ = stage.decide_for_path_observed(
+            Some(visitor),
+            Some("/login"),
+            None,
+            None,
+            None,
+            Some(&observation),
+        );
+        let events = seen.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1, "only the crossing logs");
+        let (_, action, _) = &events[0];
+        assert_eq!(action, "logged_only");
+    }
+
+    #[test]
+    fn penetration_events_carry_the_redacted_observation() {
+        let (seen, bus) = recording_bus();
+        let stage = event_stage(RateLimitStageConfig::default(), Arc::new(system_clock), bus);
+        let finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["xss".to_owned()],
+            trigger_info: "script tag".to_owned(),
+        };
+        let observation = RequestObservation {
+            method: Some("POST".to_owned()),
+            url: Some("/search?q=<script>".to_owned()),
+            user_agent: Some("curl/8".to_owned()),
+        };
+        let _ = stage.decide_for_path_observed(
+            Some(ip("192.0.2.94")),
+            Some("/search"),
+            None,
+            None,
+            Some(&finding),
+            Some(&observation),
+        );
+        let events = seen.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, EVENT_PENETRATION_ATTEMPT);
+    }
+
+    #[test]
+    fn distributed_ban_store_builder_wires_the_shared_bans() {
+        let store = Arc::new(MemoryStore::default());
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            rate_limit: RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                enable_rate_limit_auto_ban: true,
+                ..RateLimitConfig::default()
+            },
+            ip_ban: IpBanConfig {
+                enable_ip_banning: true,
+                auto_ban_threshold: 1,
+                ..IpBanConfig::default()
+            },
+            passive_mode: false,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .distributed_store(
+            Arc::clone(&store) as Arc<dyn SlidingWindowStore>,
+            "guard_core:",
+            false,
+        )
+        .distributed_ban_store(Arc::clone(&store) as Arc<dyn BanStore>)
+        .build()
+        .expect("config");
+        let visitor = ip("192.0.2.95");
+        let _ = stage.decide_for_path(Some(visitor), Some("/x"), None, None, None);
+        let _ = stage.decide_for_path(Some(visitor), Some("/x"), None, None, None);
+        // the auto-ban fired through the shared ban store
+        assert!(stage.bans().is_banned(visitor));
+        // an un-banned IP reads through the distributed store as unbanned
+        assert!(!stage.bans().is_banned(ip("192.0.2.96")));
+    }
+
+    #[test]
+    fn the_layer_service_polls_ready_and_carries_query_agent_and_custom_bodies() {
+        let layer = RateLimitStageLayer::new(
+            RateLimitStage::builder(RateLimitStageConfig {
+                rate_limit: RateLimitConfig {
+                    rate_limit: 10,
+                    endpoint_rate_limits: std::iter::once(("/login".to_owned(), entry(1, 90)))
+                        .collect(),
+                    ..RateLimitConfig::default()
+                },
+                ip_ban: IpBanConfig::default(),
+                passive_mode: false,
+                custom_error_responses: CustomErrorResponses::from_iter([(
+                    429,
+                    "slow down".to_owned(),
+                )]),
+            })
+            .build()
+            .expect("valid stage config"),
+        );
+        let inner = Inner::new();
+        let mut service = ServiceBuilder::new().layer(layer).service(inner);
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+
+        let mut request = request_from_client("192.0.2.76");
+        *request.uri_mut() = "/login?next=/home".parse().expect("uri");
+        request.headers_mut().insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("curl/8"),
+        );
+        let first = block_on(service.call(request)).expect("ready");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let mut request = request_from_client("192.0.2.76");
+        *request.uri_mut() = "/login?next=/home".parse().expect("uri");
+        request.headers_mut().insert(
+            http::header::USER_AGENT,
+            http::HeaderValue::from_static("curl/8"),
+        );
+        let second = block_on(service.call(request)).expect("ready");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = second.into_body();
+        assert_eq!(body, "slow down");
     }
 
     #[test]
@@ -2746,6 +3060,15 @@ mod tests {
         let _ = stage.decide(Some(visitor), None, None);
         let _ = stage.decide(Some(visitor), None, None);
         assert!(seen.lock().expect("sink").is_empty());
+        // a non-muted event (the detection feed's penetration attempt)
+        // still passes the filter and reaches the sink closure
+        let finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["xss".to_owned()],
+            trigger_info: "script tag".to_owned(),
+        };
+        let _ = stage.decide(Some(ip("192.0.2.77")), None, Some(&finding));
+        assert_eq!(seen.lock().expect("sink").len(), 1);
     }
 
     #[test]
@@ -3237,5 +3560,46 @@ mod tests {
         let d = stage.limiter().check(visitor, None);
         println!("after check3 None: allowed={} count={}", d.allowed, d.count);
         println!("tracked={}", stage.limiter().tracked_windows());
+    }
+
+    #[test]
+    fn an_authority_form_request_observes_the_path_only() {
+        // CONNECT requests carry an authority, not a path+query: the
+        // observation falls back to the bare path
+        let layer = RateLimitStageLayer::new(
+            RateLimitStage::new(RateLimitStageConfig::default()).expect("default config"),
+        );
+        let inner = Inner::new();
+        let mut service = ServiceBuilder::new().layer(layer).service(inner.clone());
+        let socket: SocketAddr = "192.0.2.97:65535".parse().expect("socket");
+        let request = Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("backend.internal:443")
+            .extension(socket)
+            .body("body")
+            .expect("request");
+        let response = block_on(service.call(request)).expect("ready");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(inner.call_count(), 1);
+    }
+
+    #[test]
+    fn block_on_spins_through_a_single_pending_poll() {
+        // a future that answers Pending once: the noop-waker spin polls it
+        // again and lands on the ready value
+        struct PendingOnce(bool);
+        impl Future for PendingOnce {
+            type Output = u8;
+
+            fn poll(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u8> {
+                if self.0 {
+                    Poll::Ready(7)
+                } else {
+                    self.0 = true;
+                    Poll::Pending
+                }
+            }
+        }
+        assert_eq!(block_on(PendingOnce(false)), 7);
     }
 }

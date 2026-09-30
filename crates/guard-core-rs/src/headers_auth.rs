@@ -617,4 +617,56 @@ mod tests {
             block_on(second.call(request_to("/admin", &[("x-request-id", "abc")]))).expect("ready");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    #[test]
+    fn route_verifiers_debug_renders() {
+        let verifiers = RouteVerifiers {
+            auth: None,
+            api_key: None,
+        };
+        assert!(format!("{verifiers:?}").contains("RouteVerifiers"));
+    }
+
+    #[test]
+    fn stage_and_layer_debug_render_their_names() {
+        let stage = stage_with(admin_guard(None));
+        assert!(format!("{stage:?}").contains("HeadersAuthStage"));
+        let layer = HeadersAuthStageLayer::new(stage);
+        assert!(format!("{layer:?}").contains("HeadersAuthStageLayer"));
+    }
+
+    #[test]
+    fn block_on_drives_a_pending_once_future() {
+        struct PendingOnce {
+            polled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Future for PendingOnce {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if !self.polled.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        block_on(PendingOnce {
+            polled: std::sync::Arc::clone(&polled),
+        });
+    }
+
+    #[test]
+    fn the_layer_service_polls_ready() {
+        let layer = HeadersAuthStageLayer::new(stage_with(admin_guard(None)));
+        let mut service = ::tower::ServiceBuilder::new()
+            .layer(layer)
+            .service(Inner::new());
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
 }

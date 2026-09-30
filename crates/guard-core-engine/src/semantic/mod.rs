@@ -658,3 +658,17 @@ mod tests {
         assert_eq!(fc.position, 30);
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn empty_keyword_sets_yield_zero_probabilities() {
+        let keywords = AttackKeywords::default();
+        // every type with an empty keyword set records a 0.0 probability
+        let tokens: Vec<String> = vec![].into_iter().collect();
+        let probs = attack_probability_with_tokens("content", &tokens, &keywords);
+        assert!(probs.values().all(|v| *v == 0.0));
+    }
+}

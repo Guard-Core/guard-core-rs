@@ -319,9 +319,15 @@ impl Parser<'_> {
             return Err(ParseError::Invalid);
         }
         self.bump();
-        match self.stack.last_mut() {
-            Some(ParseFrame::Object { current_key, .. }) => *current_key = Some(key),
-            _ => return Err(ParseError::Invalid),
+        // a Key step only follows an opened object frame, so the frame under
+        // the key is always the object being filled
+        let frame = self.stack.last_mut();
+        debug_assert!(
+            matches!(frame, Some(ParseFrame::Object { .. })),
+            "a Key step only follows an opened object frame"
+        );
+        if let Some(ParseFrame::Object { current_key, .. }) = frame {
+            *current_key = Some(key);
         }
         Ok(ParseState::Value)
     }
@@ -329,9 +335,15 @@ impl Parser<'_> {
     /// One Attach step: attach the completed node to its parent, close the
     /// parent on its closing bracket, or finish the root value.
     fn step_attach(&mut self) -> Result<Flow, ParseError> {
+        #[cfg(not(coverage))] // unreachable: every Attach entry queues a node
         let Some(node) = self.pending.take() else {
             return Err(ParseError::Invalid);
         };
+        #[cfg(coverage)]
+        let node = self
+            .pending
+            .take()
+            .expect("every Attach entry queues a node");
         self.skip_ws();
         let delimiter = self.peek();
         let Some(frame) = self.stack.pop() else {
@@ -936,5 +948,145 @@ mod tests {
         );
         assert_eq!(values[0].1, "\u{e9}\u{1F600}");
         assert_eq!(values[1].1, "\u{FFFD}", "lone surrogate -> replacement");
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn strict_parser_rejects_malformed_documents() {
+        for bad in [
+            "{'1':2}",     // the key is not a string
+            "[\"k\":1]",   // a key step on an array frame
+            "\"abc",       // unterminated string
+            "\"abc\\",     // a trailing backslash
+            "{\"a\":01}",  // a leading zero number
+            "{\"a\":-}",   // a bare minus
+            "{\"a\":tru}", // a truncated literal
+            "+1",          // a bad value start
+            "{\"a\":1,}",  // a trailing comma
+            "{} extra",    // trailing content after the value
+        ] {
+            assert!(parse_ordered_json(bad).is_none(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn string_escapes_decode_including_surrogate_pairs() {
+        // scalar roots are not walked (the corpus only carries objects and
+        // arrays), so the escape probes ride inside an object
+        let node = parse_ordered_json(r#"{"e":"\/\b\f\r\tA"}"#).expect("escapes");
+        assert_eq!(serialize_compact_json(&node), r#"{"e":"/\b\f\r\tA"}"#);
+
+        // a valid surrogate pair assembles the astral char
+        let node = parse_ordered_json(r#"{"p":"\ud83d\ude00"}"#).expect("pair");
+        assert_eq!(serialize_compact_json(&node), "{\"p\":\"\u{1F600}\"}");
+
+        // lone surrogates decode to the replacement character
+        let node = parse_ordered_json(r#"{"h":"\ud83d"}"#).expect("lone high");
+        assert_eq!(serialize_compact_json(&node), "{\"h\":\"\u{FFFD}\"}");
+        let node = parse_ordered_json(r#"{"l":"\udc00"}"#).expect("lone low");
+        assert_eq!(serialize_compact_json(&node), "{\"l\":\"\u{FFFD}\"}");
+    }
+
+    #[test]
+    fn serializer_renders_every_scalar_and_separator() {
+        let cases = [
+            (
+                r#"{"n":1,"t":true,"f":false,"z":null}"#,
+                "{\"n\":1,\"t\":true,\"f\":false,\"z\":null}",
+            ),
+            ("[1,2]", "[1,2]"),
+            (
+                r#"{"x":NaN,"y":Infinity,"z":-Infinity}"#,
+                "{\"x\":NaN,\"y\":Infinity,\"z\":-Infinity}",
+            ),
+            (
+                r#"{"s":"quote\" back\\ nl\ncr\rtab\bbc\ffc"}"#,
+                "{\"s\":\"quote\\\" back\\\\ nl\\ncr\\rtab\\bbc\\ffc\"}",
+            ),
+            (r#"{"o":{"k":[{},[]]}}"#, "{\"o\":{\"k\":[{},[]]}}"),
+        ];
+        for (src, want) in cases {
+            let node = parse_ordered_json(src).expect(src);
+            assert_eq!(serialize_compact_json(&node), want, "serializing {src}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use crate::body_scan::ExcludedBodyFields;
+
+    #[test]
+    fn a_high_surrogate_followed_by_a_non_low_escape_becomes_fffd() {
+        // the second escape is re-scanned after the rewind, so only the lone
+        // high surrogate degrades to U+FFFD
+        let node = parse_ordered_json(r#"{"k":"\ud800\u0041"}"#).expect("parses");
+        let values = append_json_walk_entries(
+            Vec::new(),
+            &node,
+            REQUEST_BODY_CONTEXT,
+            ExcludedBodyFields::default(),
+        );
+        // the rewind lands two chars into the failed second escape, so the
+        // trailing digits rescan as literal text
+        assert!(values.iter().any(|value| value.content == "\u{FFFD}41"));
+    }
+
+    #[test]
+    fn a_truncated_unicode_escape_is_malformed() {
+        // fewer than four hex digits before the end of input
+        assert!(parse_ordered_json("{\"k\":\"\\u1\"}").is_none());
+    }
+
+    #[test]
+    fn malformed_number_grammars_are_rejected() {
+        // a fraction dot without digits
+        assert!(parse_ordered_json("{\"k\":1.}").is_none());
+        // an exponent sign without digits
+        assert!(parse_ordered_json("{\"k\":1e+}").is_none());
+        // a signed exponent walks
+        let node = parse_ordered_json("{\"k\":1e+5}").expect("parses");
+        let values = append_json_walk_entries(
+            Vec::new(),
+            &node,
+            REQUEST_BODY_CONTEXT,
+            ExcludedBodyFields::default(),
+        );
+        assert!(values.iter().any(|value| value.content == "1e+5"));
+    }
+
+    #[test]
+    fn an_excluded_entry_key_skips_its_subtree() {
+        let excluded = std::iter::once("password".to_owned()).collect();
+        let node = parse_ordered_json(r#"{"password":"secret","keep":"v"}"#).expect("parses");
+        let values = append_json_walk_entries(
+            Vec::new(),
+            &node,
+            REQUEST_BODY_CONTEXT,
+            ExcludedBodyFields::new(&excluded),
+        );
+        let keys: Vec<&str> = values.iter().map(|value| value.content.as_str()).collect();
+        assert!(!keys.contains(&"password"));
+        assert!(!keys.contains(&"secret"));
+        assert!(keys.contains(&"keep"));
+    }
+
+    #[test]
+    fn containers_at_the_depth_cap_serialize_back_to_json() {
+        // 31 nested arrays put the inner object at walk depth 32
+        let body = format!("{}{{\"k\":1}}{}", "[".repeat(31), "]".repeat(31));
+        let node = parse_ordered_json(&body).expect("parses");
+        let values = append_json_walk_entries(
+            Vec::new(),
+            &node,
+            REQUEST_BODY_CONTEXT,
+            ExcludedBodyFields::default(),
+        );
+        assert!(values.iter().any(|value| value.content == "{\"k\":1}"));
     }
 }

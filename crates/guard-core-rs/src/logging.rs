@@ -417,3 +417,152 @@ mod tests {
         assert!(line.starts_with("Request from unknown:"));
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn log_levels_render_the_reference_names() {
+        assert_eq!(LogLevel::Info.as_str(), "INFO");
+        assert_eq!(LogLevel::Debug.as_str(), "DEBUG");
+        assert_eq!(LogLevel::Warning.as_str(), "WARNING");
+        assert_eq!(LogLevel::Error.as_str(), "ERROR");
+        assert_eq!(LogLevel::Critical.as_str(), "CRITICAL");
+    }
+
+    #[test]
+    fn log_types_render_request_suspicious_and_the_generic_shape() {
+        assert_eq!(LogType::Request.as_str(), "request");
+        assert_eq!(LogType::Suspicious.as_str(), "suspicious");
+        assert_eq!(LogType::Other("blocked".to_owned()).as_str(), "blocked");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn log_activity_composes_every_level_type_and_mute_shape() {
+        use std::collections::HashSet;
+        let sensitive = SensitiveNames::default();
+        let headers = [("authorization", "Bearer secret")];
+
+        // every level renders its name
+        for level in [
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Warning,
+            LogLevel::Error,
+            LogLevel::Critical,
+        ] {
+            let line = log_activity(
+                LogType::Request,
+                Some(level),
+                "ok",
+                Some("1.2.3.4"),
+                Some("GET"),
+                Some("/x?token=a"),
+                Some(&headers),
+                false,
+                "",
+                None,
+                None,
+                &sensitive,
+            )
+            .expect("logged");
+            assert!(line.contains("Request from 1.2.3.4"), "unexpected: {line}");
+            assert!(line.contains("token=[REDACTED]"));
+        }
+
+        // a muted check returns None before composing
+        let mut muted = HashSet::new();
+        muted.insert("rate_limit".to_owned());
+        assert!(
+            log_activity(
+                LogType::Suspicious,
+                Some(LogLevel::Warning),
+                "why",
+                None,
+                None,
+                None,
+                None,
+                true,
+                "trigger",
+                Some("rate_limit"),
+                Some(&muted),
+                &sensitive,
+            )
+            .is_none()
+        );
+
+        // a None level means no log
+        assert!(
+            log_activity(
+                LogType::Request,
+                None,
+                "",
+                None,
+                None,
+                None,
+                None,
+                false,
+                "",
+                None,
+                None,
+                &sensitive,
+            )
+            .is_none()
+        );
+
+        // the suspicious shape (passive and active)
+        let passive = log_activity(
+            LogType::Suspicious,
+            Some(LogLevel::Warning),
+            "why",
+            Some("1.2.3.4"),
+            Some("GET"),
+            Some("/x"),
+            None,
+            true,
+            "trigger",
+            None,
+            None,
+            &sensitive,
+        )
+        .expect("logged");
+        assert!(passive.contains("[PASSIVE MODE] Penetration attempt detected"));
+
+        let active = log_activity(
+            LogType::Suspicious,
+            Some(LogLevel::Warning),
+            "why",
+            Some("1.2.3.4"),
+            Some("GET"),
+            Some("/x"),
+            None,
+            false,
+            "trigger",
+            None,
+            None,
+            &sensitive,
+        )
+        .expect("logged");
+        assert!(active.contains("Suspicious activity detected from 1.2.3.4"));
+
+        // the generic Other shape capitalizes the type
+        let other = log_activity(
+            LogType::Other("banned".to_owned()),
+            Some(LogLevel::Error),
+            "why",
+            Some("1.2.3.4"),
+            Some("GET"),
+            Some("/x"),
+            None,
+            false,
+            "trigger",
+            None,
+            None,
+            &sensitive,
+        )
+        .expect("logged");
+        assert!(other.contains("Banned from 1.2.3.4"), "unexpected: {other}");
+    }
+}

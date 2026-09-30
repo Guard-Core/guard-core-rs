@@ -170,3 +170,75 @@ mod tests {
         assert!(map_knobs(&mistyped).is_err());
     }
 }
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn non_integer_or_negative_or_nonfinite_knobs_are_rejected() {
+        let config = |v: serde_json::Value| json!({ "detection_max_content_length": v });
+        assert!(
+            map_knobs(&config(json!("text"))).is_err(),
+            "a string knob is rejected"
+        );
+        assert!(
+            map_knobs(&config(json!(-3.5))).is_err(),
+            "a negative fraction is rejected"
+        );
+        assert!(
+            map_knobs(&config(json!(2.5))).is_err(),
+            "a fraction is rejected"
+        );
+    }
+
+    #[test]
+    fn a_non_bool_attack_pattern_knob_is_rejected() {
+        let config = |v: serde_json::Value| json!({ "detection_preserve_attack_patterns": v });
+        assert!(
+            map_knobs(&config(json!("yes"))).is_err(),
+            "a string bool is rejected"
+        );
+        assert!(
+            map_knobs(&config(json!(1))).is_err(),
+            "a numeric bool is rejected"
+        );
+    }
+}
+
+#[cfg(test)]
+mod number_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn non_numeric_knob_values_are_rejected() {
+        let mut config = json!({
+            "detection_max_content_length": 10000,
+            "detection_max_body_inspect_bytes": 262_144,
+            "detection_semantic_threshold": 0.7,
+            "detection_threat_score_threshold": 1.0,
+            "detection_preserve_attack_patterns": true,
+        });
+        config["detection_semantic_threshold"] = json!("high");
+        assert_eq!(
+            map_knobs(&config).err().unwrap(),
+            "config_knobs 'detection_semantic_threshold' is not a number"
+        );
+    }
+
+    #[test]
+    fn missing_preserve_attack_patterns_knob_is_rejected() {
+        let config = json!({
+            "detection_max_content_length": 10000,
+            "detection_max_body_inspect_bytes": 262_144,
+            "detection_semantic_threshold": 0.7,
+            "detection_threat_score_threshold": 1.0,
+        });
+        assert_eq!(
+            map_knobs(&config).err().unwrap(),
+            "config_knobs missing 'detection_preserve_attack_patterns'"
+        );
+    }
+}

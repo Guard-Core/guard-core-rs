@@ -140,7 +140,11 @@ fn drop_view_duplicate_threats(
     kept
 }
 
-fn semantic_threats(processed: &str, raw_content: &str, config: &DetectConfig) -> Vec<Threat> {
+fn semantic_threats(
+    processed: &str,
+    raw_content: &str,
+    config: &DetectConfig,
+) -> Vec<SemanticThreat> {
     if binary::looks_like_binary_content(raw_content) {
         return Vec::new();
     }
@@ -163,21 +167,21 @@ fn semantic_threats(processed: &str, raw_content: &str, config: &DetectConfig) -
         probs.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (attack_type, probability) in probs {
             if probability >= config.semantic_threshold {
-                threats.push(Threat::Semantic(SemanticThreat {
+                threats.push(SemanticThreat {
                     attack_type: attack_type.to_owned(),
                     score: probability,
                     fallback: false,
                     analysis: analysis.clone(),
-                }));
+                });
             }
         }
         if threats.is_empty() && score >= config.semantic_threshold {
-            threats.push(Threat::Semantic(SemanticThreat {
+            threats.push(SemanticThreat {
                 attack_type: "suspicious".to_owned(),
                 score,
                 fallback: true,
                 analysis,
-            }));
+            });
         }
     }
     threats
@@ -274,18 +278,12 @@ pub fn detect(content: &str, request_context: &str, config: &DetectConfig) -> De
     let threat_score = if regex_threats.is_empty() && semantic.is_empty() {
         0.0
     } else {
-        let semantic_max = semantic
-            .iter()
-            .map(|t| match t {
-                Threat::Semantic(s) => s.score,
-                Threat::Regex(_) => 0.0,
-            })
-            .fold(0.0_f64, f64::max);
+        let semantic_max = semantic.iter().map(|s| s.score).fold(0.0_f64, f64::max);
         (anomaly.max(semantic_max)).min(1.0)
     };
 
     let mut threats: Vec<Threat> = regex_threats.into_iter().map(Threat::Regex).collect();
-    threats.extend(semantic);
+    threats.extend(semantic.into_iter().map(Threat::Semantic));
 
     DetectVerdict {
         is_threat,
@@ -338,7 +336,13 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t, Threat::Regex(r) if r.category == "sqli"))
         );
-        let miss = detect("a/**/b", "url_path", &corpus_config());
+        // a url_path verdict carrying other threats has no sqli comment hit
+        let miss = detect("/files?name=../../etc/passwd", "url_path", &corpus_config());
+        assert!(
+            miss.threats
+                .iter()
+                .any(|t| matches!(t, Threat::Regex(r) if r.category == "dir_traversal"))
+        );
         assert!(!miss.threats.iter().any(
             |t| matches!(t, Threat::Regex(r) if r.category == "sqli" && r.pattern.contains("/\\*"))
         ));
@@ -370,7 +374,34 @@ mod tests {
         // two 0.5-weight sqli hits cross the 1.0 threshold together
         let v = detect("SELECT * FROM users", "request_body", &corpus_config());
         assert!(v.is_threat);
+        // a semantic threat rides along on its own (no regex hits of its
+        // own weight change): it contributes nothing to the anomaly sum
+        let semantic_side = detect(&mixed_content(), "request_body", &corpus_config());
+        let semantic_threat = semantic_side
+            .threats
+            .iter()
+            .find(|t| matches!(t, Threat::Semantic(_)))
+            .expect("the mixed payload carries a semantic threat");
         let anomaly: f64 = v
+            .threats
+            .iter()
+            .chain(std::iter::once(semantic_threat))
+            .filter_map(|t| match t {
+                Threat::Regex(r) => Some(r.weight),
+                Threat::Semantic(_) => None,
+            })
+            .sum();
+        assert!((anomaly - 1.0).abs() < 1e-9, "anomaly {anomaly}");
+
+        // a mixed verdict: semantic threats carry no anomaly weight
+        let mixed = detect(&mixed_content(), "request_body", &corpus_config());
+        assert!(
+            mixed
+                .threats
+                .iter()
+                .any(|t| matches!(t, Threat::Semantic(_)))
+        );
+        let mixed_anomaly: f64 = mixed
             .threats
             .iter()
             .filter_map(|t| match t {
@@ -378,6 +409,137 @@ mod tests {
                 Threat::Semantic(_) => None,
             })
             .sum();
-        assert!((anomaly - 1.0).abs() < 1e-9, "anomaly {anomaly}");
+        assert!(mixed_anomaly > 0.0, "regex hits still carry weight");
+        assert!(mixed.is_threat);
+    }
+
+    fn mixed_content() -> String {
+        format!(
+            "select union insert update delete drop from where order group having concat \
+             substring database table column (1 OR 1=1) {}",
+            "A".repeat(120)
+        )
+    }
+
+    #[test]
+    fn an_embedded_json_leaf_context_keeps_its_suffix() {
+        // a context carrying the embedded-json suffix keeps it through
+        // normalization for the validator seam
+        let v = detect(
+            "SELECT * FROM users",
+            "request_body:embedded_json",
+            &corpus_config(),
+        );
+        assert!(v.is_threat);
+    }
+
+    #[test]
+    fn a_short_base64_view_scans_as_an_additive_pass() {
+        // `JHt9` decodes to `${}`: the short-token additive view fills and
+        // its fragments run through their own scan pass, surfacing the
+        // command-injection shape the raw text hides
+        let v = detect("JHt9", "request_body", &corpus_config());
+        assert!(v.is_threat, "unexpected verdict: {v:?}");
+        assert!(
+            v.threats
+                .iter()
+                .any(|t| matches!(t, Threat::Regex(r) if r.category == "cmd_injection")),
+            "verdict: {v:?}"
+        );
+    }
+
+    #[test]
+    fn binary_raw_content_never_yields_semantic_threats() {
+        // a NUL-heavy raw payload trips the binary gate before any scan
+        let processed = "\0".repeat(16);
+        assert!(
+            semantic_threats(&processed, &processed, &corpus_config()).is_empty(),
+            "binary content is exempt from the semantic pass"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_decode_budget_appends_its_marker_threat() {
+        // `%25` followed by fifteen `25` pairs peels exactly one encoding
+        // layer per pass, so the 16-iteration decode budget runs out and
+        // the synthetic exhaustion threat rides on the verdict
+        let content = format!("%25{}", "25".repeat(15));
+        let v = detect(&content, "url_path", &corpus_config());
+        assert!(
+            v.threats.iter().any(|t| matches!(
+                t,
+                Threat::Regex(r) if r.pattern == "decode_budget_exhausted"
+            )),
+            "verdict: {v:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    fn corpus_config() -> DetectConfig {
+        DetectConfig {
+            max_content_length: 10_000,
+            max_full_scan_bytes: 262_144,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            binary_min_run_length: 16,
+        }
+    }
+
+    #[test]
+    fn a_semantic_fallback_threat_reports_suspicious() {
+        // high aggregate score without any single attack class above the
+        // threshold: the fallback "suspicious" semantic threat fires
+        let mut content = String::from("from where drop select ");
+        content.push_str(&"A".repeat(120));
+        content.push_str(" ({}$x==) foo(");
+        let v = detect(&content, "request_body", &corpus_config());
+        assert!(v.is_threat, "verdict: {v:?}");
+        assert!(
+            v.threats.iter().any(
+                |t| matches!(t, Threat::Semantic(s) if s.attack_type == "suspicious" && s.fallback)
+            ),
+            "verdict: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_mixed_verdict_scores_the_semantic_maximum_against_the_anomaly() {
+        // regex sqli hits plus a semantic sql threat: the threat score folds
+        // over both lists
+        let content = format!(
+            "select union insert update delete drop from where order group having concat \
+             substring database table column (1 OR 1=1) {}",
+            "A".repeat(120)
+        );
+        let v = detect(&content, "request_body", &corpus_config());
+        assert!(v.is_threat);
+        assert!(
+            v.threats
+                .iter()
+                .any(|t| matches!(t, Threat::Regex(r) if r.category == "sqli"))
+        );
+        assert!(v.threats.iter().any(|t| matches!(t, Threat::Semantic(_))));
+        let semantic_max = v
+            .threats
+            .iter()
+            .filter_map(|t| match t {
+                Threat::Semantic(s) => Some(s.score),
+                Threat::Regex(_) => None,
+            })
+            .fold(0.0_f64, f64::max);
+        let anomaly = v
+            .threats
+            .iter()
+            .filter_map(|t| match t {
+                Threat::Regex(r) => Some(r.weight),
+                Threat::Semantic(_) => None,
+            })
+            .sum::<f64>();
+        assert!((v.threat_score - anomaly.max(semantic_max).min(1.0)).abs() < 1e-9);
     }
 }

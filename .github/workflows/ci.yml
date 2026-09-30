@@ -89,6 +89,32 @@ jobs:
       - name: Pipeline conformance gate
         run: cargo test -p guard-core-conformance --test pipeline_conformance -- --nocapture
 
+  coverage:
+    name: coverage (100% lines)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
+          cache-shared-key: ci-coverage
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2.87.18
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Enforce 100% line coverage
+        run: cargo llvm-cov --workspace --exclude guard-core-python --fail-under-lines 100
+
   msrv:
     name: MSRV (1.92)
     runs-on: ubuntu-latest

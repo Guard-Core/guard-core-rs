@@ -268,11 +268,26 @@ mod tests {
         let bus = SecurityEventBus::new(false);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let bus = bus.on_event(Arc::new(move |_: &SecurityEvent| {
+        let handler: EventHandler = Arc::new(move |_: &SecurityEvent| {
             sink.lock().expect("sink").push("fired".to_owned());
-        }));
+        });
+        // the handler itself records when its transport is invoked
+        handler(&SecurityEvent::new(
+            EVENT_RATE_LIMITED,
+            "192.0.2.1",
+            "request_blocked",
+            "r",
+            MIDDLEWARE_HANDLER_NAME,
+        ));
+        assert_eq!(*seen.lock().expect("sink"), vec!["fired".to_owned()]);
+        // the disabled bus never drives it
+        let bus = bus.on_event(handler);
         bus.send_middleware_event(EVENT_RATE_LIMITED, "192.0.2.1", "request_blocked", "r");
-        assert!(seen.lock().expect("sink").is_empty());
+        assert_eq!(
+            seen.lock().expect("sink").len(),
+            1,
+            "the disabled bus must not fire the handler again"
+        );
     }
 
     #[test]
@@ -309,5 +324,98 @@ mod tests {
         assert_eq!(EVENT_TYPE_VALUES.len(), 39);
         assert!(EVENT_TYPE_VALUES.contains(&EVENT_PENETRATION_ATTEMPT));
         assert!(EVENT_TYPE_VALUES.contains(&EVENT_PATTERN_ANOMALY_STATISTICAL_ANOMALY));
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn a_registered_sink_receives_the_sent_event() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let bus = SecurityEventBus::new(true).on_event(Arc::new(move |_: &SecurityEvent| {
+            sink.lock().expect("sink").push("fired".to_owned());
+        }));
+        let event = SecurityEvent::new(
+            "rate_limited",
+            "192.0.2.9",
+            "request_blocked",
+            "rate limited",
+            "rate_limit",
+        );
+        bus.send_event(&event);
+        assert_eq!(seen.lock().expect("sink").len(), 1);
+    }
+
+    #[test]
+    fn chaining_two_registrations_keeps_both_handlers() {
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        // registering on a bus already holding a handler takes the shared
+        // clone path: both handlers fire, in registration order
+        let first = std::sync::Arc::clone(&seen);
+        let bus = SecurityEventBus::new(true).on_event(Arc::new(move |_: &SecurityEvent| {
+            first.lock().expect("sink").push("first".to_owned());
+        }));
+        let second = std::sync::Arc::clone(&seen);
+        let bus = bus.on_event(Arc::new(move |_: &SecurityEvent| {
+            second.lock().expect("sink").push("second".to_owned());
+        }));
+        let event = SecurityEvent::new(
+            "rate_limited",
+            "192.0.2.9",
+            "request_blocked",
+            "rate limited",
+            "rate_limit",
+        );
+        bus.send_event(&event);
+        let log = seen.lock().expect("sink").clone();
+        assert_eq!(log, vec!["first".to_owned(), "second".to_owned()]);
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use crate::event_types::EVENT_PENETRATION_ATTEMPT;
+    use std::sync::Mutex;
+
+    #[test]
+    fn registering_on_a_shared_bus_forks_the_shared_handler_list() {
+        // a clone taken before the registration keeps the inner Arc shared,
+        // so the fork-on-write registration clones the shared handler list
+        let bus = SecurityEventBus::new(true);
+        let shared = bus.clone();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let bus = bus.on_event(Arc::new(move |event: &SecurityEvent| {
+            sink.lock().expect("sink").push(event.event_type.clone());
+        }));
+        bus.send_middleware_event(
+            EVENT_PENETRATION_ATTEMPT,
+            "192.0.2.1",
+            "request_blocked",
+            "Penetration attempt detected",
+        );
+        assert_eq!(
+            *seen.lock().expect("sink"),
+            vec![EVENT_PENETRATION_ATTEMPT.to_owned()]
+        );
+        // the pre-registration clone forked before the handler landed: it
+        // holds no handlers and still dispatches nothing
+        shared.send_middleware_event(
+            EVENT_PENETRATION_ATTEMPT,
+            "192.0.2.1",
+            "request_blocked",
+            "Penetration attempt detected",
+        );
+        assert_eq!(
+            seen.lock().expect("sink").len(),
+            1,
+            "the forked handle never grew the registered handler"
+        );
     }
 }

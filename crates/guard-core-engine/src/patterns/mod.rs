@@ -821,3 +821,99 @@ mod tests {
         assert!(threat(21, "UNI/*!*/ON").is_none());
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn decode_budget_exhausted_threat_carries_the_marker() {
+        let threat = decode_budget_exhausted_threat();
+        assert_eq!(threat.pattern, "decode_budget_exhausted");
+        assert_eq!(threat.match_text, "decode_budget_exhausted");
+        assert_eq!(threat.position, 0);
+        assert_eq!(threat.category, "custom");
+    }
+
+    #[test]
+    fn structural_candidates_route_through_the_validators() {
+        // id 58: brace expansion
+        let entry = |id: usize| COMPILED_TABLE.iter().find(|e| e.entry.id == id).unwrap();
+        assert!(candidate_accepts(
+            entry(58),
+            "cmd {a,b}",
+            Candidate::new(4, 9),
+            "arg"
+        ));
+        assert!(!candidate_accepts(
+            entry(58),
+            "plain",
+            Candidate::new(0, 5),
+            "arg"
+        ));
+        // id 59: quote splice (three 1-char fragments)
+        let content = "a'b'c";
+        assert!(candidate_accepts(
+            entry(59),
+            content,
+            Candidate::new(0, 5),
+            "arg"
+        ));
+        // id 105: source extension path probe
+        assert!(candidate_accepts(
+            entry(105),
+            "",
+            Candidate::new(0, 0),
+            "url_path:.php"
+        ));
+    }
+
+    #[test]
+    fn ldap_candidate_routes_fall_back_to_accepting_when_uncompiled() {
+        // a compiled entry whose regex source is stripped: the fallback
+        // accepts rather than silently filtering
+        let entry = COMPILED_TABLE.iter().find(|e| e.entry.id == 66).unwrap();
+        let stripped_entry = CompiledEntry {
+            entry: crate::patterns::table::TableEntry {
+                id: entry.entry.id,
+                source: entry.entry.source,
+                contexts: entry.entry.contexts,
+                category: entry.entry.category,
+            },
+            re: None,
+        };
+        assert!(candidate_accepts(
+            &stripped_entry,
+            "x",
+            Candidate::new(0, 1),
+            "arg"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn the_conjunction_validator_falls_back_to_accepting_when_uncompiled() {
+        // id 68 (paren conjunction) with its regex stripped: the fallback
+        // accepts rather than silently filtering
+        let entry = COMPILED_TABLE.iter().find(|e| e.entry.id == 68).unwrap();
+        let stripped_entry = CompiledEntry {
+            entry: crate::patterns::table::TableEntry {
+                id: entry.entry.id,
+                source: entry.entry.source,
+                contexts: entry.entry.contexts,
+                category: entry.entry.category,
+            },
+            re: None,
+        };
+        assert!(candidate_accepts(
+            &stripped_entry,
+            "x",
+            Candidate::new(0, 1),
+            "arg"
+        ));
+    }
+}
