@@ -2,7 +2,13 @@
 # Every distinct regex pattern firing in the vendored corpus (guard-core-spec-4.1.0/cases/) appears in exactly one state.
 # as_is: compiles unchanged with the regex crate.
 # translated: recorded corpus-verified translation; verified_on lists corpus cases whose recorded (match, position) evidence the translation reproduces.
-# residual: constructs the RE2-family regex crate rejects; no translation attempted. Input for the OPEN decision ledger-only vs ledger+fancy-regex; decide nothing here.
+# residual: constructs the RE2-family regex crate rejects. Decision (resolved):
+# every residual is SERVED by a structural matcher in the engine
+# (patterns/matchers.rs) and CROSS-VERIFIED against a fancy-regex oracle on the
+# corpus evidence (conformance/tests/residual_fancy_regex.rs). Entries carry
+# served_by plus either fancy_regex = 'verified' (oracle agreement on every
+# recorded match) or fancy_regex = a detection limit (where the naive oracle
+# disagrees with the engine's binary-island candidate selection, documented).
 spec_version = '4.1.0'
 
 [[as_is]]
@@ -220,144 +226,165 @@ category = 'dir_traversal'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['cmd_injection', 'context_matrix', 'encoding', 'misc_injection', 'path_traversal', 'sqli']
 evidence_cases = ['cmd_injection::cmdi_semicolon_cat', 'cmd_injection::cmdi_ifs_obfuscation', 'context_matrix::ctx_trav_url_path', 'context_matrix::ctx_trav_request_body', 'context_matrix::ctx_trav_header', 'context_matrix::ctx_trav_query_param', 'context_matrix::ctx_trav_unknown', 'encoding::enc_base64_cmd_payload', 'misc_injection::deser_php_object', 'misc_injection::xml_xxe_file', 'path_traversal::trav_double_dot_slash', 'path_traversal::trav_url_encoded', 'path_traversal::trav_double_encoded', 'path_traversal::trav_dots_repetition', 'path_traversal::trav_absolute_etc', 'path_traversal::trav_etc_shadow', 'path_traversal::trav_deep_padding', 'sqli::sqli_load_file']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = "verified on the plain-text views; on binary-noise payloads the naive oracle picks different candidates than the engine island scan (detection limit: the oracle over the flat processed and raw views cannot reproduce the binary-island candidate selection, documented here)"
 [[residual]]
 pattern = '(?:^|\s|/)(?:(?<=://)[^\s/@]*@)?(?:localhost\.?|127\.0\.0\.1|0\.0\.0\.0|\[::(?:\d*)\]|\[::ffff:127\.0\.0\.1\]|169\.254(?:\.\d{1,3}){2}|192\.168(?:\.\d{1,3}){2}|10(?:\.\d{1,3}){3}|172\.(?:1[6-9]|2[0-9]|3[01])(?:\.\d{1,3}){2}|metadata\.google\.internal|metadata\.goog|100\.100\.100\.200)(?::\d+)?(?:\s|$|/)'
 category = 'ssrf'
 constructs = ['positive lookbehind (?<=...)']
 affected_suites = ['cmd_injection', 'inclusion_sensitive_recon', 'misc_injection']
 evidence_cases = ['cmd_injection::cmdi_pipe_nc', 'cmd_injection::cmdi_curl_sh', 'cmd_injection::cmdi_newline_wget', 'inclusion_sensitive_recon::incl_remote_http', 'misc_injection::log4shell_jndi_ldap', 'misc_injection::log4shell_jndi_obfuscated', 'misc_injection::xml_xxe_remote']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '://(?:[^/@\s]*@)?((?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)(?:\.(?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)){0,3})(?=[:/\s]|$)'
 category = 'ssrf'
 constructs = ['positive lookahead (?=...)']
 affected_suites = ['cmd_injection', 'inclusion_sensitive_recon', 'misc_injection']
 evidence_cases = ['cmd_injection::cmdi_curl_sh', 'cmd_injection::cmdi_newline_wget', 'inclusion_sensitive_recon::incl_remote_http', 'misc_injection::log4shell_jndi_ldap', 'misc_injection::log4shell_jndi_obfuscated', 'misc_injection::xml_xxe_remote']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '''(?:\A|[;|&])\s*/?(?:[\w.-]+/)*(?:env\s+/?(?:[\w.-]+/)*)?(?:bash|sh|ksh|csh|tsch|zsh|ash)\s+-[a-zA-Z]+(?:\s+(?:'[^']*'|\"[^\"]*\"|[^\s;|&]+))?(?=\s*(?:[;|&]|\Z))'''
 category = 'cmd_injection'
 constructs = ['positive lookahead (?=...)']
 affected_suites = ['cmd_injection']
 evidence_cases = ['cmd_injection::cmdi_bash_dash_c']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '(?i)\bSELECT\b(?:(?!\bSELECT\b)[\w\s,\*().])*?\bFROM\b'
 category = 'sqli'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['context_matrix', 'semantic', 'sqli']
 evidence_cases = ['context_matrix::ctx_sqli_narrow_header', 'context_matrix::ctx_sqli_narrow_body', 'semantic::sem_structural_dense', 'sqli::sqli_union_password', 'sqli::sqli_information_schema', 'sqli::sqli_double_query']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '\A[/\\]?(?:(?!\.env(?:\.\w+)?(?:[/\\]|\Z))[\w.\-~%]+[/\\])*\.env(?:\.\w+)?(?:[/\\][\w.\-~%]*)*(?:\?\S*)?\s*\Z'
 category = 'sensitive_file'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['inclusion_sensitive_recon']
 evidence_cases = ['inclusion_sensitive_recon::sensitive_env_file']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '\A[/\\]?(?:(?!\.(?:git|svn|hg|bzr)(?:[/\\]|\Z))[\w.\-~%]+[/\\])*\.(?:git|svn|hg|bzr)(?:[/\\][\w.\-~%]*)*(?:\?\S*)?\s*\Z'
 category = 'sensitive_file'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['inclusion_sensitive_recon']
 evidence_cases = ['inclusion_sensitive_recon::sensitive_git_config']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '\A[/\\](?:(?!(?:management|config_dump|credentials|system[/\\]version|version[/\\]system)(?:[/\\]|\Z))[\w.\-~%]+[/\\])*(?:management|config_dump|credentials|system[/\\]version|version[/\\]system)(?:[/\\][\w.\-~%]*)*(?:\?\S*)?\s*\Z'
 category = 'recon'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['inclusion_sensitive_recon']
 evidence_cases = ['inclusion_sensitive_recon::sensitive_aws_credentials']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '\A[/\\]?(?:(?!(?:\.htaccess|\.htpasswd|\.DS_Store|Thumbs\.db|\.npmrc|\.dockerenv|web\.config)(?:[/\\]|\Z))[\w.\-~%]+[/\\])*(?:\.htaccess|\.htpasswd|\.DS_Store|Thumbs\.db|\.npmrc|\.dockerenv|web\.config)(?:[/\\][\w.\-~%]*)*(?:\?\S*)?\s*\Z'
 category = 'cms_probing'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['inclusion_sensitive_recon']
 evidence_cases = ['inclusion_sensitive_recon::sensitive_htpasswd']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '\A[/\\]?(?:(?![\w.\-~%]*\.(?:bak|backup|old|orig|save|swp|swo|tmp|temp)(?:[/\\]|\Z))[\w.\-~%]+[/\\])*[\w.\-~%]*\.(?:bak|backup|old|orig|save|swp|swo|tmp|temp)(?:[/\\][\w.\-~%]*)*(?:\?\S*)?\s*\Z'
 category = 'cms_probing'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['inclusion_sensitive_recon']
 evidence_cases = ['inclusion_sensitive_recon::sensitive_config_bak']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '\A[/\\]?(?:(?!(?:wp-(?:admin|login|content|includes|config)|administrator|xmlrpc)\.?(?:php)?(?:[/\\]|\Z))[\w.\-~%]+[/\\])*(?:wp-(?:admin|login|content|includes|config)|administrator|xmlrpc)\.?(?:php)?(?:[/\\][\w.\-~%]*)*(?:\?\S*)?\s*\Z'
 category = 'cms_probing'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['inclusion_sensitive_recon']
 evidence_cases = ['inclusion_sensitive_recon::recon_wp_login', 'inclusion_sensitive_recon::recon_wp_admin']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '\A[/\\]?(?:(?!(?:actuator|server-status|telescope)(?:[/\\]|\Z))[\w.\-~%]+[/\\])*(?:actuator|server-status|telescope)(?:[/\\][\w.\-~%]*)*(?:\?\S*)?\s*\Z'
 category = 'recon'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['inclusion_sensitive_recon']
 evidence_cases = ['inclusion_sensitive_recon::recon_server_status', 'inclusion_sensitive_recon::recon_actuator']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '(?<![A-Za-z0-9+/])(?-i:rO0AB)'
 category = 'deserialization'
 constructs = ['negative lookbehind (?<!...)']
 affected_suites = ['misc_injection']
 evidence_cases = ['misc_injection::deser_java_base64']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '''\{\{(?![^\}]*\d{4}-\d{1,2}-\d{1,2}(?!\d))(?=[^\}]*(?:@[\w.]+@|\b\w+\(\s*\)|['\"]?\d+['\"]?\s*[*/%+\-]\s*['\"]?\d+['\"]?))[^\}]*\}\}'''
 category = 'template'
 constructs = ['positive lookahead (?=...)', 'negative lookahead (?!...)']
 affected_suites = ['misc_injection']
 evidence_cases = ['misc_injection::template_jinja_expr']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '''(?:\A|[;,:\n])\s*filename\s*=\s*[\"'][^\"']*\.(?:php\d*|phtml|shtml|asax|ascx|ashx|asmx|aspx|bash|jspx|phar|phps|asa|asp|bat|cer|cfc|cfm|cgi|cmd|exe|hta|jsp|msi|pht|vbe|vbs|war|wsf|js|pl|py|rb|sh|ws)(?![A-Za-z0-9])(?:[^ \"'][^\"']*)?\.(?:docx|jpeg|pptx|tiff|webm|webp|xlsx|avi|bmp|doc|gif|ico|jpg|mkv|mov|mp3|mp4|odt|pdf|png|ppt|svg|tif|wav|xls)[\"']'''
 category = 'file_upload'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['misc_injection']
 evidence_cases = ['misc_injection::file_upload_double_ext']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '''\A(?:(?!\n).)*(?:boot\.ini|win\.ini|system\.ini|config\.sys)(?:[&#;,\"'<>]|\s*\Z)'''
 category = 'dir_traversal'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['path_traversal']
 evidence_cases = ['path_traversal::trav_double_backslash', 'path_traversal::trav_windows_ini']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '''\A(?:(?!\n).)*proc/self/environ(?:[&#;,\"'<>]|\s*\Z)'''
 category = 'dir_traversal'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['path_traversal']
 evidence_cases = ['path_traversal::trav_proc_self_env']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '''(?:<[A-Za-z/](?:[^<>]*[^<>\s/])?(?<!=)(?<!=\")(?<!=')[\s/]+(?:onwebkitplaybacktargetavailabilitychanged|oncontentvisibilityautostatechange|onwebkitpresentationmodechanged|onwebkitmouseforcewillbegin|onwebkitanimationiteration|onsecuritypolicyviolation|onwebkitmouseforcechanged|onvalidationstatuschange|onwebkitfullscreenchange|onwebkitwillrevealbottom|onwebkitanimationstart|onwebkitmouseforcedown|onbeforescriptexecute|onmozfullscreenchange|onwebkittransitionend|onafterscriptexecute|onanimationiteration|onlostpointercapture|onscrollsnapchanging|onunhandledrejection|onwebkitanimationend|onwebkitmouseforceup|ondeviceorientation|ongotpointercapture|onbeforedeactivate|onfullscreenchange|onpointerrawupdate|onreadystatechange|onrejectionhandled|onscrollsnapchange|ontransitioncancel|onanimationcancel|onbeforeeditfocus|oncontextrestored|ondatasetcomplete|onselectionchange|ontransitionstart|onanimationstart|onbeforeactivate|oncanplaythrough|ondatasetchanged|ondurationchange|onlanguagechange|onlayoutcomplete|onloadedmetadata|onpropertychange|oncontrolselect|ondataavailable|ongesturechange|onmediacomplete|onpointercancel|onpromptdismiss|ontransitionend|ontransitionrun|onwebkitneedkey|onanimationend|onbeforetoggle|onbeforeunload|onbeforeupdate|ondevicemotion|onfilterchange|ongesturestart|onmessageerror|onpointerenter|onpointerleave|onpromptaction|onsyncrestored|onvolumechange|onafterupdate|onbeforeinput|onbeforematch|onbeforepaste|onbeforeprint|oncontextlost|oncontextmenu|onerrorupdate|onlosecapture|onpointerdown|onpointermove|onpointerover|onresizestart|onrowinserted|onselectstart|ontouchcancel|ontrackchange|onafterprint|onbeforecopy|oncellchange|ondeactivate|ongestureend|onhashchange|onloadeddata|onmediaerror|onmouseenter|onmouseleave|onmousewheel|onpagereveal|onpointerout|onratechange|onslotchange|ontimeupdate|ontouchstart|onbeforecut|oncuechange|ondragenter|ondragleave|ondragstart|onloadstart|onmousedown|onmousemove|onmouseover|onmovestart|onoutofsync|onpointerup|onresizeend|onrowdelete|onrowsenter|onscrollend|ontimeerror|ontouchmove|onactivate|onauxclick|ondblclick|ondragdrop|ondragexit|ondragover|onfocusout|onformdata|onkeypress|onlocation|onmouseout|onpagehide|onpageshow|onpageswap|onpopstate|onprogress|ontouchend|oncanplay|oncommand|ondragend|onemptied|onfocusin|oninvalid|onkeydown|onmessage|onmouseup|onmoveend|onoffline|onplaying|onreverse|onrowexit|onseeking|onstalled|onstorage|onsuspend|onurlflip|onwaiting|onbounce|oncancel|onchange|onfinish|ononline|onrepeat|onresize|onresume|onscroll|onsearch|onseeked|onselect|onsubmit|ontoggle|onunload|onabort|onbegin|onclick|onclose|onended|onerror|onfocus|oninput|onkeyup|onpaste|onpause|onreset|onstart|onwheel|onblur|oncopy|ondrag|ondrop|onhelp|onload|onmove|onplay|onredo|onseek|onstop|onundo|oncut|onend)\s*=\s{0,20}(?:[\"'][^\"']*[\"']|[^\s>]+))'''
 category = 'xss'
 constructs = ['negative lookbehind (?<!...)']
 affected_suites = ['semantic', 'xss']
 evidence_cases = ['semantic::sem_regex_plus_semantic_below_threshold', 'xss::xss_img_onerror', 'xss::xss_svg_onload', 'xss::xss_body_onload', 'xss::xss_details_ontoggle', 'xss::xss_event_handler_nested_quote', 'xss::xss_video_source', 'xss::xss_marquee_onstart', 'xss::xss_input_autofocus', 'xss::xss_select_onchange']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '''(?i)\b(?:OR|AND)\s*(\d+|'[^']*'|\"[^\"]*\"|[@:$][A-Za-z_]\w*)\s*=\s*\1\b'''
 category = 'sqli'
 constructs = ['backreference (\1)']
 affected_suites = ['sqli']
 evidence_cases = ['sqli::sqli_or_tautology', 'sqli::sqli_sqlite_version']
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '\w/\*(?!!)[^*]*\*/\w'
 category = 'sqli'
 constructs = ['negative lookahead (?!...)']
 affected_suites = ['sqli']
 evidence_cases = ['sqli::sqli_inline_comment_obfuscation']
-
-
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = 'verified'
 [[residual]]
 pattern = '(?<!`)`(?:[A-Za-z0-9_./~]|\$[({])(?:[^`\\\n]|\\.)*`'
 category = 'cmd_injection'
 constructs = ['negative lookbehind (?<!...)']
 affected_suites = ['binary_bodies']
 evidence_cases = ['binary_bodies::binary_text_backtick_embedded_sample0', 'binary_bodies::binary_text_backtick_embedded_sample1', 'binary_bodies::binary_text_backtick_embedded_sample2']
+served_by = 'structural matcher (patterns/matchers.rs)'
+fancy_regex = "verified on the plain-text views; on binary-noise payloads the naive oracle picks different candidates than the engine island scan (detection limit: the oracle over the flat processed and raw views cannot reproduce the binary-island candidate selection, documented here)"

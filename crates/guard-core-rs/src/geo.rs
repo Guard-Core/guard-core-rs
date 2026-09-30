@@ -379,6 +379,7 @@ fn render<ResBody: From<&'static str>>(answer: &StageResponse) -> Response<ResBo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_types::EVENT_COUNTRY_BLOCKED;
     use std::collections::HashMap;
     use std::convert::Infallible;
     use std::net::SocketAddr;
@@ -695,5 +696,82 @@ mod tests {
             ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
             Poll::Ready(Ok(()))
         ));
+    }
+
+    /// A bus-backed recorder: the events the stage emits land here.
+    fn event_recorder() -> (
+        Arc<std::sync::Mutex<Vec<crate::events::SecurityEvent>>>,
+        Arc<crate::events::SecurityEventBus>,
+    ) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let bus = Arc::new(
+            crate::events::SecurityEventBus::new(true).on_event(Arc::new(
+                move |event: &crate::events::SecurityEvent| {
+                    sink_log.lock().expect("log").push(event.clone());
+                },
+            )),
+        );
+        (log, bus)
+    }
+
+    #[test]
+    fn a_country_match_fires_the_country_blocked_event_through_the_sink() {
+        // The blacklist rule: a blocked-country verdict.
+        let (log, bus) = event_recorder();
+        let stage = GeoStage::builder(GeoStageConfig {
+            gate: parse_country_lists([] as [&str; 0], ["RU"]),
+            handler: Some(Arc::new(Fixed("RU"))),
+            passive_mode: false,
+        })
+        .event_sink(crate::stage_events::StageEventSink::new(
+            None,
+            Some(bus),
+            crate::redact::SensitiveNames::default(),
+        ))
+        .build();
+        assert!(stage.decide(Some(ip("192.0.2.1")), None).is_some());
+        let events = log.lock().expect("log").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EVENT_COUNTRY_BLOCKED);
+        assert_eq!(events[0].action_taken, "request_blocked");
+        assert_eq!(events[0].rule_type.as_deref(), Some("country_blacklist"));
+
+        // The whitelist rule: a restrictive whitelist missing the country.
+        let (log, bus) = event_recorder();
+        let stage = GeoStage::builder(GeoStageConfig {
+            gate: parse_country_lists(["US"], [] as [&str; 0]),
+            handler: Some(Arc::new(Fixed("DE"))),
+            passive_mode: false,
+        })
+        .event_sink(crate::stage_events::StageEventSink::new(
+            None,
+            Some(bus),
+            crate::redact::SensitiveNames::default(),
+        ))
+        .build();
+        assert!(stage.decide(Some(ip("192.0.2.1")), None).is_some());
+        let events = log.lock().expect("log").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].rule_type.as_deref(), Some("country_whitelist"));
+
+        // Passive mode still emits (the handler-direct reference event never
+        // flips) and never blocks.
+        let (log, bus) = event_recorder();
+        let stage = GeoStage::builder(GeoStageConfig {
+            gate: parse_country_lists([] as [&str; 0], ["RU"]),
+            handler: Some(Arc::new(Fixed("RU"))),
+            passive_mode: true,
+        })
+        .event_sink(crate::stage_events::StageEventSink::new(
+            None,
+            Some(bus),
+            crate::redact::SensitiveNames::default(),
+        ))
+        .build();
+        assert!(stage.decide(Some(ip("192.0.2.1")), None).is_none());
+        let events = log.lock().expect("log").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action_taken, "request_blocked");
     }
 }

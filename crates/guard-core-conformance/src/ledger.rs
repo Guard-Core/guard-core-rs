@@ -42,6 +42,13 @@ pub struct ResidualEntry {
     pub constructs: Vec<String>,
     pub affected_suites: Vec<String>,
     pub evidence_cases: Vec<String>,
+    /// The engine surface that serves the residual (`structural matcher`).
+    #[serde(default)]
+    pub served_by: Option<String>,
+    /// The fancy-regex oracle verdict: `verified`, or the documented
+    /// detection limit where the naive oracle disagrees.
+    #[serde(default)]
+    pub fancy_regex: Option<String>,
 }
 
 pub fn load_ledger() -> Result<Ledger, String> {

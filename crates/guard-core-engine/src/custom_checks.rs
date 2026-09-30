@@ -261,6 +261,20 @@ mod tests {
                 validator: "second".to_owned()
             }
         );
+
+        // The first truthy answer wins even when it cannot block: the
+        // flagging validator's name rides a blockless verdict.
+        let first_flags = vec![
+            (String::from("first"), flagging.clone()),
+            (String::from("second"), blocking.clone()),
+        ];
+        assert_eq!(
+            decide_custom_validators(&first_flags, &ctx),
+            CustomValidatorsVerdict::Failed {
+                block: None,
+                validator: "first".to_owned()
+            }
+        );
     }
 
     #[test]

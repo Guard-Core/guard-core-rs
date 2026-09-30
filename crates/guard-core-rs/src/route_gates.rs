@@ -688,4 +688,102 @@ mod tests {
             "Not now"
         );
     }
+
+    #[test]
+    fn both_gates_render_their_debug_shapes() {
+        let referrer = referrer_stage();
+        let rendered = format!("{referrer:?}");
+        assert!(rendered.starts_with("ReferrerStage"));
+
+        let window = window_stage();
+        let rendered = format!("{window:?}");
+        assert!(rendered.starts_with("TimeWindowStage"));
+    }
+
+    #[test]
+    fn an_empty_referrer_requirement_never_runs_the_check() {
+        let stage = ReferrerStage::builder(GateConfig::default())
+            .resolver(Arc::new(|path| (path == "/open").then_some(Vec::new())))
+            .build();
+        assert!(
+            stage
+                .decide("/open", None, "1.2.3.4", "/open", "GET")
+                .is_none(),
+            "an empty allowed list means the route requires nothing"
+        );
+    }
+
+    #[test]
+    fn the_referrer_builder_carries_passive_mode() {
+        let (cell, hook) = recorder();
+        let stage = ReferrerStage::builder(GateConfig::default())
+            .resolver(Arc::new(|path| {
+                (path == "/embed").then(|| vec!["partner.example.com".to_owned()])
+            }))
+            .passive_mode(true)
+            .on_block(hook)
+            .build();
+        assert!(
+            stage
+                .decide("/embed", None, "1.2.3.4", "/embed", "GET")
+                .is_none()
+        );
+        let fired = cell.lock().expect("cell").clone().expect("fired");
+        assert!(fired.passive_mode);
+        assert_eq!(fired.status_code, None);
+    }
+
+    #[test]
+    fn the_wall_clock_decide_passes_an_unconfigured_path() {
+        let stage = window_stage();
+        // The wall-clock entry point delegates to decide_at; an
+        // unconfigured path answers before any window math.
+        assert!(stage.decide("/open", "1.2.3.4", "/open", "GET").is_none());
+    }
+
+    #[test]
+    fn an_all_none_window_fails_open() {
+        let stage = TimeWindowStage::builder(GateConfig::default())
+            .resolver(Arc::new(|path| {
+                (path == "/blank").then_some(TimeWindow {
+                    start: None,
+                    end: None,
+                    timezone: None,
+                })
+            }))
+            .build();
+        assert!(
+            stage
+                .decide_at("/blank", at_utc(12, 0), "1.2.3.4", "/blank", "GET")
+                .is_none(),
+            "a window with no bounds restricts nothing"
+        );
+    }
+
+    #[test]
+    fn the_time_window_builder_carries_passive_mode_and_the_hook() {
+        let (cell, hook) = recorder();
+        let stage = TimeWindowStage::builder(GateConfig::default())
+            .resolver(Arc::new(|path| {
+                (path == "/nightly").then(|| TimeWindow {
+                    start: Some("09:00".into()),
+                    end: Some("17:00".into()),
+                    timezone: Some("UTC".into()),
+                })
+            }))
+            .passive_mode(true)
+            .on_block(hook)
+            .build();
+        assert!(
+            stage
+                .decide_at("/nightly", at_utc(18, 30), "1.2.3.4", "/nightly", "GET")
+                .is_none(),
+            "passive mode observes the outside-the-window match only"
+        );
+        let fired = cell.lock().expect("cell").clone().expect("fired");
+        assert_eq!(fired.check_name, TIME_WINDOW_CHECK_NAME);
+        assert!(fired.passive_mode);
+        assert_eq!(fired.status_code, None);
+        assert_eq!(fired.reason, "Access outside allowed time window");
+    }
 }

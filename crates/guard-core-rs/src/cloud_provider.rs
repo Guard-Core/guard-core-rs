@@ -346,6 +346,7 @@ fn render<ResBody: From<&'static str>>(answer: &StageResponse) -> Response<ResBo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_types::EVENT_CLOUD_BLOCKED;
     use std::convert::Infallible;
     use std::net::SocketAddr;
     use std::str::FromStr;
@@ -621,5 +622,44 @@ mod tests {
             ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
             Poll::Ready(Ok(()))
         ));
+    }
+
+    #[test]
+    fn a_cloud_match_fires_the_cloud_blocked_event_through_the_sink() {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_log = Arc::clone(&log);
+        let bus = Arc::new(
+            crate::events::SecurityEventBus::new(true).on_event(Arc::new(
+                move |event: &crate::events::SecurityEvent| {
+                    sink_log.lock().expect("log").push(event.clone());
+                },
+            )),
+        );
+        let table = CloudIpTable::default();
+        table
+            .set_provider_ranges("AWS", vec![("203.0.113.0/24".to_owned(), None)])
+            .expect("valid ranges");
+        let stage = CloudProviderStage::builder(CloudProviderStageConfig {
+            block_cloud_providers: parse_cloud_selectors(["AWS"]).expect("valid selectors"),
+            table,
+            passive_mode: false,
+        })
+        .event_sink(crate::stage_events::StageEventSink::new(
+            None,
+            Some(bus),
+            crate::redact::SensitiveNames::default(),
+        ))
+        .build();
+
+        let decision = stage
+            .decide(Some(ip("203.0.113.9")), None)
+            .expect("blocked");
+        assert_eq!(decision.answer.status, StatusCode::FORBIDDEN);
+        let events = log.lock().expect("log").clone();
+        assert_eq!(events.len(), 1, "the cloud_blocked event rode the bus");
+        assert_eq!(events[0].event_type, EVENT_CLOUD_BLOCKED);
+        assert_eq!(events[0].action_taken, "request_blocked");
+        assert_eq!(events[0].metadata["cloud_provider"], "AWS");
+        assert_eq!(events[0].metadata["network"], "203.0.113.0/24");
     }
 }

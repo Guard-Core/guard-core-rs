@@ -337,4 +337,29 @@ mod tests {
         assert_eq!(CUSTOM_REQUEST_CHECK_NAME, "custom_request");
         assert_eq!(CUSTOM_VALIDATORS_CHECK_NAME, "custom_validators");
     }
+
+    #[test]
+    fn the_stage_renders_debug_and_unconfigured_seams_pass() {
+        let built = stage();
+        assert!(format!("{built:?}").starts_with("CustomChecksStage"));
+
+        // No validators resolver at all: the route check passes.
+        let bare = CustomChecksStage::builder().build();
+        assert!(
+            bare.decide_custom_validators("/private", "GET", None)
+                .is_none()
+        );
+
+        // A resolver that answers with an empty validator list: the check
+        // runs and allows.
+        let empty = CustomChecksStage::builder()
+            .validators_resolver(Arc::new(|_path| Some(Vec::new())))
+            .build();
+        assert!(
+            empty
+                .decide_custom_validators("/private", "GET", None)
+                .is_none(),
+            "no validators: the check allows"
+        );
+    }
 }

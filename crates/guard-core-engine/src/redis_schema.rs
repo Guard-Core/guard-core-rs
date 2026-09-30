@@ -1034,4 +1034,38 @@ mod tests {
         assert!(!admin.has("guard_core:banned_ips:::ffff:192.0.2.9"));
         assert!(admin.has("guard_core:banned_ips:192.0.2.9"));
     }
+
+    #[test]
+    fn one_key_migration_skips_foreign_prefixes_and_missing_values() {
+        let admin = MemoryAdmin::default();
+        // A key outside the banned_ips namespace is untouched.
+        assert!(
+            !migrate_one_ban_key(&admin, "guard_core:", "guard_core:ratelimit:192.0.2.9").unwrap(),
+            "a foreign namespace never migrates"
+        );
+        // A legacy (non-canonical) key with no value row is untouched.
+        assert!(
+            !migrate_one_ban_key(
+                &admin,
+                "guard_core:",
+                "guard_core:banned_ips:::ffff:192.0.2.9"
+            )
+            .unwrap(),
+            "no value: nothing to carry over"
+        );
+    }
+
+    #[test]
+    fn cloud_ranges_decode_skips_empty_entries() {
+        let (networks, regions) =
+            decode_cloud_ranges(",203.0.113.0/24|us-east,,198.51.100.0/24,").expect("decodable");
+        assert_eq!(
+            networks,
+            vec![
+                String::from("198.51.100.0/24"),
+                String::from("203.0.113.0/24"),
+            ]
+        );
+        assert_eq!(regions.get("203.0.113.0/24"), Some(&"us-east".to_owned()));
+    }
 }
