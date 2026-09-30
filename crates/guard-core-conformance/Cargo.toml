@@ -17,6 +17,9 @@ serde             = { workspace = true }
 serde_json        = { workspace = true }
 toml              = { workspace = true }
 
+[dev-dependencies]
+fancy-regex       = { version = "0.14", default-features = false }
+
 [lints.rust]
 unsafe_code = "forbid"
 
