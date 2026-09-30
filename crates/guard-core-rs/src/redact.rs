@@ -185,10 +185,10 @@ pub fn redact_url_for_display(url: &str, names: &SensitiveNames) -> String {
             out.push_str(&redact_pairs_in_text(fragment.unwrap_or_default(), names));
         } else {
             // The '?' was followed by '#': the fragment rides in rest.
-            let fragment = rest.strip_prefix('#').unwrap_or(rest);
             #[cfg(not(coverage))] // unreachable: this branch only runs when
             // `rest` holds no '#', so it cannot start with one
             if rest.starts_with('#') {
+                let fragment = rest.strip_prefix('#').unwrap_or(rest);
                 out.push('#');
                 out.push_str(&redact_pairs_in_text(fragment, names));
             }
