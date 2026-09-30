@@ -64,6 +64,7 @@
 //! assert!(score > 0.0);
 //! ```
 
+pub mod cloud_fetch;
 pub mod cloud_provider;
 pub mod custom_checks;
 pub mod emergency_mode;

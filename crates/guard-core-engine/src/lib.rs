@@ -1,6 +1,7 @@
 pub mod behavior;
 pub mod binary_islands;
 pub mod body_scan;
+pub mod cloud_fetch;
 pub mod cloud_provider;
 pub mod compiler;
 pub mod cors;
