@@ -1439,52 +1439,53 @@ mod unit_twins {
             "gc:",
         );
         assert!(!failed.is_banned(ip("192.0.2.71")));
+    }
 
-        fn failing_distributed_ban_lookup_fails_secure() {
-            // The reference `_check_redis_exact` -> `redis_handler.get_key` ->
-            // `safe_operation` raises `GuardRedisError(503, "Redis operation
-            // failed")` on a backend failure: the pipeline never reads a
-            // failing lookup as unbanned.
-            let store = Arc::new(crate::distributed::MemoryStore::default());
-            store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
-            let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0)).with_distributed_store(
-                Arc::clone(&store) as Arc<dyn crate::distributed::BanStore>,
-                "guard_core:",
-            );
-            let stranger = ip("192.0.2.77");
+    #[test]
+    fn failing_distributed_ban_lookup_fails_secure() {
+        // The reference `_check_redis_exact` -> `redis_handler.get_key` ->
+        // `safe_operation` raises `GuardRedisError(503, "Redis operation
+        // failed")` on a backend failure: the pipeline never reads a
+        // failing lookup as unbanned.
+        let store = Arc::new(crate::distributed::MemoryStore::default());
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0)).with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::BanStore>,
+            "guard_core:",
+        );
+        let stranger = ip("192.0.2.77");
 
-            // The fail-secure seam surfaces the backend error.
-            let error = manager.try_is_banned(stranger).expect_err("fail secure");
-            assert!(error.to_string().contains("backend down"));
-            // The lossy form keeps its documented shape (reads unbanned) so
-            // existing callers stay total.
-            assert!(!manager.is_banned(stranger));
-        }
+        // The fail-secure seam surfaces the backend error.
+        let error = manager.try_is_banned(stranger).expect_err("fail secure");
+        assert!(error.to_string().contains("backend down"));
+        // The lossy form keeps its documented shape (reads unbanned) so
+        // existing callers stay total.
+        assert!(!manager.is_banned(stranger));
+    }
 
-        #[test]
-        fn live_local_ban_answers_ok_even_when_the_store_is_down() {
-            // The reference checks the local TTLCache before Redis, so a live
-            // local ban short-circuits and a backend failure never surfaces.
-            let store = Arc::new(crate::distributed::MemoryStore::default());
-            let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0)).with_distributed_store(
-                Arc::clone(&store) as Arc<dyn crate::distributed::BanStore>,
-                "guard_core:",
-            );
-            let attacker = ip("192.0.2.78");
-            manager
-                .ban_ip(attacker, 60, "threshold_exceeded")
-                .expect("ban");
+    #[test]
+    fn live_local_ban_answers_ok_even_when_the_store_is_down() {
+        // The reference checks the local TTLCache before Redis, so a live
+        // local ban short-circuits and a backend failure never surfaces.
+        let store = Arc::new(crate::distributed::MemoryStore::default());
+        let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0)).with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::BanStore>,
+            "guard_core:",
+        );
+        let attacker = ip("192.0.2.78");
+        manager
+            .ban_ip(attacker, 60, "threshold_exceeded")
+            .expect("ban");
 
-            store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
-            assert!(manager.try_is_banned(attacker).expect("local hit"));
-        }
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(manager.try_is_banned(attacker).expect("local hit"));
+    }
 
-        #[test]
-        fn distributed_ban_lookup_error_names_the_backend() {
-            // Without a store at all the fail-secure seam still answers: no
-            // backend, no error, just the local store's verdict.
-            let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0));
-            assert!(!manager.try_is_banned(ip("192.0.2.79")).expect("no store"));
-        }
+    #[test]
+    fn distributed_ban_lookup_error_names_the_backend() {
+        // Without a store at all the fail-secure seam still answers: no
+        // backend, no error, just the local store's verdict.
+        let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0));
+        assert!(!manager.try_is_banned(ip("192.0.2.79")).expect("no store"));
     }
 }

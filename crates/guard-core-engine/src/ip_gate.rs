@@ -207,6 +207,15 @@ pub(crate) const fn canonical(addr: IpAddr) -> IpAddr {
     }
 }
 
+impl core::fmt::Display for IpNet {
+    /// The family's canonical textual form: the masked address, `/`, the
+    /// prefix (the reference `str(ip_network(...))` / Go `Prefix.String()`;
+    /// IPv6 comes out compressed).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
 /// The address family's bit width.
 const fn family_bits(addr: IpAddr) -> u8 {
     match addr {

@@ -7,10 +7,13 @@ license      = { workspace = true }
 rust-version = { workspace = true }
 
 [dependencies]
+chrono                = { version = "0.4", default-features = false, features = ["clock"] }
+chrono-tz             = { version = "0.10", default-features = false, features = ["case-insensitive"] }
 html-escape           = { workspace = true }
 sha2                  = "0.10"
 lru                   = { workspace = true }
 percent-encoding      = { workspace = true }
+rand                  = { version = "0.9", default-features = false, features = ["std", "thread_rng"] }
 regex                 = { workspace = true }
 serde_json            = { workspace = true }
 unicode-normalization = { workspace = true }
