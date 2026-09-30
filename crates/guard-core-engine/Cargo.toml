@@ -8,7 +8,7 @@ rust-version = { workspace = true }
 
 [dependencies]
 html-escape           = { workspace = true }
-sha2                  = "0.10"
+sha2                  = "0.11"
 lru                   = { workspace = true }
 percent-encoding      = { workspace = true }
 regex                 = { workspace = true }
