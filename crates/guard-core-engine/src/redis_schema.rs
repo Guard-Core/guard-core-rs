@@ -262,9 +262,7 @@ pub fn format_expiry(expiry: f64) -> String {
 /// contract, the shape is the interop guarantee.
 #[must_use]
 pub fn random_member() -> String {
-    use rand::RngCore;
-    let mut bytes = [0_u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
+    let bytes: [u8; 16] = rand::random();
     bytes
         .iter()
         .fold(String::with_capacity(32), |mut out, byte| {
