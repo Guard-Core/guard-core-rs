@@ -582,9 +582,10 @@ impl CaseEngine {
 
         // 1. The route IP gate (the reference `_check_route_ip_access`,
         //    which runs inside the ip_security check before the global
-        //    lists): a route blacklist match denies, a configured route
-        //    whitelist takes over the route verdict, no lists leave the
-        //    request to the global gate.
+        //    lists): a configured route whitelist takes over the route
+        //    verdict first (a match passes, a miss denies, even over a
+        //    blacklist match), then the blacklist denies, and no lists
+        //    leave the request to the global gate.
         let route_spec = self.routes.get(path);
         if let Some(gate) = route_spec.and_then(|spec| spec.ip_gate.as_ref())
             && gate.evaluate(ip) == RouteIpVerdict::Denied

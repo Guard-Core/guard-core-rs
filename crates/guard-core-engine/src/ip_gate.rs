@@ -207,6 +207,15 @@ pub(crate) const fn canonical(addr: IpAddr) -> IpAddr {
     }
 }
 
+impl core::fmt::Display for IpNet {
+    /// The family's canonical textual form: the masked address, `/`, the
+    /// prefix (the reference `str(ip_network(...))` / Go `Prefix.String()`;
+    /// IPv6 comes out compressed).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
 /// The address family's bit width.
 const fn family_bits(addr: IpAddr) -> u8 {
     match addr {
@@ -378,12 +387,19 @@ pub enum RouteIpVerdict {
 /// [`RouteIpGate::evaluate`], decides a request IP against one route:
 ///
 /// ```text
-/// blacklist match:            deny (a blacklisted IP is denied even when a
-///                             whitelist would take it)
-/// whitelist configured, miss: deny (the whitelist takes over the route verdict)
-/// whitelist match:            pass the route stage
-/// neither list configured:    unrestricted (the global gate decides)
+/// whitelist configured, match: pass the route stage (the whitelist verdict
+///                              wins, even over a blacklist match)
+/// whitelist configured, miss:  deny (the whitelist takes over the route
+///                              verdict; the blacklist is never consulted)
+/// blacklist match:             deny
+/// neither list configured:     unrestricted (the global gate decides)
 /// ```
+///
+/// The precedence is the reference's `check_route_ip_access`: the whitelist
+/// is asked first and its answer settles the IP verdict (`ip_result`); the
+/// blacklist is only consulted when the whitelist gives no verdict (it is
+/// not configured), so a whitelisted IP that is also blacklisted still
+/// passes the route stage.
 ///
 /// Matching semantics are the global gate's ([`IpGateConfig`]): a bare IP or
 /// a CIDR range per entry, IPv4-mapped request addresses canonicalized,
@@ -404,7 +420,8 @@ pub enum RouteIpVerdict {
 ///
 /// let gate = RouteIpGate::new(["192.0.2.40"], ["203.0.113.9"]).expect("valid lists");
 ///
-/// // A whitelist member passes the route stage.
+/// // A whitelist member passes the route stage, even a blacklisted one:
+/// // the whitelist verdict wins over the blacklist.
 /// assert_eq!(
 ///     gate.evaluate(IpAddr::from_str("192.0.2.40").unwrap()),
 ///     RouteIpVerdict::Allowed
@@ -414,7 +431,7 @@ pub enum RouteIpVerdict {
 ///     gate.evaluate(IpAddr::from_str("192.0.2.11").unwrap()),
 ///     RouteIpVerdict::Denied
 /// );
-/// // A blacklisted IP is denied even when a whitelist entry would take it.
+/// // A blacklisted IP outside the whitelist is denied.
 /// assert_eq!(
 ///     gate.evaluate(IpAddr::from_str("203.0.113.9").unwrap()),
 ///     RouteIpVerdict::Denied
@@ -464,21 +481,21 @@ impl RouteIpGate {
         !self.whitelist.is_empty()
     }
 
-    /// Evaluate a request IP against the route's lists: the blacklist
-    /// denies first, then a configured whitelist takes over the route
-    /// verdict (a miss denies, a match passes), and no list leaves the
-    /// request unrestricted.
+    /// Evaluate a request IP against the route's lists: a configured
+    /// whitelist takes over the route verdict first (a match passes, a miss
+    /// denies, exactly the reference's `ip_result` order), then the
+    /// blacklist denies, and no list leaves the request unrestricted.
     #[must_use]
     pub fn evaluate(&self, ip: IpAddr) -> RouteIpVerdict {
-        if !self.blacklist.is_empty() && list_matches(&self.blacklist, ip) {
-            return RouteIpVerdict::Denied;
-        }
         if !self.whitelist.is_empty() {
             return if list_matches(&self.whitelist, ip) {
                 RouteIpVerdict::Allowed
             } else {
                 RouteIpVerdict::Denied
             };
+        }
+        if !self.blacklist.is_empty() && list_matches(&self.blacklist, ip) {
+            return RouteIpVerdict::Denied;
         }
         RouteIpVerdict::Unrestricted
     }
@@ -785,28 +802,43 @@ mod tests {
     }
 
     #[test]
-    fn route_gate_blacklist_denies_first() {
+    fn route_gate_whitelist_verdict_wins_over_the_blacklist() {
+        // The reference order (`check_route_ip_access`): the whitelist is
+        // asked first and its answer settles the IP verdict; the blacklist
+        // is only consulted when the whitelist is not configured.
         let gate = RouteIpGate::new(["192.0.2.40"], ["203.0.113.9", "198.51.100.0/24"]).unwrap();
         assert_eq!(
             gate.evaluate(ip("203.0.113.9")),
             RouteIpVerdict::Denied,
-            "a blacklist match denies"
+            "a blacklist match outside the whitelist denies"
         );
-        // A blacklisted IP is denied even when the whitelist would take it.
         assert_eq!(
             gate.evaluate(ip("198.51.100.7")),
             RouteIpVerdict::Denied,
-            "blacklist beats the whitelist"
+            "a blacklist-range miss under the whitelist denies"
         );
         assert_eq!(
             gate.evaluate(ip("192.0.2.40")),
             RouteIpVerdict::Allowed,
-            "the whitelist still passes its members"
+            "the whitelist passes its members"
         );
         assert_eq!(
             gate.evaluate(ip("192.0.2.11")),
             RouteIpVerdict::Denied,
-            "the whitelist still denies its misses"
+            "the whitelist denies its misses"
+        );
+    }
+
+    #[test]
+    fn route_gate_whitelisted_blacklisted_ip_passes() {
+        // An IP on both lists passes: the whitelist verdict wins, exactly
+        // the reference's `ip_result = _check_ip_whitelist(...)` settling
+        // before the blacklist is ever consulted.
+        let gate = RouteIpGate::new(["192.0.2.40"], ["192.0.2.40"]).unwrap();
+        assert_eq!(
+            gate.evaluate(ip("192.0.2.40")),
+            RouteIpVerdict::Allowed,
+            "a whitelisted IP that is also blacklisted passes the route stage"
         );
     }
 

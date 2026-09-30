@@ -494,12 +494,11 @@ mod tests {
     #[test]
     fn json_keys_redact_at_depth() {
         let blob = r#"{"user":"u","nested":{"password":"p","keep":1}}"#;
-        // Key order normalizes to sorted: this port re-serializes through
-        // serde_json's ordered map, a documented divergence from the
-        // reference's insertion-order dumps.
+        // Key order follows the input's insertion order: serde_json runs
+        // with preserve_order, the reference's insertion-order dumps.
         assert_eq!(
             redact_blob_for_display(blob, &names()),
-            r#"{"nested":{"keep":1,"password":"[REDACTED]"},"user":"u"}"#
+            r#"{"user":"u","nested":{"password":"[REDACTED]","keep":1}}"#
         );
     }
 
