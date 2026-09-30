@@ -13,6 +13,7 @@ repository    = { workspace = true }
 rust-version  = { workspace = true }
 
 [dependencies]
+chrono            = { version = "0.4", default-features = false, features = ["clock"] }
 guard-core-engine = { workspace = true }
 http              = "1.3"
 serde_json        = { workspace = true }

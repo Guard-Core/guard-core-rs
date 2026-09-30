@@ -65,15 +65,20 @@
 //! ```
 
 pub mod cloud_provider;
+pub mod custom_checks;
+pub mod emergency_mode;
 pub mod event_types;
 pub mod events;
 pub mod geo;
 pub mod headers_auth;
+pub mod https_enforcement;
 pub mod logging;
 pub mod process_response;
 pub mod redact;
 pub mod request_limits;
+pub mod request_logging;
 pub mod responses;
+pub mod route_gates;
 pub mod tower;
 pub mod user_agent;
 
@@ -81,4 +86,6 @@ pub use guard_core_engine::compiler;
 pub use guard_core_engine::detect;
 pub use guard_core_engine::detection_exclusions;
 pub use guard_core_engine::preprocessor;
+pub use guard_core_engine::referrer;
 pub use guard_core_engine::semantic;
+pub use guard_core_engine::time_window;
