@@ -420,8 +420,10 @@ impl PerformanceMonitor {
     ///
     /// `now_monotonic` is the cooldown clock (the reference
     /// `time.monotonic()`); `on_event`, when given, receives every
-    /// detected anomaly's event descriptor - the reference's
-    /// `agent_handler.send_event` arm, gated by the per-pattern cooldown.
+    /// detected anomaly's sanitized event descriptor - the reference's
+    /// `agent_handler.send_event` arm, gated by the per-pattern cooldown,
+    /// whose event carries the redacted pattern (`build_anomaly_event_
+    /// data`). The raw pattern never leaves the recorder.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     // The mutex guard spans the whole stats update exactly once (the
@@ -510,12 +512,17 @@ impl PerformanceMonitor {
         }
         let anomalies: Vec<PatternAnomaly> = anomalies.into_iter().flatten().collect();
 
-        // The agent arm is cooldown-gated; the callbacks always run.
+        // The agent arm is cooldown-gated; the callbacks always run. Both
+        // arms receive the sanitized anomaly: the reference's agent event
+        // carries the redacted pattern (`build_anomaly_event_data`) and
+        // its callbacks the truncated hash-bearing one
+        // (`sanitize_anomaly_data`) - this port's single sanitized shape
+        // covers both, so no raw pattern ever leaves the recorder.
         if let (false, Some(on_event)) = (anomalies.is_empty(), on_event)
             && self.reserve_anomaly_emission(&pattern, now_monotonic)
         {
             for anomaly in &anomalies {
-                on_event(anomaly);
+                on_event(&sanitize_anomaly_data(anomaly));
             }
         }
         if !anomalies.is_empty() {
