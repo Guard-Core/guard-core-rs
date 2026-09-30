@@ -356,4 +356,29 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn a_mismatched_bare_entry_falls_through_and_junk_addresses_never_match() {
+        // A bare entry the connecting address does not equal is skipped in
+        // favor of the next entry.
+        let config = HttpsEnforcementConfig::new(true, true, ["10.0.0.1", "10.0.0.0/8"]).unwrap();
+        assert_eq!(
+            decide(
+                &request("http", Some("10.1.2.3"), Some("https"), None),
+                &config
+            ),
+            HttpsVerdict::Allowed,
+            "the CIDR entry answers after the bare entry missed"
+        );
+        // A CIDR entry with an unparseable connecting address never matches
+        // (the seam stays total where the reference raises).
+        let config = HttpsEnforcementConfig::new(true, true, ["10.0.0.0/8"]).unwrap();
+        assert_eq!(
+            decide(&request("http", Some("junk"), Some("https"), None), &config),
+            HttpsVerdict::Redirect {
+                route_scoped: false
+            },
+            "junk cannot upgrade itself"
+        );
+    }
 }

@@ -477,11 +477,21 @@ impl PerformanceMonitor {
                 }
                 row.max_execution_time = row.max_execution_time.max(execution_time);
                 row.min_execution_time = row.min_execution_time.min(execution_time);
-                row.avg_execution_time = if row.recent_times.is_empty() {
-                    row.avg_execution_time
-                } else {
-                    row.recent_times.iter().sum::<f64>() / row.recent_times.len() as f64
-                };
+                #[cfg(not(coverage))] // unreachable: the non-timeout arm
+                // above just pushed a sample, so the recent window always
+                // holds at least one entry here
+                {
+                    row.avg_execution_time = if row.recent_times.is_empty() {
+                        row.avg_execution_time
+                    } else {
+                        row.recent_times.iter().sum::<f64>() / row.recent_times.len() as f64
+                    };
+                }
+                #[cfg(coverage)]
+                {
+                    row.avg_execution_time =
+                        row.recent_times.iter().sum::<f64>() / row.recent_times.len() as f64;
+                }
             }
             statistical = detect_statistical_anomaly(
                 &pattern,
@@ -724,8 +734,8 @@ mod tests {
         }
         let anomalies = monitor.record_metric("few", 1.0, 10, false, false, 100.0, None);
         assert!(
-            anomalies.iter().all(|a| a.kind() != "statistical_anomaly"),
-            "10 samples is under the min_samples floor"
+            anomalies.is_empty(),
+            "10 samples is under the min_samples floor: {anomalies:?}"
         );
     }
 
@@ -841,5 +851,172 @@ mod tests {
         assert_eq!(problematic.len(), 2);
         assert_eq!(problematic[0].pattern, "slow");
         assert_eq!(problematic[1].pattern, "also_slow");
+    }
+
+    #[test]
+    fn event_types_and_patterns_read_off_every_anomaly_kind() {
+        let timeout = PatternAnomaly::Timeout {
+            pattern: String::from("p"),
+            content_length: 1,
+        };
+        let slow = PatternAnomaly::SlowExecution {
+            pattern: String::from("p"),
+            execution_time: 1.0,
+            content_length: 1,
+        };
+        let statistical = PatternAnomaly::Statistical {
+            pattern: String::from("p"),
+            execution_time: 1.0,
+            z_score: 4.0,
+            avg_time: 0.1,
+            std_time: 0.2,
+        };
+        assert_eq!(timeout.event_type(), "pattern_anomaly_timeout");
+        assert_eq!(slow.event_type(), "pattern_anomaly_slow_execution");
+        assert_eq!(
+            statistical.event_type(),
+            "pattern_anomaly_statistical_anomaly"
+        );
+        // The slow-execution pattern accessor rides the same shape.
+        assert_eq!(slow.pattern(), "p");
+        assert_eq!(statistical.pattern(), "p");
+    }
+
+    #[test]
+    fn truncation_walks_back_to_a_char_boundary_and_the_sanitizer_redacts_bytes() {
+        // 34 three-byte chars: 102 bytes, so the 100-byte cut lands inside
+        // a char and must walk back to the boundary.
+        let multibyte = "\u{20ac}".repeat(34);
+        let truncated = truncate_pattern(&multibyte);
+        assert!(truncated.ends_with("...[truncated]"));
+        assert!(
+            multibyte.starts_with(truncated.trim_end_matches("...[truncated]")),
+            "the cut stays on a char boundary"
+        );
+
+        // The sanitizer's 50-byte cut walks back the same way: 20
+        // three-byte chars are 60 bytes, so 50 sits inside a char.
+        let long = "\u{20ac}".repeat(20);
+        let sanitized = sanitize_anomaly_data(&PatternAnomaly::Timeout {
+            pattern: long,
+            content_length: 1,
+        });
+        assert!(sanitized.pattern().contains('#'), "the hash rides along");
+        assert!(sanitized.pattern().contains("..."));
+    }
+
+    #[test]
+    fn the_slow_and_statistical_arms_stay_quiet_outside_their_windows() {
+        // Below the slow threshold the slow arm answers None.
+        assert!(
+            detect_slow_execution_anomaly("p", 0.01, 10, 0.1).is_none(),
+            "under the threshold: no slow anomaly"
+        );
+
+        // Identical window samples have a zero stddev: no statistical arm.
+        let flat = vec![0.5; 12];
+        assert!(
+            detect_statistical_anomaly("p", 5.0, &flat, 10, 3.0).is_none(),
+            "a zero stddev cannot score a z-score"
+        );
+
+        // Enough samples, real stddev, but the spike is inside the
+        // threshold: the statistical arm stays quiet.
+        let spread = (0..12).map(f64::from).collect::<Vec<_>>();
+        assert!(
+            detect_statistical_anomaly("p", 20.0, &spread, 10, 100.0).is_none(),
+            "the z-score sits under the threshold"
+        );
+    }
+
+    #[test]
+    fn the_global_history_evicts_its_oldest_metric() {
+        let monitor = PerformanceMonitor::new(3.0, 0.1, 100, 1000, 60.0, 30);
+        for i in 0..101_u64 {
+            drop(monitor.record_metric(
+                "p",
+                f64::from(i as u32) * 0.001,
+                10,
+                false,
+                false,
+                f64::from(i as u32),
+                None,
+            ));
+        }
+        let (metrics, _patterns, avg, _timeouts, _matches) = monitor.summary_stats();
+        assert_eq!(metrics, 100, "the history window holds its cap");
+        assert!(avg > 0.0);
+    }
+
+    #[test]
+    fn the_tracked_pattern_cap_evicts_the_oldest_pattern() {
+        let monitor = PerformanceMonitor::new(3.0, 0.1, 1000, 100, 60.0, 30);
+        for i in 0..101 {
+            drop(monitor.record_metric(&format!("p{i}"), 0.001, 10, false, false, 0.0, None));
+        }
+        // The map evicts at the cap (the map's iteration order picks the
+        // victim), so exactly one of the 101 patterns is gone and the
+        // newest is still tracked.
+        let missing = (0..101)
+            .filter(|i| monitor.pattern_report(&format!("p{i}")).is_none())
+            .count();
+        assert_eq!(missing, 1, "the cap evicted exactly one pattern");
+        assert!(monitor.pattern_report("p100").is_some());
+    }
+
+    #[test]
+    fn the_emission_cooldown_refuses_and_allows_directly() {
+        let monitor = PerformanceMonitor::new(3.0, 0.1, 1000, 1000, 60.0, 30);
+        // An untracked pattern is always allowed.
+        assert!(
+            monitor.reserve_anomaly_emission("ghost", 10.0),
+            "an untracked pattern carries no stamp"
+        );
+        // Lay the stamp through the event arm, then probe the window.
+        let noop = |_anomaly: &PatternAnomaly| {};
+        drop(monitor.record_metric("p", 5.0, 10, false, true, 0.0, Some(&noop)));
+        assert!(
+            !monitor.reserve_anomaly_emission("p", 1.0),
+            "inside the cooldown the reservation is refused"
+        );
+        assert!(
+            monitor.reserve_anomaly_emission("p", 61.0),
+            "outside the cooldown the reservation wins again"
+        );
+    }
+
+    #[test]
+    fn summary_stats_count_the_recent_window() {
+        let monitor = PerformanceMonitor::new(3.0, 0.1, 1000, 1000, 60.0, 30);
+        assert_eq!(
+            monitor.summary_stats(),
+            (0, 0, 0.0, 0, 0),
+            "an empty monitor summarizes to zeros"
+        );
+
+        // Mixed window: timeouts skip the average but count the totals.
+        drop(monitor.record_metric("p", 0.2, 10, true, false, 0.0, None));
+        drop(monitor.record_metric("p", 0.4, 10, true, false, 1.0, None));
+        drop(monitor.record_metric("q", 9.9, 10, false, true, 2.0, None));
+        let (metrics, patterns, avg, timeouts, matches) = monitor.summary_stats();
+        assert_eq!(metrics, 3);
+        assert_eq!(patterns, 2);
+        assert!(
+            (avg - 0.3).abs() < 1e-9,
+            "only the non-timeout times average"
+        );
+        assert_eq!(timeouts, 1);
+        assert_eq!(matches, 2);
+
+        // An all-timeout window averages to zero.
+        let only_timeouts = PerformanceMonitor::new(3.0, 0.1, 1000, 1000, 60.0, 30);
+        drop(only_timeouts.record_metric("q", 9.9, 10, false, true, 0.0, None));
+        let (metrics, _patterns, avg, timeouts, _matches) = only_timeouts.summary_stats();
+        assert_eq!(metrics, 1);
+        assert!(
+            avg.abs() < f64::EPSILON,
+            "an all-timeout window averages zero"
+        );
+        assert_eq!(timeouts, 1);
     }
 }

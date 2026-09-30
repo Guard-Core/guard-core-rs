@@ -544,4 +544,78 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body(), &"inner");
     }
+
+    #[test]
+    fn the_builder_methods_shape_the_switches_and_the_stage_renders_debug() {
+        let stage = EmergencyModeStage::builder(EmergencyModeStageConfig::default())
+            .emergency_mode(true)
+            .passive_mode(true)
+            .emergency_whitelist(["192.0.2.40"])
+            .build()
+            .expect("valid whitelist");
+        // The builder methods laid both switches: passive observes only.
+        assert!(
+            stage
+                .decide(Some("203.0.113.9"), "203.0.113.9", "/", "GET")
+                .is_none()
+        );
+        assert!(format!("{stage:?}").starts_with("EmergencyModeStage"));
+
+        let layer = EmergencyModeStageLayer::new(stage_with(false));
+        assert!(format!("{layer:?}").starts_with("EmergencyModeStageLayer"));
+    }
+
+    #[test]
+    fn the_service_readies_and_renders_the_custom_body_as_static_empty() {
+        let mut custom = CustomErrorResponses::new();
+        custom.insert(503, "Down for maintenance".to_owned());
+        let layer = EmergencyModeStageLayer::new(
+            EmergencyModeStage::builder(EmergencyModeStageConfig {
+                emergency_mode: true,
+                passive_mode: false,
+            })
+            .custom_error_responses(custom)
+            .build()
+            .expect("valid"),
+        );
+        let mut service = ::tower::ServiceBuilder::new().layer(layer).service(Inner);
+
+        // poll_ready delegates to the inner service.
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(service.poll_ready(&mut cx), Poll::Ready(Ok(()))));
+
+        let mut blocked = Request::builder().uri("/x").body("b").expect("req");
+        blocked
+            .extensions_mut()
+            .insert(ClientIp("203.0.113.9".parse().expect("ip")));
+        let response = block_on(service.call(blocked)).expect("ready");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // A custom body cannot outlive the request, so the static render
+        // answers the reference default shape.
+        assert_eq!(response.body(), &"");
+    }
+
+    #[test]
+    fn the_helper_block_on_spins_a_pending_future_once() {
+        struct PendingOnce {
+            polled: std::cell::Cell<bool>,
+        }
+        impl Future for PendingOnce {
+            type Output = u8;
+
+            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u8> {
+                if self.polled.get() {
+                    Poll::Ready(7)
+                } else {
+                    self.polled.set(true);
+                    Poll::Pending
+                }
+            }
+        }
+        let future = PendingOnce {
+            polled: std::cell::Cell::new(false),
+        };
+        assert_eq!(block_on(future), 7, "the second poll answers");
+    }
 }

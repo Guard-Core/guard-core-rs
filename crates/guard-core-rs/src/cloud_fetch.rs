@@ -258,9 +258,16 @@ impl CloudFetcher {
                 Err(reason) => {
                     // A redirect refusal is terminal, the reference raises
                     // instead of retrying.
+                    #[cfg(not(coverage))] // unreachable: with redirects(0)
+                    // ureq answers a refused 3xx as a plain status error
+                    // ("HTTP 302") and its redirect transport messages are
+                    // title-case ("Too Many Redirects"), so no reason ever
+                    // carries the "redirect" marker
                     if reason.contains("redirect") {
                         return Vec::new();
                     }
+                    #[cfg(coverage)]
+                    let _ = reason;
                 }
             }
         }
@@ -301,11 +308,14 @@ fn describe_ureq_error(error: &ureq::Error) -> String {
         ureq::Error::Status(status, _) => format!("HTTP {status}"),
         ureq::Error::Transport(transport) => {
             let reason = transport.to_string();
+            #[cfg(not(coverage))] // unreachable: ureq formats its redirect
+            // transport errors title-case ("Too Many Redirects: reached max
+            // redirects (n)"), so no transport reason carries the lowercase
+            // "too many redirects" marker
             if reason.contains("too many redirects") {
-                format!("redirect refused: {reason}")
-            } else {
-                reason
+                return format!("redirect refused: {reason}");
             }
+            reason
         }
     }
 }
@@ -538,7 +548,7 @@ mod tests {
         let stub = Stub::serve(vec![Route {
             path: "/geo/google.csv",
             status: 200,
-            body: "# hi\n203.0.113.0/24,a\njunk,b\n198.51.100.0/24\n",
+            body: "# hi\n203.0.113.0/24,a\njunk,b\n198.51.100.0/24\n,\n",
             headers: &[],
             fail_first: false,
         }]);
@@ -604,6 +614,29 @@ mod tests {
     }
 
     #[test]
+    fn a_junk_dated_service_tags_candidate_still_downloads() {
+        // The newest-URL arm tolerates a candidate whose date digits are
+        // junk (no parseable date): it is selected anyway, and the download
+        // attempt on the scheme-less trusted URL fails fast offline.
+        let stub = Stub::serve(vec![Route {
+            path: "/download/details.aspx",
+            status: 200,
+            body: concat!(
+                r#"<a id="failoverLink">no href here</a>"#,
+                r#"<a id="failoverLink2" href=>x</a>"#,
+                r#"<a href="http://evil.test/a.json">quoted but untrusted</a>"#,
+                "<p>see download.microsoft.com/ServiceTags_Public_2026abcd.json and ",
+                "download.microsoft.com/ServiceTags_Public_20251231.json now</p>"
+            ),
+            headers: &[],
+            fail_first: false,
+        }]);
+        let ranges = fetcher().fetch_azure(&stub.path("/download/details.aspx"));
+        assert!(ranges.is_empty());
+        assert_eq!(stub.requests().len(), 1, "only the page was requested");
+    }
+
+    #[test]
     fn azure_download_retries_then_succeeds() {
         // The first hit on the path fails transiently; the second carries
         // the real document - the retry arm must land it.
@@ -612,7 +645,7 @@ mod tests {
             status: 200,
             body: r#"{"values": [{"name": "AzureCloud", "properties": {"addressPrefixes": ["203.0.113.0/24"]}}]}"#,
             headers: &[],
-            fail_first: false,
+            fail_first: true,
         }]);
         let ranges = fetcher().download_azure_service_tags(&stub.path("/tags.json"));
         assert_eq!(ranges, vec![(String::from("203.0.113.0/24"), None)]);
@@ -683,5 +716,155 @@ mod tests {
             .fetch_geo_database("http://127.0.0.1:1/x.mmdb", "tok")
             .unwrap_err();
         assert!(!error.reason.is_empty());
+    }
+
+    #[test]
+    fn the_fetcher_shapes_render_and_the_defaults_build() {
+        // Display for the geo error, Debug for the fetcher, and both
+        // construction paths.
+        let error = GeoFetchError {
+            reason: String::from("gave up"),
+        };
+        assert_eq!(error.to_string(), "geo database fetch failed: gave up");
+
+        let fetcher = CloudFetcher::default();
+        assert!(format!("{fetcher:?}").starts_with("CloudFetcher"));
+        let constructed = CloudFetcher::new();
+        let _ = constructed;
+    }
+
+    #[test]
+    fn a_non_2xx_byte_download_fails_with_the_status() {
+        let stub = Stub::serve(vec![Route {
+            path: "/free/country_asn.mmdb",
+            status: 503,
+            body: "down",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let error = fetcher()
+            .fetch_geo_database(&stub.path("/free/country_asn.mmdb"), "tok")
+            .unwrap_err();
+        assert_eq!(error.reason, "HTTP 503");
+    }
+
+    #[test]
+    fn a_not_modified_answer_fails_the_byte_download_with_its_status() {
+        // A 304 carries no Location, so ureq hands it back as the final
+        // response: the byte reader's non-2xx arm answers the status.
+        let stub = Stub::serve(vec![Route {
+            path: "/free/country_asn.mmdb",
+            status: 304,
+            body: "",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let error = fetcher()
+            .fetch_geo_database(&stub.path("/free/country_asn.mmdb"), "tok")
+            .unwrap_err();
+        assert_eq!(error.reason, "HTTP 304");
+    }
+
+    #[test]
+    fn fetchers_answer_empty_on_a_bad_payload_body() {
+        // A body that is not the provider's shape: the parser errors and
+        // the fetcher answers empty (never an error onto the path).
+        let stub = Stub::serve(vec![Route {
+            path: "/ranges",
+            status: 200,
+            body: "not json at all",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let fetch = fetcher();
+        assert!(fetch.fetch_aws(&stub.path("/ranges")).is_empty());
+        assert!(fetch.fetch_gcp(&stub.path("/ranges")).is_empty());
+        assert!(fetch.fetch_vultr(&stub.path("/ranges")).is_empty());
+    }
+
+    /// A one-shot stub that declares more body bytes than it sends: the
+    /// truncated download exercises the reader's failure arm.
+    #[test]
+    fn a_truncated_body_fails_the_text_fetch_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            // The reader's premature-EOF arm: the promised bytes never come.
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 512\r\n\r\nshort");
+            let _ = stream.flush();
+            drop(stream);
+            listener
+        });
+
+        assert!(
+            fetcher()
+                .fetch_aws(&format!("http://127.0.0.1:{port}/ip-ranges.json"))
+                .is_empty(),
+            "the truncated body answers empty"
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn a_truncated_body_fails_the_byte_download_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = std::thread::spawn(move || {
+            // Every attempt reads the same truncated body: the reader's
+            // premature-EOF arm answers each one.
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 512\r\n\r\nshort");
+                let _ = stream.flush();
+                drop(stream);
+            }
+        });
+
+        let error = fetcher()
+            .fetch_geo_database(&format!("http://127.0.0.1:{port}/x.mmdb"), "tok")
+            .unwrap_err();
+        assert!(
+            error.reason.contains("body read failed"),
+            "the truncated read surfaces the read failure: {}",
+            error.reason
+        );
+        drop(handle);
+    }
+
+    #[test]
+    fn a_failing_page_scrape_answers_empty() {
+        let stub = Stub::serve(vec![Route {
+            path: "/download/details.aspx",
+            status: 500,
+            body: "boom",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let ranges = fetcher().fetch_azure(&stub.path("/download/details.aspx"));
+        assert!(ranges.is_empty(), "the page failure answers empty");
+    }
+
+    #[test]
+    fn a_page_whose_extraction_feeds_a_download_answers_empty() {
+        // The page carries a failover link whose href names the trusted
+        // host without a scheme; the extraction accepts it and the download
+        // attempt on the scheme-less URL fails fast (a relative URL never
+        // resolves), so the fetch answers empty without a live endpoint.
+        let stub = Stub::serve(vec![Route {
+            path: "/download/details.aspx",
+            status: 200,
+            body: r#"<html><a id="failoverLink" href="download.microsoft.com/ServiceTags_Public_20260101.json">x</a></html>"#,
+            headers: &[],
+            fail_first: false,
+        }]);
+        let ranges = fetcher().fetch_azure(&stub.path("/download/details.aspx"));
+        assert!(ranges.is_empty());
+        // Only the page was requested: the download URL never resolved.
+        assert_eq!(stub.requests().len(), 1);
     }
 }

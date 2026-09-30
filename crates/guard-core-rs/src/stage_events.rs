@@ -499,4 +499,35 @@ mod tests {
         assert_eq!(events[1].metadata["filter_type"], "global");
         assert_eq!(events[1].metadata["user_agent"], "bot/1.0");
     }
+
+    #[test]
+    fn the_sink_reports_installation_and_renders_debug() {
+        let bare = StageEventSink::default();
+        assert!(!bare.is_installed(), "no hook, no bus: nothing observes");
+        assert!(format!("{bare:?}").starts_with("StageEventSink"));
+
+        let (sink, _recorded) = sink_with_hook();
+        assert!(sink.is_installed(), "a hook alone counts as installed");
+    }
+
+    #[test]
+    fn passive_cloud_and_ua_events_flip_to_logged_only_and_cloud_skips_metadata() {
+        let (log, bus) = bus_recorder();
+        let sink = bus_sink(bus);
+
+        // A passive cloud block: the event flips to logged_only, and a
+        // match without network metadata carries none.
+        emit_cloud_block(&sink, Some("GCP"), None, "192.0.2.9", true);
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action_taken, "logged_only");
+        assert_eq!(events[0].metadata["cloud_provider"], "GCP");
+        assert!(events[0].metadata.get("network").is_none());
+
+        // A passive user-agent block flips the same way.
+        emit_user_agent_block(&sink, false, "bot/1.0", "192.0.2.9", true);
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].action_taken, "logged_only");
+    }
 }

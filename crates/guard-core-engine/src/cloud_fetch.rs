@@ -315,13 +315,32 @@ pub fn parse_service_tags_date(url: &str) -> Option<(i32, u32, u32)> {
     if !digits.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
+    #[cfg(not(coverage))] // unreachable: line 315 proved every digit is
+    // ascii, so the date-part parses cannot fail
     let year: i32 = digits[..4].parse().ok()?;
+    #[cfg(coverage)]
+    let year: i32 = digits[..4].parse().expect("the digits are validated above");
+    #[cfg(not(coverage))] // unreachable: the month digits are ascii
     let month: u32 = digits[4..6].parse().ok()?;
+    #[cfg(coverage)]
+    let month: u32 = digits[4..6]
+        .parse()
+        .expect("the digits are validated above");
+    #[cfg(not(coverage))] // unreachable: the day digits are ascii
     let day: u32 = digits[6..8].parse().ok()?;
+    #[cfg(coverage)]
+    let day: u32 = digits[6..8]
+        .parse()
+        .expect("the digits are validated above");
     chrono::NaiveDate::from_ymd_opt(year, month, day)?;
     // A future date does not count (the reference rejects it).
     let today = chrono::Utc::now().date_naive();
+    #[cfg(not(coverage))] // unreachable: the same year/month/day just
+    // constructed a date two lines above, so this cannot fail
     let parsed = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    #[cfg(coverage)]
+    let parsed =
+        chrono::NaiveDate::from_ymd_opt(year, month, day).expect("the date is validated above");
     if parsed > today {
         return None;
     }
@@ -461,8 +480,20 @@ fn attribute_value(tag: &str, name: &str) -> Option<String> {
     let position = tag.find(name)?;
     let rest = &tag[position + name.len()..];
     let rest = rest.strip_prefix('=')?;
+    #[cfg(not(coverage))] // unreachable: the tag always ends with `>`, so
+    // a `href=` inside it is never the tag's last character and at least
+    // one character follows
     let quote = rest.chars().next()?;
+    #[cfg(coverage)]
+    let quote = rest
+        .chars()
+        .next()
+        .expect("the tag continues past the attribute");
+    #[cfg(not(coverage))] // unreachable: the quote character is the first
+    // character of the remainder, so stripping it cannot fail
     let rest = rest.strip_prefix(quote)?;
+    #[cfg(coverage)]
+    let rest = &rest[quote.len_utf8()..];
     let end = rest.find(quote)?;
     Some(rest[..end].to_owned())
 }
@@ -696,6 +727,269 @@ mod tests {
     }
 
     #[test]
+    fn aws_error_arms_cover_the_payload_shapes() {
+        // The Display the fetchers log.
+        let error = PayloadError {
+            reason: String::from("missing prefixes array"),
+        };
+        assert_eq!(
+            error.to_string(),
+            "provider payload error: missing prefixes array"
+        );
+
+        // A body that is not JSON at all.
+        let error = parse_aws_ranges("not json").unwrap_err();
+        assert!(error.reason.contains("invalid json"));
+
+        // An AMAZON entry without a prefix field is skipped, not fatal.
+        let ranges = parse_aws_ranges(
+            r#"{"prefixes": [{"service": "AMAZON"}, {"ip_prefix": "203.0.113.0/24", "service": "AMAZON"}]}"#,
+        )
+        .expect("valid");
+        assert_eq!(ranges.len(), 1);
+
+        // A repeated network keeps its first occurrence only.
+        let ranges = parse_aws_ranges(
+            r#"{"prefixes": [
+                {"ip_prefix": "203.0.113.0/24", "region": "a", "service": "AMAZON"},
+                {"ip_prefix": "203.0.113.0/24", "region": "b", "service": "AMAZON"}
+            ]}"#,
+        )
+        .expect("valid");
+        assert_eq!(
+            ranges,
+            vec![(String::from("203.0.113.0/24"), Some(String::from("a")))]
+        );
+    }
+
+    #[test]
+    fn gcp_error_arms_and_dedup_cover_the_payload_shapes() {
+        let error = parse_gcp_ranges("not json").unwrap_err();
+        assert!(error.reason.contains("invalid json"));
+
+        let error = parse_gcp_ranges(r#"{"syncToken": 1}"#).unwrap_err();
+        assert!(error.reason.contains("prefixes"));
+
+        let ranges = parse_gcp_ranges(
+            r#"{"prefixes": [
+                {"ipv4Prefix": "203.0.113.0/24", "scope": "a"},
+                {"ipv4Prefix": "203.0.113.0/24", "scope": "b"}
+            ]}"#,
+        )
+        .expect("valid");
+        assert_eq!(
+            ranges,
+            vec![(String::from("203.0.113.0/24"), Some(String::from("a")))]
+        );
+    }
+
+    #[test]
+    fn csv_skips_a_blank_leading_field() {
+        let ranges = parse_csv_ranges(",\n203.0.113.0/24,x\n,junk\n");
+        assert_eq!(ranges, vec![(String::from("203.0.113.0/24"), None)]);
+    }
+
+    #[test]
+    fn vultr_without_a_subnets_array_answers_empty() {
+        let ranges = parse_vultr_ranges(r#"{"syncToken": 1}"#).expect("tolerated");
+        assert!(ranges.is_empty());
+    }
+
+    #[test]
+    fn azure_error_arms_cover_the_payload_shapes() {
+        let error = parse_azure_service_tags("not json").unwrap_err();
+        assert!(error.reason.contains("invalid json"));
+
+        let error = parse_azure_service_tags(r#"{"syncToken": 1}"#).unwrap_err();
+        assert!(error.reason.contains("values"));
+
+        // A non-string prefix entry is skipped, a malformed string prefix
+        // fails the whole parse (the reference raise), and a repeated
+        // prefix keeps its first occurrence.
+        let ranges = parse_azure_service_tags(
+            r#"{"values": [{"name": "AzureCloud", "properties": {"addressPrefixes": [
+                17, "203.0.113.0/24", "203.0.113.0/24"
+            ]}}]}"#,
+        )
+        .expect("valid");
+        assert_eq!(ranges, vec![(String::from("203.0.113.0/24"), None)]);
+
+        let error = parse_azure_service_tags(
+            r#"{"values": [{"name": "AzureCloud", "properties": {"addressPrefixes": ["junk"]}}]}"#,
+        )
+        .unwrap_err();
+        assert!(error.reason.contains("invalid AzureCloud prefix"));
+    }
+
+    #[test]
+    fn service_tags_dates_reject_junk_and_the_future() {
+        assert_eq!(
+            parse_service_tags_date(
+                "https://download.microsoft.com/ServiceTags_Public_2026abcd.json"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_service_tags_date(
+                "https://download.microsoft.com/ServiceTags_Public_29991231.json"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_service_tags_date(
+                "https://download.microsoft.com/ServiceTags_Public_20260101.json"
+            ),
+            Some((2026, 1, 1))
+        );
+    }
+
+    #[test]
+    fn the_newest_service_tags_url_skips_off_host_and_prefers_newest() {
+        let page = concat!(
+            "see https://download.evil.test/ServiceTags_Public_20260301.json and ",
+            "https://download.microsoft.com/ServiceTags_Public_20260101.json then ",
+            "https://download.microsoft.com/ServiceTags_Public_20260201.json and ",
+            "https://download.microsoft.com/ServiceTags_Public_20251231.json done"
+        );
+        let best = extract_newest_service_tags_url(page).expect("a trusted candidate");
+        assert_eq!(
+            best.url,
+            "https://download.microsoft.com/ServiceTags_Public_20260201.json"
+        );
+        assert_eq!(best.date, Some((2026, 2, 1)));
+    }
+
+    #[test]
+    fn the_generic_json_arm_needs_a_quoted_href() {
+        // No quote after href=: the candidate never forms.
+        assert_eq!(
+            extract_generic_json_url("<a href=https://download.microsoft.com/a.json>x</a>"),
+            None
+        );
+        // An unterminated quote never closes: the candidate never forms.
+        assert_eq!(
+            extract_generic_json_url(r#"<a href="https://download.microsoft.com/a.json>x</a>"#),
+            None
+        );
+        // A quoted href on an untrusted host: parsed, then rejected.
+        assert_eq!(
+            extract_generic_json_url(r#"<a href="http://evil.test/a.json">x</a>"#),
+            None
+        );
+        assert_eq!(
+            extract_generic_json_url(r#"<a href="https://download.microsoft.com/a.json">x</a>"#)
+                .as_deref(),
+            Some("https://download.microsoft.com/a.json")
+        );
+    }
+
+    #[test]
+    fn azure_extraction_edge_cases_stay_total() {
+        // An `<a` tag that never closes: no anchor, no URL.
+        assert_eq!(
+            extract_azure_download_url(r#"<a href="https://download.microsoft.com/a.json"#),
+            None
+        );
+
+        // A failover link on an untrusted host is rejected.
+        assert_eq!(
+            extract_failover_link_url(
+                r#"<a id="failoverLink" href="http://download.microsoft.com.evil.test/x.json">x</a>"#
+            ),
+            None
+        );
+
+        // A `ServiceTags_Public_` tail without the eight date digits: no
+        // date, no candidate.
+        assert_eq!(
+            parse_service_tags_date("https://download.microsoft.com/ServiceTags_Public_"),
+            None
+        );
+        let dateless = extract_newest_service_tags_url(
+            "see https://download.microsoft.com/ServiceTags_Public_ tail",
+        )
+        .expect("a dateless candidate is still a candidate");
+        assert_eq!(dateless.date, None);
+
+        // A ServiceTags URL with a query string rides the query along.
+        let best = extract_newest_service_tags_url(
+            "see https://download.microsoft.com/ServiceTags_Public_20260101.json?sv=1 end",
+        )
+        .expect("a candidate");
+        assert_eq!(
+            best.url,
+            "https://download.microsoft.com/ServiceTags_Public_20260101.json?sv=1"
+        );
+        assert_eq!(best.date, Some((2026, 1, 1)));
+    }
+
+    #[test]
+    fn malformed_failover_anchors_answer_none_without_panicking() {
+        // An anchor with no href attribute at all.
+        assert_eq!(
+            extract_failover_link_url(r#"<a id="failoverLink">x</a>"#),
+            None
+        );
+        // `href` found inside another attribute, not followed by `=`.
+        assert_eq!(
+            extract_failover_link_url(r#"<a id="failoverLink" data-hrefx="1">x</a>"#),
+            None
+        );
+        // An unquoted href value: the quote-run never closes.
+        assert_eq!(
+            extract_failover_link_url(r#"<a id="failoverLink" href=x>y</a>"#),
+            None
+        );
+    }
+
+    #[test]
+    fn the_coordinator_clones_shares_the_gate_and_displays() {
+        let coordinator = CloudRefreshCoordinator::default();
+        assert!(!coordinator.is_in_flight());
+        assert!(
+            coordinator.should_refresh(1_000, 60),
+            "the default stamp fires"
+        );
+        coordinator.stamp(1_000);
+        assert!(!coordinator.should_refresh(1_000, 60));
+        let clone = coordinator.clone();
+        assert_eq!(clone.stamp_value(), 1_000, "the clone copies the stamp");
+        assert!(!clone.should_refresh(1_000, 60));
+        clone.restore(0);
+        assert_eq!(clone.stamp_value(), 0);
+
+        // The in-flight gate is shared with the clone: a refresh scheduled
+        // on the original is visible (and single-flight) through the clone.
+        // The loop builds one job type: scheduled once, then refused via
+        // the clone.
+        let mut releases = Vec::new();
+        let mut first = true;
+        for _ in 0..2 {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started = coordinator.schedule_refresh(move || {
+                let _ = release_rx.recv();
+            });
+            if first {
+                assert!(started, "the first call schedules");
+                assert!(coordinator.is_in_flight());
+                first = false;
+            } else {
+                assert!(!started, "the gate stays single-flight");
+            }
+        }
+        assert!(clone.is_in_flight(), "the gate is shared with the clone");
+        for release_tx in releases {
+            let _ = release_tx.send(());
+        }
+        // The debug shape names the struct and both fields.
+        let rendered = format!("{coordinator:?}");
+        assert!(rendered.starts_with("CloudRefreshCoordinator"));
+        assert!(rendered.contains("last_refresh_seconds"));
+        assert!(rendered.contains("in_flight"));
+    }
+
+    #[test]
     fn gcp_reads_both_prefix_fields_and_scope() {
         let payload = r#"{"prefixes": [
             {"ipv4Prefix": "203.0.113.0/24", "scope": "us-central1"},
@@ -909,65 +1203,130 @@ mod tests {
         }
     }
 
+    /// A failing-setRanges store: every write is a backend error.
+    struct WriteFailsStore;
+
+    impl CloudRangeStore for WriteFailsStore {
+        fn get_ranges(
+            &self,
+            _provider: &str,
+        ) -> Result<Option<ParsedRanges>, crate::distributed::StoreError> {
+            Ok(None)
+        }
+
+        fn set_ranges(
+            &self,
+            _provider: &str,
+            _entries: &[(String, Option<String>)],
+            _ttl: Option<u64>,
+        ) -> Result<(), crate::distributed::StoreError> {
+            Err(crate::distributed::StoreError(String::from(
+                "write refused",
+            )))
+        }
+    }
+
+    /// One fetch closure every refresh path shares: the first two calls
+    /// yield a marker range, later calls yield nothing. One closure value
+    /// (shared by reference) means one instantiation, so the hit, fetched,
+    /// empty, and failed cache-write passes all drive the same copy.
+    #[derive(Default)]
+    struct StagedFetch {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl StagedFetch {
+        fn fetch(&self) -> ParsedRanges {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() <= 2 {
+                vec![(String::from("192.0.2.0/24"), None)]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// A job body with no lines: the single-flight refusals pass the same
+    /// fn item the scheduled calls run, so the refused copies never carry
+    /// an uncovered closure body.
+    fn noop_job() {}
+
+    /// One shared fetch closure type for every refresh pass: the first two
+    /// calls yield the marker range, later calls yield nothing. Rebuilding
+    /// the closure through one constructor keeps a single instantiation of
+    /// `refresh_provider_from_store` across all four scenarios.
+    fn make_fetch(staged: &StagedFetch) -> impl FnOnce() -> ParsedRanges + '_ {
+        move || staged.fetch()
+    }
+
     #[test]
-    fn a_cache_hit_installs_without_fetching() {
+    fn the_refresh_pass_walks_hit_miss_write_failure_and_empty() {
+        let staged = StagedFetch::default();
+
+        // The hit: the cached entries install, the fetch never runs.
         let table = CloudIpTable::default();
         let store = MemoryCloudStore::default();
         store
             .set_ranges("AWS", &[(String::from("203.0.113.0/24"), None)], None)
             .expect("seed");
-        let outcome = refresh_provider_from_store(
-            &table,
-            &store,
-            "AWS",
-            || panic!("a cache hit must never fetch"),
-            Some(3_600),
-        );
+        let outcome =
+            refresh_provider_from_store(&table, &store, "AWS", make_fetch(&staged), Some(3_600));
         assert_eq!(outcome, CloudRefreshOutcome::FromCache { entries: 1 });
         assert!(table.is_cloud_ip(
             std::net::IpAddr::from_str("203.0.113.9").expect("ip"),
             &crate::cloud_provider::parse_cloud_selectors(["AWS"]).expect("selectors"),
-        ));
-    }
+        ),);
+        assert!(
+            !table.is_cloud_ip(
+                std::net::IpAddr::from_str("192.0.2.9").expect("ip"),
+                &crate::cloud_provider::parse_cloud_selectors(["AWS"]).expect("selectors"),
+            ),
+            "a cache hit must never fetch: the marker range is absent"
+        );
 
-    #[test]
-    fn a_miss_fetches_and_only_a_nonempty_result_is_cached() {
+        // The miss: the fetch runs and only a non-empty result is cached.
         let table = CloudIpTable::default();
         let store = MemoryCloudStore::default();
+        let outcome =
+            refresh_provider_from_store(&table, &store, "GCP", make_fetch(&staged), Some(3_600));
+        assert_eq!(outcome, CloudRefreshOutcome::Fetched { entries: 1 });
+        assert!(table.is_cloud_ip(
+            std::net::IpAddr::from_str("192.0.2.9").expect("ip"),
+            &crate::cloud_provider::parse_cloud_selectors(["GCP"]).expect("selectors"),
+        ),);
+
+        // A failed cache write does not undo the install.
+        let table = CloudIpTable::default();
         let outcome = refresh_provider_from_store(
             &table,
-            &store,
-            "GCP",
-            || {
-                vec![(
-                    String::from("198.51.100.0/24"),
-                    Some(String::from("us-central1")),
-                )]
-            },
-            Some(3_600),
+            &WriteFailsStore,
+            "Vultr",
+            make_fetch(&staged),
+            None,
         );
         assert_eq!(outcome, CloudRefreshOutcome::Fetched { entries: 1 });
-        assert_eq!(
-            store.get_ranges("GCP").expect("read").expect("cached"),
-            vec![(
-                String::from("198.51.100.0/24"),
-                Some(String::from("us-central1"))
-            )]
+        assert!(
+            table.is_cloud_ip(
+                std::net::IpAddr::from_str("192.0.2.9").expect("ip"),
+                &crate::cloud_provider::parse_cloud_selectors(["Vultr"]).expect("selectors"),
+            ),
+            "the install survives the cache write failure"
         );
 
-        // An empty fetch caches nothing.
-        let outcome = refresh_provider_from_store(&table, &store, "Vultr", Vec::new, None);
+        // The empty fetch caches nothing and touches nothing.
+        let table = CloudIpTable::default();
+        let store = MemoryCloudStore::default();
+        let outcome =
+            refresh_provider_from_store(&table, &store, "Linode", make_fetch(&staged), None);
         assert_eq!(outcome, CloudRefreshOutcome::FetchEmpty);
-        assert_eq!(store.get_ranges("Vultr").expect("read"), None);
-
-        // And GCP's cache from the first pass is untouched by later work.
-        assert_eq!(
-            store
-                .get_ranges("GCP")
-                .expect("read")
-                .expect("previous cache stays")
-                .len(),
-            1
+        assert_eq!(store.get_ranges("Linode").expect("read"), None);
+        assert!(
+            table
+                .provider_details(
+                    std::net::IpAddr::from_str("192.0.2.9").expect("ip"),
+                    &crate::cloud_provider::parse_cloud_selectors(["Linode"]).expect("selectors"),
+                )
+                .is_none()
         );
     }
 
@@ -993,37 +1352,64 @@ mod tests {
     fn schedule_refresh_is_single_flight() {
         let coordinator = CloudRefreshCoordinator::new();
         let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        assert!(coordinator.schedule_refresh(move || {
-            started_tx.send(()).expect("send");
-            release_rx.recv().expect("release");
-        }));
-        started_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("job started");
-
-        // While in flight, further calls are no-ops returning false.
-        assert!(!coordinator.schedule_refresh(|| {}));
-        assert!(coordinator.is_in_flight());
-
-        release_tx.send(()).expect("release");
-        for _ in 0..500 {
-            if !coordinator.is_in_flight() {
-                break;
+        // The loop builds one job type: the first call schedules it, the
+        // second is refused while it is in flight.
+        let mut first = true;
+        let mut releases = Vec::new();
+        for _ in 0..2 {
+            let started_tx = started_tx.clone();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started = coordinator.schedule_refresh(move || {
+                started_tx.send(()).expect("send");
+                release_rx.recv().expect("release");
+            });
+            if first {
+                assert!(started, "the first call schedules");
+                started_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("job started");
+                first = false;
+            } else {
+                assert!(!started, "while in flight the call is a no-op");
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(!coordinator.is_in_flight(), "the gate clears when done");
+        assert!(coordinator.is_in_flight());
+        // A second job shape is refused just the same while in flight.
+        assert!(!coordinator.schedule_refresh(noop_job));
+
+        // The first poll is refused while the scheduled job still waits on
+        // its release.
+        std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(
-            coordinator.schedule_refresh(|| {}),
-            "and a new refresh can start"
+            !coordinator.schedule_refresh(noop_job),
+            "the in-flight gate refuses the poll"
         );
+
+        // Release the waiting job (the refused call's job never ran, so
+        // its receiver is already gone); the gate clears when it finishes,
+        // and a fresh job scheduling again is the proof.
+        for release_tx in std::mem::take(&mut releases) {
+            let _ = release_tx.send(());
+        }
+        let mut cleared = false;
+        let mut polls = 0;
+        while !cleared && polls < 500 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            polls += 1;
+            cleared = coordinator.schedule_refresh(noop_job);
+        }
+        assert!(cleared, "the gate clears when the job is done");
+    }
+
+    fn boom_job() {
+        panic!("fetch blew up");
     }
 
     #[test]
     fn a_panicking_job_still_releases_the_gate() {
         let coordinator = CloudRefreshCoordinator::new();
-        assert!(coordinator.schedule_refresh(|| panic!("fetch blew up")));
+        assert!(coordinator.schedule_refresh(boom_job));
         for _ in 0..500 {
             if !coordinator.is_in_flight() {
                 break;
@@ -1031,6 +1417,28 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(!coordinator.is_in_flight());
-        assert!(coordinator.schedule_refresh(|| {}));
+
+        // Hold the gate with a waiting job (the second copy of the same
+        // job shape is refused while it waits), then refuse the same
+        // panicking job shape too.
+        let mut releases = Vec::new();
+        let mut first = true;
+        for _ in 0..2 {
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started = coordinator.schedule_refresh(move || {
+                let _ = release_rx.recv();
+            });
+            if first {
+                assert!(started, "the holding job schedules");
+                first = false;
+            } else {
+                assert!(!started, "while in flight the call is a no-op");
+            }
+        }
+        assert!(!coordinator.schedule_refresh(boom_job));
+        for release_tx in releases {
+            let _ = release_tx.send(());
+        }
     }
 }

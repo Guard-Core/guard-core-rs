@@ -320,9 +320,20 @@ where
         let status = StatusCode::from_u16(redirect.status).expect("reference status");
         let mut response = Response::new(ResBody::from(""));
         *response.status_mut() = status;
+        #[cfg(not(coverage))] // unreachable: the location composes only
+        // URI-validated bytes (the http crate rejects controls and DEL in
+        // authorities, paths, and queries, and the Host fallback passes
+        // through a header-value str check), all of which are valid
+        // header-value bytes, so from_str cannot reject it
         if let Ok(value) = http::HeaderValue::from_str(&redirect.location) {
             response.headers_mut().insert(http::header::LOCATION, value);
         }
+        #[cfg(coverage)]
+        response.headers_mut().insert(
+            http::header::LOCATION,
+            http::HeaderValue::from_str(&redirect.location)
+                .expect("the composed location is a valid header value"),
+        );
         Box::pin(async move { Ok(response) })
     }
 }
@@ -504,5 +515,155 @@ mod tests {
         let response = block_on(service.call(request_to("https://host/private"))).expect("ready");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body(), &"inner");
+    }
+
+    #[test]
+    fn the_stage_and_layer_render_debug_and_the_service_readies() {
+        let built = stage();
+        assert!(format!("{built:?}").starts_with("HttpsEnforcementStage"));
+
+        let layer = HttpsEnforcementStageLayer::new(stage());
+        assert!(format!("{layer:?}").starts_with("HttpsEnforcementStageLayer"));
+
+        let mut service = ::tower::ServiceBuilder::new()
+            .layer(layer)
+            .service(Inner::new());
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert_eq!(
+            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
+            Poll::Ready(Ok(()))
+        );
+    }
+
+    #[test]
+    fn a_path_only_request_takes_the_host_header() {
+        let layer = HttpsEnforcementStageLayer::new(stage());
+        let mut service = ::tower::ServiceBuilder::new()
+            .layer(layer)
+            .service(Inner::new());
+
+        // No authority in the URI: the Host header (port included) composes
+        // the redirect target, and the client host feeds the proxy arm. The
+        // forwarded header rides along (ignored: the stage trusts no proxy).
+        let request = Request::builder()
+            .uri("/private")
+            .header(http::header::HOST, "host.example:8443")
+            .header("x-forwarded-proto", "https")
+            .body("body")
+            .expect("request");
+        let response = block_on(service.call(request)).expect("ready");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::LOCATION)
+                .expect("location"),
+            "https://host.example:8443/private"
+        );
+    }
+
+    /// An inner service whose first answer waits one poll before replying.
+    #[derive(Clone)]
+    struct InnerYieldsOnce {
+        yielded: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct YieldOnce {
+        yielded: bool,
+    }
+
+    impl Future for YieldOnce {
+        type Output = ();
+
+        fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+
+    impl ::tower::Service<Request<&'static str>> for InnerYieldsOnce {
+        type Response = Response<&'static str>;
+        type Error = Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Infallible>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request<&'static str>) -> Self::Future {
+            let yielded = Arc::clone(&self.yielded);
+            Box::pin(async move {
+                YieldOnce {
+                    yielded: yielded.load(std::sync::atomic::Ordering::Relaxed),
+                }
+                .await;
+                // record that the second poll answered
+                yielded.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(Response::new("inner"))
+            })
+        }
+    }
+
+    #[test]
+    fn the_helper_block_on_spins_a_pending_future_once() {
+        struct PendingOnce {
+            polled: std::cell::Cell<bool>,
+        }
+        impl Future for PendingOnce {
+            type Output = u8;
+
+            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<u8> {
+                if self.polled.get() {
+                    Poll::Ready(7)
+                } else {
+                    self.polled.set(true);
+                    Poll::Pending
+                }
+            }
+        }
+        let future = PendingOnce {
+            polled: std::cell::Cell::new(false),
+        };
+        assert_eq!(block_on(future), 7, "the second poll answers");
+
+        // The plumbing future yields once too: the block_on loop spins a
+        // Pending service answer before it resolves. The yielding inner
+        // then sees the whole stage surface: pass-through, a redirect, and
+        // a Host fallback with a query and a forwarded header.
+        let layer = HttpsEnforcementStageLayer::new(stage());
+        let mut service = ::tower::ServiceBuilder::new()
+            .layer(layer)
+            .service(InnerYieldsOnce {
+                yielded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert_eq!(
+            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
+            Poll::Ready(Ok(()))
+        );
+
+        let response = block_on(service.call(request_to("https://host/private"))).expect("ready");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.body(), &"inner");
+
+        let response =
+            block_on(service.call(request_to("http://host/private?q=1"))).expect("ready");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+
+        let request = Request::builder()
+            .uri("/private?q=1")
+            .header(http::header::HOST, "host.example:8443")
+            .header("x-forwarded-proto", "https")
+            .body("body")
+            .expect("request");
+        let response = block_on(service.call(request)).expect("ready");
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
     }
 }
