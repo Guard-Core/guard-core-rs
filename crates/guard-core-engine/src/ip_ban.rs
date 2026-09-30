@@ -526,8 +526,8 @@ impl IpBanManager {
     ///
     /// # Errors
     ///
-    /// [`StoreError`] when the distributed lookup fails and the local
-    /// cache holds no live answer.
+    /// [`crate::distributed::StoreError`] when the distributed lookup
+    /// fails and the local cache holds no live answer.
     pub fn try_is_banned(&self, ip: IpAddr) -> Result<bool, crate::distributed::StoreError> {
         let ip = canonical(ip);
         let now = (self.clock)();
