@@ -62,7 +62,7 @@ jobs:
       - name: Run AI inference
         id: inference
         if: steps.target.outputs.skip != 'true'
-        uses: actions/ai-inference@b81b2afb8390ee6839b494a404766bef6493c7d9 # v1.2.8
+        uses: actions/ai-inference@a7805884c80886efc241e94a5351df715968a0ad # v2.1.1
         with:
           prompt: |
             You are an assistant that summarizes a GitHub issue for maintainers of the `guard-core-rs` Rust crate (a framework-agnostic application-layer API security engine; Rust port of the `guard-core` Python engine).
