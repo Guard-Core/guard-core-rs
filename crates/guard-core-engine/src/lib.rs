@@ -19,6 +19,7 @@ pub mod multipart_scan;
 pub mod patterns;
 pub mod preprocessor;
 pub mod rate_limit;
+pub mod redis_schema;
 pub mod referrer;
 pub mod request_limits;
 pub mod request_logging;
