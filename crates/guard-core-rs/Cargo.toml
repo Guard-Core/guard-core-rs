@@ -20,7 +20,7 @@ http              = "1.3"
 serde_json        = { workspace = true }
 tower             = { version = "0.5", default-features = false }
 ureq              = { version = "2.10", default-features = false, features = ["tls", "gzip"] }
-redis             = { version = "0.27", optional = true, default-features = false, features = ["acl"] }
+redis             = { version = "1.7", optional = true, default-features = false, features = ["acl"] }
 
 [features]
 # The Redis-backed distributed store (the reference `enable_redis`
