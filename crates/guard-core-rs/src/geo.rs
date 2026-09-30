@@ -145,6 +145,7 @@ pub struct GeoDecision {
 pub struct GeoStage {
     config: GeoStageConfig,
     extract_ip: ExtractIp,
+    event_sink: Option<crate::stage_events::StageEventSink>,
 }
 
 impl fmt::Debug for GeoStage {
@@ -162,6 +163,7 @@ impl GeoStage {
         Self {
             config,
             extract_ip: Arc::new(default_extract_ip),
+            event_sink: None,
         }
     }
 
@@ -171,6 +173,7 @@ impl GeoStage {
         GeoStageBuilder {
             config,
             extract_ip: None,
+            event_sink: None,
         }
     }
 
@@ -193,24 +196,42 @@ impl GeoStage {
         let handler = NoopHandler(self.config.handler.as_deref());
         if let Some(ip) = ip {
             let block = check_countries(ip, &self.config.gate, &handler, false)?;
-            return self.answer(block);
+            return self.answer(block, Some(ip));
         }
         // No client identity: the reference `_check_unknown_identity_access`
         // reading - a restrictive whitelist blocks the unidentifiable.
         if self.config.gate.whitelist_countries.is_empty() {
             return None;
         }
-        self.answer(CountryBlock {
-            country: None,
-            // `ip` in the reference reason is the UNKNOWN_CLIENT_IDENTITY
-            // sentinel string.
-            reason: generic_list_block_reason_for(UNKNOWN_CLIENT_IP),
-        })
+        self.answer(
+            CountryBlock {
+                country: None,
+                // `ip` in the reference reason is the UNKNOWN_CLIENT_IDENTITY
+                // sentinel string.
+                reason: generic_list_block_reason_for(UNKNOWN_CLIENT_IP),
+            },
+            None,
+        )
     }
 
     /// The block answer, or `None` under passive mode: the reference's
     /// passive geo path logs the country match and lets the request pass.
-    fn answer(&self, block: CountryBlock) -> Option<GeoDecision> {
+    fn answer(&self, block: CountryBlock, ip: Option<IpAddr>) -> Option<GeoDecision> {
+        if let Some(sink) = &self.event_sink {
+            let rule = if self.config.gate.whitelist_countries.is_empty() {
+                crate::stage_events::CountryRule::Blacklist
+            } else {
+                crate::stage_events::CountryRule::Whitelist
+            };
+            crate::stage_events::emit_geo_block(
+                sink,
+                &block.reason,
+                block.country.as_deref(),
+                rule,
+                &ip.map_or_else(String::new, |addr| addr.to_string()),
+                self.config.passive_mode,
+            );
+        }
         if self.config.passive_mode {
             return None;
         }
@@ -245,6 +266,7 @@ impl GeoIpHandler for NoopHandler<'_> {
 pub struct GeoStageBuilder {
     config: GeoStageConfig,
     extract_ip: Option<ExtractIp>,
+    event_sink: Option<crate::stage_events::StageEventSink>,
 }
 
 impl GeoStageBuilder {
@@ -257,6 +279,13 @@ impl GeoStageBuilder {
         self
     }
 
+    /// Install the stage event sink (the `country_blocked` event and the
+    /// `ip_security` block payload).
+    pub fn event_sink(mut self, sink: crate::stage_events::StageEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
     /// Build the stage.
     #[must_use]
     pub fn build(self) -> GeoStage {
@@ -264,6 +293,7 @@ impl GeoStageBuilder {
         if let Some(extract_ip) = self.extract_ip {
             stage.extract_ip = extract_ip;
         }
+        stage.event_sink = self.event_sink;
         stage
     }
 }
