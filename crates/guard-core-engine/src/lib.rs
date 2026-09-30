@@ -18,6 +18,7 @@ pub mod ip_gate;
 pub mod json_walk;
 pub mod multipart_scan;
 pub mod patterns;
+pub mod performance_monitor;
 pub mod preprocessor;
 pub mod rate_limit;
 pub mod redis_schema;

@@ -80,6 +80,7 @@ pub mod request_limits;
 pub mod request_logging;
 pub mod responses;
 pub mod route_gates;
+pub mod stage_events;
 pub mod tower;
 pub mod user_agent;
 

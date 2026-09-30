@@ -133,6 +133,7 @@ pub struct UserAgentStage {
     bans: IpBanManager,
     counters: ViolationCounters,
     extract_ip: ExtractIp,
+    event_sink: Option<crate::stage_events::StageEventSink>,
 }
 
 impl fmt::Debug for UserAgentStage {
@@ -167,6 +168,7 @@ impl UserAgentStage {
             counters: None,
             clock: None,
             extract_ip: None,
+            event_sink: None,
         }
     }
 
@@ -218,6 +220,15 @@ impl UserAgentStage {
         if !route_blocked && !self.config.blocked_user_agents.is_blocked(agent) {
             return None;
         }
+        if let Some(sink) = &self.event_sink {
+            crate::stage_events::emit_user_agent_block(
+                sink,
+                route_blocked,
+                agent,
+                &ip.map_or_else(String::new, |addr| addr.to_string()),
+                self.config.passive_mode,
+            );
+        }
         if self.config.passive_mode {
             // Log-only: the reference's passive path emits the block events
             // and returns None - no ban feed, no 403.
@@ -258,6 +269,7 @@ pub struct UserAgentStageBuilder {
     counters: Option<ViolationCounters>,
     clock: Option<Clock>,
     extract_ip: Option<ExtractIp>,
+    event_sink: Option<crate::stage_events::StageEventSink>,
 }
 
 impl UserAgentStageBuilder {
@@ -293,6 +305,13 @@ impl UserAgentStageBuilder {
         self
     }
 
+    /// Install the stage event sink (the `user_agent_blocked` /
+    /// `decorator_violation` events and the `user_agent` block payload).
+    pub fn event_sink(mut self, sink: crate::stage_events::StageEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
     /// Validate everything and build the stage.
     ///
     /// # Errors
@@ -317,6 +336,7 @@ impl UserAgentStageBuilder {
             extract_ip: self
                 .extract_ip
                 .unwrap_or_else(|| Arc::new(default_extract_ip)),
+            event_sink: self.event_sink,
         })
     }
 }
@@ -935,5 +955,62 @@ mod tests {
         );
         assert_eq!(answer.expect("blocked").body, USER_AGENT_BLOCKED_BODY);
         assert!(stage.bans().is_banned(ip("192.0.2.7")));
+    }
+}
+
+#[cfg(test)]
+mod event_sink_tests {
+    use super::*;
+    use std::str::FromStr;
+    use std::sync::Mutex;
+
+    use crate::redact::SensitiveNames;
+    use crate::stage_events::StageEventSink;
+
+    type BlockLog = Arc<Mutex<Vec<(String, String, Option<u16>)>>>;
+
+    #[test]
+    fn a_blocked_agent_fires_the_event_stream_through_the_sink() {
+        let seen: BlockLog = Arc::new(Mutex::new(Vec::new()));
+        let reader = Arc::clone(&seen);
+        let hook: crate::responses::OnBlockHook = Arc::new(move |payload| {
+            reader.lock().expect("reader").push((
+                payload.check_name.clone(),
+                payload.reason.clone(),
+                payload.status_code,
+            ));
+        });
+        let config = UserAgentStageConfig {
+            blocked_user_agents: UserAgentFilter::new(["badbot"]).expect("valid patterns"),
+            ..UserAgentStageConfig::default()
+        };
+        let stage = UserAgentStage::builder(config)
+            .event_sink(StageEventSink::new(
+                Some(hook),
+                None,
+                SensitiveNames::default(),
+            ))
+            .build()
+            .expect("valid");
+
+        let ip = std::net::IpAddr::from_str("192.0.2.9").expect("ip");
+        let answer = stage.decide(Some(ip), None, None, Some("badbot/1.0"), None);
+        assert!(answer.is_some(), "the bad agent is blocked");
+        {
+            let blocks = seen.lock().expect("reader").clone();
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].0, "user_agent");
+            assert_eq!(blocks[0].1, "Blocked user agent: badbot/1.0");
+            assert_eq!(blocks[0].2, Some(403));
+        }
+
+        // A clean agent emits nothing.
+        seen.lock().expect("reader").clear();
+        assert!(
+            stage
+                .decide(Some(ip), None, None, Some("nice-browser/2.0"), None)
+                .is_none()
+        );
+        assert!(seen.lock().expect("reader").is_empty());
     }
 }
