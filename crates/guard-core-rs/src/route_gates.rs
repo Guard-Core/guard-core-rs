@@ -55,10 +55,70 @@ use guard_core_engine::time_window::{
     self, TIME_WINDOW_BLOCK_BODY, TIME_WINDOW_BLOCK_STATUS, TIME_WINDOW_CHECK_NAME, TimeWindow,
 };
 
+use crate::event_types::EVENT_DECORATOR_VIOLATION;
+use crate::events::{MIDDLEWARE_HANDLER_NAME, SecurityEvent, SecurityEventBus};
 use crate::redact::SensitiveNames;
 use crate::responses::{
     CustomErrorResponses, OnBlockHook, build_block_payload, fire_block_hook, resolve_error_body,
 };
+
+/// The decorator-violation emission both gates share
+/// (`emit_access_denied_event` / `emit_decorator_event`): the reference
+/// event fires in both modes with the action flipping to `logged_only`
+/// under passive mode, `decorator_type` on its envelope field and in the
+/// metadata, and the per-check kwargs riding the metadata.
+struct DecoratorViolation<'a> {
+    /// Why, the reference reason string.
+    reason: &'a str,
+    /// The resolved client identity.
+    client_ip: &'a str,
+    /// The request path for the envelope's `endpoint`.
+    path: &'a str,
+    /// The request method.
+    method: &'a str,
+    /// The decorator kind (`content_filtering`, `advanced`).
+    decorator_type: &'a str,
+    /// The rule kind (`require_referrer`, `time_restriction`).
+    violation_type: &'a str,
+    /// The per-check metadata kwargs.
+    extra: Vec<(&'static str, serde_json::Value)>,
+}
+
+fn send_decorator_violation(
+    events: Option<&Arc<SecurityEventBus>>,
+    passive: bool,
+    violation: &DecoratorViolation<'_>,
+) {
+    let Some(bus) = events else {
+        return;
+    };
+    let mut event = SecurityEvent::new(
+        EVENT_DECORATOR_VIOLATION,
+        violation.client_ip,
+        if passive {
+            "logged_only"
+        } else {
+            "request_blocked"
+        },
+        violation.reason,
+        MIDDLEWARE_HANDLER_NAME,
+    );
+    event.decorator_type = Some(violation.decorator_type.to_owned());
+    event.metadata.insert(
+        String::from("decorator_type"),
+        serde_json::json!(violation.decorator_type),
+    );
+    event.metadata.insert(
+        String::from("violation_type"),
+        serde_json::json!(violation.violation_type),
+    );
+    for (key, value) in &violation.extra {
+        event.metadata.insert(String::from(*key), value.clone());
+    }
+    event.endpoint = Some(violation.path.to_owned());
+    event.method = Some(violation.method.to_owned());
+    bus.send_event(&event);
+}
 
 /// How the stage learns a path's `require_referrer` list (the reference
 /// reads it from `request.state.route_config`). `None` (no entry) means
@@ -94,6 +154,7 @@ pub struct ReferrerStage {
     on_block: Option<OnBlockHook>,
     custom_error_responses: CustomErrorResponses,
     sensitive: Arc<SensitiveNames>,
+    events: Option<Arc<SecurityEventBus>>,
 }
 
 impl fmt::Debug for ReferrerStage {
@@ -110,6 +171,7 @@ pub struct ReferrerStageBuilder {
     on_block: Option<OnBlockHook>,
     custom_error_responses: CustomErrorResponses,
     sensitive: SensitiveNames,
+    events: Option<Arc<SecurityEventBus>>,
 }
 
 impl ReferrerStage {
@@ -122,6 +184,7 @@ impl ReferrerStage {
             on_block: None,
             custom_error_responses: CustomErrorResponses::new(),
             sensitive: SensitiveNames::default(),
+            events: None,
         }
     }
 
@@ -143,12 +206,13 @@ impl ReferrerStage {
         if allowed.is_empty() {
             return None;
         }
-        let (reason, status, body) = match referrer::decide(referer, &allowed) {
+        let (reason, status, body, extra) = match referrer::decide(referer, &allowed) {
             ReferrerVerdict::Allowed => return None,
             ReferrerVerdict::Missing => (
                 String::from("Missing referrer header"),
                 referrer::REFERRER_MISSING_STATUS,
                 referrer::REFERRER_MISSING_BODY,
+                Vec::new(),
             ),
             ReferrerVerdict::Invalid { referrer } => {
                 let redacted = crate::redact::redact_url_for_display(&referrer, &self.sensitive);
@@ -156,9 +220,25 @@ impl ReferrerStage {
                     format!("Referrer '{redacted}' not in allowed domains"),
                     referrer::REFERRER_INVALID_STATUS,
                     referrer::REFERRER_INVALID_BODY,
+                    vec![("referrer", serde_json::json!(redacted))],
                 )
             }
         };
+        let mut metadata_extra = extra;
+        metadata_extra.push(("allowed_domains", serde_json::json!(allowed)));
+        send_decorator_violation(
+            self.events.as_ref(),
+            self.config.passive_mode,
+            &DecoratorViolation {
+                reason: &reason,
+                client_ip,
+                path: payload_path,
+                method,
+                decorator_type: "content_filtering",
+                violation_type: "require_referrer",
+                extra: metadata_extra,
+            },
+        );
         self.answer(
             REFERRER_CHECK_NAME,
             &reason,
@@ -250,6 +330,14 @@ impl ReferrerStageBuilder {
         self
     }
 
+    /// Install the middleware-event bus (the reference
+    /// `decorator_violation` emission).
+    #[must_use]
+    pub fn events(mut self, bus: Arc<SecurityEventBus>) -> Self {
+        self.events = Some(bus);
+        self
+    }
+
     /// Build the stage (no validation to fail: the lists are host data).
     #[must_use]
     pub fn build(self) -> ReferrerStage {
@@ -259,6 +347,7 @@ impl ReferrerStageBuilder {
             on_block: self.on_block,
             custom_error_responses: self.custom_error_responses,
             sensitive: Arc::new(self.sensitive),
+            events: self.events,
         }
     }
 }
@@ -271,6 +360,7 @@ pub struct TimeWindowStage {
     on_block: Option<OnBlockHook>,
     custom_error_responses: CustomErrorResponses,
     sensitive: Arc<SensitiveNames>,
+    events: Option<Arc<SecurityEventBus>>,
 }
 
 impl fmt::Debug for TimeWindowStage {
@@ -287,6 +377,7 @@ pub struct TimeWindowStageBuilder {
     on_block: Option<OnBlockHook>,
     custom_error_responses: CustomErrorResponses,
     sensitive: SensitiveNames,
+    events: Option<Arc<SecurityEventBus>>,
 }
 
 impl TimeWindowStage {
@@ -299,6 +390,7 @@ impl TimeWindowStage {
             on_block: None,
             custom_error_responses: CustomErrorResponses::new(),
             sensitive: SensitiveNames::default(),
+            events: None,
         }
     }
 
@@ -336,6 +428,19 @@ impl TimeWindowStage {
         if time_window::is_within(&window, &current) {
             return None;
         }
+        send_decorator_violation(
+            self.events.as_ref(),
+            self.config.passive_mode,
+            &DecoratorViolation {
+                reason: "Access outside allowed time window",
+                client_ip,
+                path: payload_path,
+                method,
+                decorator_type: "advanced",
+                violation_type: "time_restriction",
+                extra: Vec::new(),
+            },
+        );
         self.answer(
             TIME_WINDOW_CHECK_NAME,
             "Access outside allowed time window",
@@ -426,6 +531,14 @@ impl TimeWindowStageBuilder {
         self
     }
 
+    /// Install the middleware-event bus (the reference
+    /// `decorator_violation` emission).
+    #[must_use]
+    pub fn events(mut self, bus: Arc<SecurityEventBus>) -> Self {
+        self.events = Some(bus);
+        self
+    }
+
     /// Build the stage.
     #[must_use]
     pub fn build(self) -> TimeWindowStage {
@@ -435,6 +548,7 @@ impl TimeWindowStageBuilder {
             on_block: self.on_block,
             custom_error_responses: self.custom_error_responses,
             sensitive: Arc::new(self.sensitive),
+            events: self.events,
         }
     }
 }
@@ -471,6 +585,112 @@ mod tests {
                 (path == "/embed").then(|| vec!["partner.example.com".to_owned()])
             }))
             .build()
+    }
+
+    fn recording_bus() -> (Arc<Mutex<Vec<SecurityEvent>>>, Arc<SecurityEventBus>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let bus = Arc::new(SecurityEventBus::new(true).on_event(Arc::new(
+            move |event: &SecurityEvent| {
+                sink.lock().expect("sink").push(event.clone());
+            },
+        )));
+        (log, bus)
+    }
+
+    #[test]
+    fn the_referrer_deny_fires_the_decorator_violation_with_its_metadata() {
+        let (log, bus) = recording_bus();
+        let stage = ReferrerStage::builder(GateConfig::default())
+            .resolver(Arc::new(|path| {
+                (path == "/embed").then(|| vec!["partner.example.com".to_owned()])
+            }))
+            .events(bus)
+            .build();
+        // Missing referer.
+        stage
+            .decide("/embed", None, "1.2.3.4", "/embed", "GET")
+            .expect("missing");
+        // Invalid referer.
+        stage
+            .decide(
+                "/embed",
+                Some("https://evil.test/x?token=secret"),
+                "1.2.3.4",
+                "/embed",
+                "GET",
+            )
+            .expect("invalid");
+
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "decorator_violation");
+        assert_eq!(events[0].action_taken, "request_blocked");
+        assert_eq!(events[0].reason, "Missing referrer header");
+        assert_eq!(
+            events[0].decorator_type.as_deref(),
+            Some("content_filtering")
+        );
+        assert_eq!(events[0].metadata["violation_type"], "require_referrer");
+        assert_eq!(
+            events[0].metadata["allowed_domains"],
+            serde_json::json!(["partner.example.com"])
+        );
+        assert_eq!(
+            events[1].reason,
+            "Referrer 'https://evil.test/x?token=[REDACTED]' not in allowed domains"
+        );
+        assert_eq!(
+            events[1].metadata["referrer"], "https://evil.test/x?token=[REDACTED]",
+            "the redacted referrer rides the metadata"
+        );
+    }
+
+    #[test]
+    fn passive_mode_flips_the_referrer_event_action() {
+        let (log, bus) = recording_bus();
+        let stage = ReferrerStage::builder(GateConfig { passive_mode: true })
+            .resolver(Arc::new(|path| {
+                (path == "/embed").then(|| vec!["partner.example.com".to_owned()])
+            }))
+            .events(bus)
+            .build();
+        assert!(
+            stage
+                .decide("/embed", None, "1.2.3.4", "/embed", "GET")
+                .is_none()
+        );
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action_taken, "logged_only");
+    }
+
+    #[test]
+    fn the_time_window_deny_fires_the_decorator_violation() {
+        let (log, bus) = recording_bus();
+        let stage = TimeWindowStage::builder(GateConfig::default())
+            .resolver(Arc::new(|path| {
+                (path == "/nightly").then(|| TimeWindow {
+                    start: Some(String::from("09:00")),
+                    end: Some(String::from("17:00")),
+                    timezone: None,
+                })
+            }))
+            .events(bus)
+            .build();
+        // 03:00 UTC is outside the 09:00-17:00 UTC window.
+        assert!(
+            stage
+                .decide_at("/nightly", at_utc(3, 0), "1.2.3.4", "/nightly", "GET")
+                .is_some()
+        );
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "decorator_violation");
+        assert_eq!(events[0].decorator_type.as_deref(), Some("advanced"));
+        assert_eq!(events[0].metadata["violation_type"], "time_restriction");
+        assert_eq!(events[0].reason, "Access outside allowed time window");
+        assert_eq!(events[0].action_taken, "request_blocked");
     }
 
     #[test]

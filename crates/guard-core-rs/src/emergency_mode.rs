@@ -51,6 +51,8 @@ use std::task::{Context, Poll};
 use ::tower::Layer;
 use http::{Request, Response, StatusCode};
 
+use crate::event_types::EVENT_EMERGENCY_MODE_BLOCK;
+use crate::events::{MIDDLEWARE_HANDLER_NAME, SecurityEvent, SecurityEventBus};
 use crate::redact::SensitiveNames;
 use crate::responses::{
     CustomErrorResponses, OnBlockHook, build_block_payload, fire_block_hook, resolve_error_body,
@@ -87,6 +89,7 @@ pub struct EmergencyModeStage {
     on_block: Option<OnBlockHook>,
     custom_error_responses: CustomErrorResponses,
     sensitive: Arc<SensitiveNames>,
+    events: Option<Arc<SecurityEventBus>>,
 }
 
 impl fmt::Debug for EmergencyModeStage {
@@ -105,6 +108,7 @@ pub struct EmergencyModeStageBuilder {
     on_block: Option<OnBlockHook>,
     custom_error_responses: CustomErrorResponses,
     sensitive: SensitiveNames,
+    events: Option<Arc<SecurityEventBus>>,
 }
 
 impl EmergencyModeStage {
@@ -117,6 +121,7 @@ impl EmergencyModeStage {
             on_block: None,
             custom_error_responses: CustomErrorResponses::new(),
             sensitive: SensitiveNames::default(),
+            events: None,
         }
     }
 
@@ -144,6 +149,9 @@ impl EmergencyModeStage {
             "[EMERGENCY MODE] IP {} not in whitelist",
             client_ip.unwrap_or_default()
         );
+        // The reference emits the block event in both modes, flipping the
+        // action to `logged_only` under passive mode.
+        self.observe_emergency_block(ip_for_payload, &reason, path, method);
         if self.config.passive_mode {
             // Passive mode still fires the hook, with no status code and
             // the passive flag set (the reference dispatcher shape).
@@ -185,6 +193,36 @@ impl EmergencyModeStage {
                 EMERGENCY_BLOCK_BODY,
             ),
         })
+    }
+
+    /// The block emission (`send_middleware_event` with
+    /// `EVENT_EMERGENCY_MODE_BLOCK`): the reference reason, the
+    /// whitelist size, and `emergency_active`.
+    fn observe_emergency_block(&self, ip: &str, reason: &str, path: &str, method: &str) {
+        let Some(bus) = &self.events else {
+            return;
+        };
+        let mut event = SecurityEvent::new(
+            EVENT_EMERGENCY_MODE_BLOCK,
+            ip,
+            if self.config.passive_mode {
+                "logged_only"
+            } else {
+                "request_blocked"
+            },
+            reason,
+            MIDDLEWARE_HANDLER_NAME,
+        );
+        event.endpoint = Some(path.to_owned());
+        event.method = Some(method.to_owned());
+        event.metadata.insert(
+            String::from("emergency_whitelist_count"),
+            serde_json::json!(self.whitelist.len()),
+        );
+        event
+            .metadata
+            .insert(String::from("emergency_active"), serde_json::json!(true));
+        bus.send_event(&event);
     }
 }
 
@@ -230,6 +268,14 @@ impl EmergencyModeStageBuilder {
         self
     }
 
+    /// Install the middleware-event bus
+    /// (`EVENT_EMERGENCY_MODE_BLOCK` emission).
+    #[must_use]
+    pub fn events(mut self, bus: Arc<SecurityEventBus>) -> Self {
+        self.events = Some(bus);
+        self
+    }
+
     /// Validate the whitelist and build the stage, failing closed.
     ///
     /// # Errors
@@ -245,6 +291,7 @@ impl EmergencyModeStageBuilder {
             on_block: self.on_block,
             custom_error_responses: self.custom_error_responses,
             sensitive: Arc::new(self.sensitive),
+            events: self.events,
         })
     }
 }
@@ -439,6 +486,65 @@ mod tests {
             fired.reason,
             "[EMERGENCY MODE] IP 203.0.113.9 not in whitelist"
         );
+    }
+
+    fn recording_bus() -> (Arc<Mutex<Vec<SecurityEvent>>>, Arc<SecurityEventBus>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let bus = Arc::new(SecurityEventBus::new(true).on_event(Arc::new(
+            move |event: &SecurityEvent| {
+                sink.lock().expect("sink").push(event.clone());
+            },
+        )));
+        (log, bus)
+    }
+
+    #[test]
+    fn the_block_fires_the_emergency_mode_block_event() {
+        let (log, bus) = recording_bus();
+        let stage = EmergencyModeStage::builder(EmergencyModeStageConfig {
+            emergency_mode: true,
+            passive_mode: false,
+        })
+        .emergency_whitelist(["192.0.2.40"])
+        .events(bus)
+        .build()
+        .expect("valid");
+        stage
+            .decide(Some("203.0.113.9"), "203.0.113.9", "/", "GET")
+            .expect("blocked");
+
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "emergency_mode_block");
+        assert_eq!(events[0].action_taken, "request_blocked");
+        assert_eq!(
+            events[0].reason,
+            "[EMERGENCY MODE] IP 203.0.113.9 not in whitelist"
+        );
+        assert_eq!(events[0].metadata["emergency_whitelist_count"], 1);
+        assert_eq!(events[0].metadata["emergency_active"], true);
+    }
+
+    #[test]
+    fn passive_mode_flips_the_emergency_event_action() {
+        let (log, bus) = recording_bus();
+        let stage = EmergencyModeStage::builder(EmergencyModeStageConfig {
+            emergency_mode: true,
+            passive_mode: true,
+        })
+        .emergency_whitelist(["192.0.2.40"])
+        .events(bus)
+        .build()
+        .expect("valid");
+        assert!(
+            stage
+                .decide(Some("203.0.113.9"), "203.0.113.9", "/", "GET")
+                .is_none()
+        );
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action_taken, "logged_only");
     }
 
     #[test]
