@@ -50,6 +50,10 @@ use std::task::{Context, Poll};
 use ::tower::Layer;
 use http::{Request, Response, StatusCode};
 
+use crate::event_types::{EVENT_DECORATOR_VIOLATION, EVENT_HTTPS_ENFORCED};
+use crate::events::{MIDDLEWARE_HANDLER_NAME, SecurityEvent, SecurityEventBus};
+use crate::redact::SensitiveNames;
+
 pub use guard_core_engine::https_enforcement::{
     HTTPS_ENFORCEMENT_CHECK_NAME, HTTPS_REDIRECT_STATUS,
 };
@@ -89,6 +93,8 @@ pub struct HttpsEnforcementStage {
     config: HttpsEnforcementStageConfig,
     trusted_proxies: Vec<String>,
     route_resolver: Option<RouteHttpsResolver>,
+    events: Option<Arc<SecurityEventBus>>,
+    sensitive: Arc<SensitiveNames>,
 }
 
 impl fmt::Debug for HttpsEnforcementStage {
@@ -106,6 +112,8 @@ pub struct HttpsEnforcementStageBuilder {
     config: HttpsEnforcementStageConfig,
     trusted_proxies: Vec<String>,
     route_resolver: Option<RouteHttpsResolver>,
+    events: Option<Arc<SecurityEventBus>>,
+    sensitive: SensitiveNames,
 }
 
 impl HttpsEnforcementStage {
@@ -116,6 +124,8 @@ impl HttpsEnforcementStage {
             config,
             trusted_proxies: Vec::new(),
             route_resolver: None,
+            events: None,
+            sensitive: SensitiveNames::default(),
         }
     }
 
@@ -157,18 +167,85 @@ impl HttpsEnforcementStage {
         };
         match guard_core_engine::https_enforcement::decide(&request, &engine_config) {
             guard_core_engine::https_enforcement::HttpsVerdict::Allowed => None,
-            guard_core_engine::https_enforcement::HttpsVerdict::Redirect { .. }
-                if self.config.passive_mode =>
-            {
-                None
-            }
-            guard_core_engine::https_enforcement::HttpsVerdict::Redirect { .. } => {
-                Some(HttpsRedirectAnswer {
-                    status: HTTPS_REDIRECT_STATUS,
-                    location: https_url.to_owned(),
-                })
+            guard_core_engine::https_enforcement::HttpsVerdict::Redirect { route_scoped } => {
+                // The reference emits the violation event before its
+                // passive-mode branch, so passive mode observes it too.
+                self.observe_https_violation(
+                    route_scoped,
+                    url_scheme,
+                    client_host,
+                    path,
+                    https_url,
+                );
+                if self.config.passive_mode {
+                    None
+                } else {
+                    Some(HttpsRedirectAnswer {
+                        status: HTTPS_REDIRECT_STATUS,
+                        location: https_url.to_owned(),
+                    })
+                }
             }
         }
+    }
+
+    /// The violation emission (`send_https_violation_event`): a route's
+    /// `require_https` fires `decorator_violation`
+    /// (`decorator_type` `authentication`, `violation_type`
+    /// `require_https`), the global arm fires `https_enforced`; both
+    /// carry action `https_redirect`, `original_scheme`, and the
+    /// redacted scheme-upgraded URL as `redirect_url`.
+    fn observe_https_violation(
+        &self,
+        route_scoped: bool,
+        original_scheme: &str,
+        client_host: Option<&str>,
+        path: &str,
+        https_url: &str,
+    ) {
+        let Some(bus) = &self.events else {
+            return;
+        };
+        let mut event = if route_scoped {
+            let mut event = SecurityEvent::new(
+                EVENT_DECORATOR_VIOLATION,
+                client_host.unwrap_or_default(),
+                "https_redirect",
+                "Route requires HTTPS but request was HTTP",
+                MIDDLEWARE_HANDLER_NAME,
+            );
+            event.decorator_type = Some(String::from("authentication"));
+            event.metadata.insert(
+                String::from("decorator_type"),
+                serde_json::json!("authentication"),
+            );
+            event.metadata.insert(
+                String::from("violation_type"),
+                serde_json::json!("require_https"),
+            );
+            event
+        } else {
+            SecurityEvent::new(
+                EVENT_HTTPS_ENFORCED,
+                client_host.unwrap_or_default(),
+                "https_redirect",
+                "HTTP request redirected to HTTPS for security",
+                MIDDLEWARE_HANDLER_NAME,
+            )
+        };
+        event.metadata.insert(
+            String::from("original_scheme"),
+            serde_json::json!(original_scheme),
+        );
+        event.metadata.insert(
+            String::from("redirect_url"),
+            serde_json::json!(crate::redact::redact_url_for_display(
+                https_url,
+                &self.sensitive
+            )),
+        );
+        event.endpoint = Some(crate::redact::redact_url_for_display(path, &self.sensitive));
+        bus.send_event(&event);
     }
 }
 
@@ -200,6 +277,21 @@ impl HttpsEnforcementStageBuilder {
         self
     }
 
+    /// Install the middleware-event bus (`send_https_violation_event`).
+    #[must_use]
+    pub fn events(mut self, bus: Arc<SecurityEventBus>) -> Self {
+        self.events = Some(bus);
+        self
+    }
+
+    /// Set the merged sensitive-name sets for the `redirect_url` /
+    /// `endpoint` redaction.
+    #[must_use]
+    pub fn sensitive(mut self, sensitive: SensitiveNames) -> Self {
+        self.sensitive = sensitive;
+        self
+    }
+
     /// Validate the trusted-proxy list and build the stage, failing closed.
     ///
     /// # Errors
@@ -216,6 +308,8 @@ impl HttpsEnforcementStageBuilder {
             config: self.config,
             trusted_proxies: self.trusted_proxies,
             route_resolver: self.route_resolver,
+            events: self.events,
+            sensitive: Arc::new(self.sensitive),
         })
     }
 }
@@ -260,6 +354,23 @@ pub struct HttpsEnforcementStageService<S> {
     stage: HttpsEnforcementStage,
 }
 
+/// The host half of an authority string (`host` or `host:port` or a
+/// bracketed IPv6 literal, optionally `user:pass@`-prefixed in a URI
+/// authority): the port is stripped and IPv6 brackets are removed, the
+/// bare-address shape the reference compares trusted-proxy entries
+/// against. A colon run that is not an all-digits port never splits, so
+/// a bracket-less IPv6 text survives whole.
+fn host_of_authority(value: &str) -> &str {
+    let host_port = value.rsplit('@').next().unwrap_or_default();
+    if let Some(rest) = host_port.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host_port.split_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => host_port,
+    }
+}
+
 impl<S, B, ResBody> ::tower::Service<Request<B>> for HttpsEnforcementStageService<S>
 where
     S: ::tower::Service<Request<B>, Response = Response<ResBody>>,
@@ -289,10 +400,12 @@ where
                     .map(ToOwned::to_owned)
             });
         // The connecting identity the trusted-proxy arm reads: the host
-        // half of the authority (or Host header), port stripped.
+        // half of the authority (or Host header), port stripped, IPv6
+        // brackets removed - the socket-host shape the reference's
+        // `request.client_host` carries.
         let client_host = host_and_port
             .as_deref()
-            .map(|host| host.rsplit(':').next().unwrap_or_default().to_owned());
+            .map(|value| host_of_authority(value).to_owned());
         let forwarded = request
             .headers()
             .get("x-forwarded-proto")
@@ -440,6 +553,102 @@ mod tests {
             .build()
             .unwrap_err();
         assert_eq!(error.list, "trusted_proxies");
+    }
+
+    #[test]
+    fn the_connecting_host_strips_the_port_and_the_v6_brackets() {
+        // The `client_host` the trusted-proxy arm compares must be the
+        // bare host: a port-bearing authority reads as the port string
+        // otherwise, and no proxy entry can ever match it.
+        assert_eq!(host_of_authority("10.1.2.3:8080"), "10.1.2.3");
+        assert_eq!(host_of_authority("host.example"), "host.example");
+        assert_eq!(host_of_authority("host.example:443"), "host.example");
+        assert_eq!(host_of_authority("[2001:db8::1]:8080"), "2001:db8::1");
+        assert_eq!(host_of_authority("[2001:db8::1]"), "2001:db8::1");
+        assert_eq!(host_of_authority("2001:db8::1"), "2001:db8::1");
+    }
+
+    fn recording_bus() -> (
+        Arc<std::sync::Mutex<Vec<SecurityEvent>>>,
+        Arc<SecurityEventBus>,
+    ) {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let bus = Arc::new(SecurityEventBus::new(true).on_event(Arc::new(
+            move |event: &SecurityEvent| {
+                sink.lock().expect("sink").push(event.clone());
+            },
+        )));
+        (log, bus)
+    }
+
+    #[test]
+    fn the_violation_fires_the_route_and_global_event_split() {
+        let (log, bus) = recording_bus();
+        let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+            .enforce_https(true)
+            .events(Arc::clone(&bus))
+            .build()
+            .expect("valid");
+        // The global arm fires `https_enforced`.
+        stage
+            .decide("/x", "http", None, None, "https://host.example/x")
+            .expect("redirected");
+        // The route arm fires `decorator_violation`.
+        let route_stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+            .route_resolver(Arc::new(|_: &str| Some(true)))
+            .events(bus)
+            .build()
+            .expect("valid");
+        route_stage
+            .decide("/secure", "http", None, None, "https://host.example/secure")
+            .expect("redirected");
+
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, EVENT_HTTPS_ENFORCED);
+        assert_eq!(events[0].action_taken, "https_redirect");
+        assert_eq!(
+            events[0].reason,
+            "HTTP request redirected to HTTPS for security"
+        );
+        assert_eq!(
+            events[0].metadata["original_scheme"], "http",
+            "the reference metadata rides along"
+        );
+        assert_eq!(
+            events[0].metadata["redirect_url"],
+            serde_json::json!("https://host.example/x")
+        );
+        assert_eq!(events[1].event_type, EVENT_DECORATOR_VIOLATION);
+        assert_eq!(events[1].decorator_type.as_deref(), Some("authentication"));
+        assert_eq!(events[1].metadata["violation_type"], "require_https");
+        assert_eq!(
+            events[1].reason,
+            "Route requires HTTPS but request was HTTP"
+        );
+    }
+
+    #[test]
+    fn passive_mode_still_observes_the_https_violation() {
+        // The reference emits the event before its passive-mode branch.
+        let (log, bus) = recording_bus();
+        let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig {
+            enforce_https: true,
+            passive_mode: true,
+            ..HttpsEnforcementStageConfig::default()
+        })
+        .events(bus)
+        .build()
+        .expect("valid");
+        assert!(
+            stage
+                .decide("/x", "http", None, None, "https://host/x")
+                .is_none()
+        );
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EVENT_HTTPS_ENFORCED);
     }
 
     /// The future the plumbing tests drive.

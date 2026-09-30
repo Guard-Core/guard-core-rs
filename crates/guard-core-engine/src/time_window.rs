@@ -39,7 +39,7 @@
 //! assert!(is_within(&night, "05:59"));
 //! assert!(!is_within(&night, "12:00"));
 //!
-//! // The zone resolution: 12:00 UTC is 08:00 in New York (winter).
+//! // The zone resolution: 12:00 UTC is 07:00 in New York (winter).
 //! let utc = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
 //! assert_eq!(hhmm_in_zone(utc, Some("America/New_York")), "07:00");
 //! // An unknown zone falls back to UTC.
