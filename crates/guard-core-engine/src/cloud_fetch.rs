@@ -13,8 +13,10 @@
 //!
 //! ```text
 //! AWS    json prefixes[]: entries with service == "AMAZON" only; the
-//!        ip_prefix network carries its region annotation
-//! GCP    json prefixes[]: ipv4Prefix or ipv6Prefix, scope annotation
+//!        ip_prefix network carries its region annotation; a malformed
+//!        prefix aborts the whole parse (the reference raise)
+//! GCP    json prefixes[]: ipv4Prefix or ipv6Prefix, scope annotation;
+//!        a malformed prefix aborts the whole parse (the reference raise)
 //! CSV    `DigitalOcean` / Linode: the first field per non-comment line;
 //!        invalid CIDRs are skipped, not fatal
 //! Vultr  json subnets[]: ip_prefix; invalid CIDRs are skipped
@@ -101,8 +103,10 @@ impl std::error::Error for PayloadError {}
 ///
 /// # Errors
 ///
-/// [`PayloadError`] when the body carries no `prefixes` array (the
-/// reference `data["prefixes"]` `KeyError` caught into an empty fetch).
+/// [`PayloadError`] when the body carries no `prefixes` array, or when an
+/// AMAZON entry's prefix does not parse (the reference
+/// `ipaddress.ip_network` raise aborts the whole fetch into its
+/// empty-set catch, which the refresh pass never caches).
 pub fn parse_aws_ranges(payload: &str) -> Result<ParsedRanges, PayloadError> {
     let data: serde_json::Value = serde_json::from_str(payload).map_err(|e| PayloadError {
         reason: format!("invalid json: {e}"),
@@ -123,7 +127,13 @@ pub fn parse_aws_ranges(payload: &str) -> Result<ParsedRanges, PayloadError> {
             continue;
         };
         let Some(network) = crate::redis_schema::canonical_network_string(prefix) else {
-            continue;
+            // The reference `ipaddress.ip_network(prefix)` raise aborts the
+            // whole fetch (its `except` returns an empty set, which the
+            // refresh pass never caches); a malformed entry never silently
+            // shrinks the provider's range set.
+            return Err(PayloadError {
+                reason: format!("invalid AWS prefix: {prefix}"),
+            });
         };
         let region = entry
             .get("region")
@@ -142,7 +152,9 @@ pub fn parse_aws_ranges(payload: &str) -> Result<ParsedRanges, PayloadError> {
 ///
 /// # Errors
 ///
-/// [`PayloadError`] when the body carries no `prefixes` array.
+/// [`PayloadError`] when the body carries no `prefixes` array, or when a
+/// prefix does not parse (the reference `ip_network` raise aborts the
+/// whole fetch into its empty-set catch).
 pub fn parse_gcp_ranges(payload: &str) -> Result<ParsedRanges, PayloadError> {
     let data: serde_json::Value = serde_json::from_str(payload).map_err(|e| PayloadError {
         reason: format!("invalid json: {e}"),
@@ -164,7 +176,11 @@ pub fn parse_gcp_ranges(payload: &str) -> Result<ParsedRanges, PayloadError> {
             continue;
         };
         let Some(network) = crate::redis_schema::canonical_network_string(prefix) else {
-            continue;
+            // Same abort shape as the AWS parser: the reference raise
+            // empties the whole fetch.
+            return Err(PayloadError {
+                reason: format!("invalid GCP prefix: {prefix}"),
+            });
         };
         let scope = entry
             .get("scope")
@@ -670,8 +686,7 @@ mod tests {
         let payload = r#"{"prefixes": [
             {"ip_prefix": "203.0.113.0/24", "region": "us-east-1", "service": "AMAZON"},
             {"ip_prefix": "198.51.100.0/24", "region": "eu-west-1", "service": "EC2"},
-            {"ip_prefix": "192.0.2.0/24", "region": "us-west-2", "service": "AMAZON"},
-            {"ip_prefix": "not-a-cidr", "region": "x", "service": "AMAZON"}
+            {"ip_prefix": "192.0.2.0/24", "region": "us-west-2", "service": "AMAZON"}
         ]}"#;
         let ranges = parse_aws_ranges(payload).expect("valid");
         assert_eq!(
@@ -690,6 +705,29 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_amazon_prefix_aborts_the_whole_parse() {
+        // The reference `ipaddress.ip_network(prefix)` raise empties the
+        // whole fetch, so a malformed upstream entry never silently
+        // shrinks the provider's cached range set.
+        let payload = r#"{"prefixes": [
+            {"ip_prefix": "203.0.113.0/24", "region": "us-east-1", "service": "AMAZON"},
+            {"ip_prefix": "not-a-cidr", "region": "x", "service": "AMAZON"}
+        ]}"#;
+        let error = parse_aws_ranges(payload).unwrap_err();
+        assert!(error.reason.contains("not-a-cidr"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_gcp_prefix_aborts_the_whole_parse() {
+        let payload = r#"{"prefixes": [
+            {"ipv4Prefix": "203.0.113.0/24", "scope": "us-central1"},
+            {"ipv4Prefix": "bogus", "scope": "x"}
+        ]}"#;
+        let error = parse_gcp_ranges(payload).unwrap_err();
+        assert!(error.reason.contains("bogus"), "{error}");
+    }
+
+    #[test]
     fn aws_missing_prefixes_array_is_a_payload_error() {
         let error = parse_aws_ranges(r#"{"syncToken": 1}"#).unwrap_err();
         assert!(error.reason.contains("prefixes"));
@@ -700,7 +738,6 @@ mod tests {
         let payload = r#"{"prefixes": [
             {"ipv4Prefix": "203.0.113.0/24", "scope": "us-central1"},
             {"ipv6Prefix": "2001:db8::/32", "scope": "europe-west1"},
-            {"ipv4Prefix": "bogus", "scope": "x"},
             {"scope": "no-prefix"}
         ]}"#;
         let ranges = parse_gcp_ranges(payload).expect("valid");
@@ -713,7 +750,7 @@ mod tests {
                 ),
                 (
                     String::from("2001:db8::/32"),
-                    Some(String::from("europe-west1"))
+                    Some(String::from("europe-west1")),
                 ),
             ]
         );
