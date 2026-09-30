@@ -36,9 +36,43 @@ pub fn canonicalize(value: &mut Value) {
 pub fn threat_multiset(threats: &[Value]) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for threat in threats {
-        *counts.entry(threat.to_string()).or_insert(0) += 1;
+        // The multiset key must be key-order insensitive: a parsed
+        // expectation and a constructed verdict can carry the same object
+        // under different key orders (serde_json's preserve_order keeps
+        // insertion order, so the string form follows the producer).
+        let mut normalized = threat.clone();
+        sort_object_keys(&mut normalized);
+        *counts.entry(normalized.to_string()).or_insert(0) += 1;
     }
     counts
+}
+
+/// Recursively sort every object's keys, so a serialized form is stable
+/// across producers that insert in different orders.
+pub fn sort_object_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let sorted: serde_json::Map<String, Value> = map
+                .iter()
+                .map(|(k, v)| {
+                    let mut v = v.clone();
+                    sort_object_keys(&mut v);
+                    (k.clone(), v)
+                })
+                .collect::<Vec<(String, Value)>>()
+                .into_iter()
+                .collect::<BTreeMap<String, Value>>()
+                .into_iter()
+                .collect();
+            *map = sorted;
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                sort_object_keys(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn compare_verdicts(got: &Value, want: &Value) -> Vec<String> {

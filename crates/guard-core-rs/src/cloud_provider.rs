@@ -128,6 +128,7 @@ pub struct CloudProviderStageConfig {
 pub struct CloudProviderStage {
     config: CloudProviderStageConfig,
     extract_ip: ExtractIp,
+    event_sink: Option<crate::stage_events::StageEventSink>,
 }
 
 impl fmt::Debug for CloudProviderStage {
@@ -148,6 +149,7 @@ impl CloudProviderStage {
         Self {
             config,
             extract_ip: Arc::new(default_extract_ip),
+            event_sink: None,
         }
     }
 
@@ -157,6 +159,7 @@ impl CloudProviderStage {
         CloudProviderStageBuilder {
             config,
             extract_ip: None,
+            event_sink: None,
         }
     }
 
@@ -194,6 +197,20 @@ impl CloudProviderStage {
             .config
             .table
             .provider_details(ip, &self.config.block_cloud_providers);
+        if let Some(sink) = &self.event_sink {
+            let (provider, network) = details
+                .as_ref()
+                .map_or((None, None), |(provider, network)| {
+                    (Some(provider.as_str()), Some(network.as_str()))
+                });
+            crate::stage_events::emit_cloud_block(
+                sink,
+                provider,
+                network,
+                &ip.to_string(),
+                self.config.passive_mode,
+            );
+        }
         if self.config.passive_mode {
             // Log-only: the reference's passive path emits the block events
             // and returns None.
@@ -216,6 +233,7 @@ impl CloudProviderStage {
 pub struct CloudProviderStageBuilder {
     config: CloudProviderStageConfig,
     extract_ip: Option<ExtractIp>,
+    event_sink: Option<crate::stage_events::StageEventSink>,
 }
 
 impl CloudProviderStageBuilder {
@@ -228,6 +246,13 @@ impl CloudProviderStageBuilder {
         self
     }
 
+    /// Install the stage event sink (the `cloud_blocked` event and the
+    /// `cloud_provider` block payload).
+    pub fn event_sink(mut self, sink: crate::stage_events::StageEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
+    }
+
     /// Build the stage.
     #[must_use]
     pub fn build(self) -> CloudProviderStage {
@@ -235,6 +260,7 @@ impl CloudProviderStageBuilder {
         if let Some(extract_ip) = self.extract_ip {
             stage.extract_ip = extract_ip;
         }
+        stage.event_sink = self.event_sink;
         stage
     }
 }
