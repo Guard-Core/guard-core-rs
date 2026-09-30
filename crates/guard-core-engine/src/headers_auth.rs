@@ -727,4 +727,13 @@ mod tests {
             .is_none()
         );
     }
+
+    #[test]
+    fn route_verifiers_debug_renders_the_verifier_presence() {
+        let verifiers = RouteVerifiers {
+            auth: None,
+            api_key: None,
+        };
+        assert!(format!("{verifiers:?}").contains("RouteVerifiers"));
+    }
 }

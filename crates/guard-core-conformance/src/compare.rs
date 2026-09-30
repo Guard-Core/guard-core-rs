@@ -255,3 +255,26 @@ mod tests {
         assert!(compare_verdicts(&got_canon, &want_canon).is_empty());
     }
 }
+
+#[cfg(test)]
+mod summarize_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn summarize_threats_truncates_long_patterns() {
+        let long_pattern = "a".repeat(60);
+        let threats = vec![json!({
+            "category": "sqli",
+            "pattern": long_pattern,
+            "position": 7,
+        })];
+        let summary = summarize_threats(&threats);
+        // the JSON-quoted pattern is truncated to 40 characters: the opening
+        // quote plus 39 letters
+        assert!(summary.starts_with("[\"sqli\"|"), "unexpected: {summary}");
+        assert!(summary.contains(&format!("\"{}", "a".repeat(39))));
+        assert!(!summary.contains(&"a".repeat(40)));
+        assert!(summary.ends_with("@7]"), "unexpected: {summary}");
+    }
+}

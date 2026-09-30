@@ -102,3 +102,23 @@ mod tests {
         assert_eq!(str_rfind_in("abc", "z", 0, 3), None);
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn find_from_rejects_out_of_bounds_and_snaps_forward() {
+        // past the end
+        assert_eq!(str_find_from("abc", "b", 9), None);
+        // a mid-char offset snaps to the next boundary
+        let s = "a\u{00e9}b";
+        assert_eq!(str_find_from(s, "b", 2), Some(3));
+    }
+
+    #[test]
+    fn rfind_in_rejects_empty_needles_and_bad_bounds() {
+        assert_eq!(str_rfind_in("abc", "", 0, 3), None);
+        assert_eq!(str_rfind_in("abc", "b", 9, 9), None);
+    }
+}

@@ -760,10 +760,10 @@ mod tests {
     #[test]
     fn exempt_flag_is_only_set_after_the_deny_checks_pass() {
         let gate = IpGateConfig::new(NIL, ["198.51.100.7"], ["198.51.100.7"]).unwrap();
-        match gate.evaluate(ip("198.51.100.7")) {
-            IpGateVerdict::Denied(denial) => assert_eq!(denial, IpGateDenial::Blacklisted),
-            IpGateVerdict::Allowed(_) => panic!("a blacklisted exempt IP must be denied"),
-        }
+        assert!(matches!(
+            gate.evaluate(ip("198.51.100.7")),
+            IpGateVerdict::Denied(IpGateDenial::Blacklisted)
+        ));
     }
 
     impl IpGateVerdict {
@@ -774,6 +774,14 @@ mod tests {
                 Self::Denied(denial) => denial,
             }
         }
+    }
+
+    #[test]
+    fn unwrap_denied_extracts_the_denial_reason() {
+        let gate = IpGateConfig::new(Vec::<String>::new(), ["198.51.100.7"], Vec::<String>::new())
+            .unwrap();
+        let denial = gate.evaluate(ip("198.51.100.7")).unwrap_denied();
+        assert_eq!(denial, IpGateDenial::Blacklisted);
     }
 
     #[test]
@@ -870,5 +878,13 @@ mod tests {
             RouteIpVerdict::Allowed,
             "a v4-mapped request matches its IPv4 entry"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a denial")]
+    fn unwrap_denied_panics_on_an_allowed_verdict() {
+        // the helper's contract: it is only called on denied verdicts
+        let gate = IpGateConfig::new(["198.51.100.7"], NIL, NIL).unwrap();
+        let _ = gate.evaluate(ip("198.51.100.7")).unwrap_denied();
     }
 }

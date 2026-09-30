@@ -557,3 +557,119 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+
+    fn processor(
+        rules: Vec<BehaviorRule>,
+        headers: Option<SecurityHeadersConfig>,
+        cors: Option<CorsConfig>,
+        bans: IpBanManager,
+    ) -> ResponseProcessor {
+        ResponseProcessor::new(
+            headers,
+            cors,
+            rules,
+            Arc::new(Mutex::new(BehaviorTracker::new())),
+            bans,
+            true,
+            DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        )
+    }
+
+    fn request(origin: Option<&str>) -> RequestBits {
+        RequestBits {
+            method: "GET".to_owned(),
+            url_path: "/api".to_owned(),
+            client_ip: "192.0.2.10".to_owned(),
+            origin: origin.map(ToOwned::to_owned),
+        }
+    }
+
+    fn non_return_rule() -> BehaviorRule {
+        BehaviorRule {
+            rule_type: "detection_exclusion".to_owned(),
+            threshold: 1,
+            window: 60,
+            pattern: "*".to_owned(),
+            action: "log".to_owned(),
+            ban_duration: None,
+            correlate_with_detection: false,
+        }
+    }
+
+    #[test]
+    fn a_non_return_pattern_rule_never_trips_the_processor() {
+        // the response pass only dispatches `return_pattern` rules: other
+        // rule kinds ride in the list untouched
+        let mut response = ResponseBits {
+            status: 404,
+            body: Some("ok".to_owned()),
+            headers: std::collections::BTreeMap::default(),
+        };
+        let processor = processor(vec![non_return_rule()], None, None, IpBanManager::new());
+        assert_eq!(
+            processor.process(&request(None), &mut response, None, SystemTime::now()),
+            None
+        );
+        assert_eq!(response.status, 404);
+    }
+
+    #[test]
+    fn the_free_pass_without_rules_or_headers_leaves_the_response_alone() {
+        // no global rules: the whole rule block is skipped; no security
+        // headers and no cors: the response rides through untouched
+        let tracker = Arc::new(Mutex::new(BehaviorTracker::new()));
+        let mut response = ResponseBits::default();
+        let actions = process_response(
+            None,
+            None,
+            &[],
+            &tracker,
+            &request(None),
+            &mut response,
+            true,
+            SystemTime::now(),
+        );
+        assert!(actions.is_empty());
+        assert!(response.headers.is_empty());
+    }
+
+    #[test]
+    fn the_free_pass_skips_other_rules_and_renders_headers_and_cors() {
+        // a non-`return_pattern` rule is skipped, then the enabled security
+        // headers render, then the CORS verdict composes for the allowed
+        // origin
+        let tracker = Arc::new(Mutex::new(BehaviorTracker::new()));
+        let mut response = ResponseBits::default();
+        let actions = process_response(
+            Some(&SecurityHeadersConfig::reference_default()),
+            Some(&CorsConfig {
+                enabled: true,
+                allow_origins: vec!["https://app.example.com".to_owned()],
+                ..CorsConfig::default()
+            }),
+            &[non_return_rule()],
+            &tracker,
+            &request(Some("https://app.example.com")),
+            &mut response,
+            true,
+            SystemTime::now(),
+        );
+        assert!(actions.is_empty(), "no return_pattern rule tripped");
+        assert_eq!(
+            response
+                .headers
+                .get("Access-Control-Allow-Origin")
+                .map(String::as_str),
+            Some("https://app.example.com")
+        );
+        assert_eq!(
+            response.headers.get("X-Frame-Options").map(String::as_str),
+            Some("SAMEORIGIN")
+        );
+    }
+}

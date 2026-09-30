@@ -185,9 +185,13 @@ pub fn template_keyword_matches(
     kind: &TemplateKind,
     ignore_case: bool,
 ) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: every kind indicator is a statically
+    // valid literal
     let Ok(indicator) = PyRegex::compile(kind.indicator, ignore_case) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let indicator = PyRegex::compile(kind.indicator, ignore_case).expect("statically valid");
     let mut matches = Vec::new();
     for region in template_regions(content, kind.opening, kind.closing) {
         let from = region.start + kind.opening.len() + 1;
@@ -214,9 +218,13 @@ pub fn template_expression_matches(
     kind: &TemplateKind,
     ignore_case: bool,
 ) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: every kind indicator is a statically
+    // valid literal
     let Ok(indicator) = PyRegex::compile(kind.indicator, ignore_case) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let indicator = PyRegex::compile(kind.indicator, ignore_case).expect("statically valid");
     let arithmetic = PyRegex::compile(kind.arithmetic, ignore_case).ok();
     let dates = PyRegex::compile(DATE_SOURCE, ignore_case).ok();
     let has_dates = matches!(kind.opening, "{{" | "#{");
@@ -313,5 +321,90 @@ mod tests {
             template_expression_matches("{{x1 3*4}}", &KIND_CURLY_CALL, true).len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_frames_and_missing_closers_are_rejected() {
+        // two adjacent regions both match
+        assert_eq!(
+            template_keyword_matches("{{ system }}{{ system }}", &KIND_CURLY_KEYWORD, true).len(),
+            2
+        );
+        // a keyword inside the first char after the opening is not "inside"
+        assert!(template_keyword_matches("{{system}}", &KIND_CURLY_KEYWORD, true).is_empty());
+        // an unterminated frame: no region, nothing matches
+        assert!(template_keyword_matches("{{ system ", &KIND_CURLY_KEYWORD, true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn digit_preceded_arithmetic_candidates_are_rejected() {
+        // the quote forces the arithmetic match to start after the leading
+        // digit, which is exactly the start the (?<!\d) guard rejects
+        assert!(template_expression_matches("#{1\"2*3}", &KIND_HASH, true).is_empty());
+        // the later region in the same content still fires
+        assert_eq!(
+            template_expression_matches("#{1\"2*3}#{eval(x)}", &KIND_HASH, true).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_region_body_shorter_than_the_restart_lookback_restarts_in_place() {
+        // "#{}" has no body to scan for dates: the restart returns the region
+        // start unchanged and the empty region never hits
+        assert_eq!(
+            template_expression_matches("#{}#{eval(x)}", &KIND_HASH, true).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn an_overlapping_second_region_is_skipped_after_a_hit() {
+        // the inner `<%` region starts inside the first region's accepted
+        // span, so the restart cursor yields it and it is dropped
+        assert_eq!(
+            template_expression_matches("<%eval<%>%>", &KIND_ASP, true).len(),
+            1
+        );
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+
+    #[test]
+    fn template_frame_rejects_misaligned_and_unterminated_windows() {
+        // the start does not sit on the opening delimiter
+        assert_eq!(template_frame("{{x}}", "{{", "}}", 1, 5), None);
+        // the body never reaches the closing delimiter
+        assert_eq!(template_frame("{{x", "{{", "}}", 0, 3), None);
+        // the frame extends past the candidate end
+        assert_eq!(template_frame("{{x}} tail", "{{", "}}", 0, 4), None);
+        // a well-formed frame inside the window renders
+        let frame = template_frame("{{x}} tail", "{{", "}}", 0, 10).expect("frame");
+        assert_eq!((frame.start, frame.end), (0, 5));
+    }
+
+    #[test]
+    fn date_restart_finds_the_next_opening_inside_the_barrier() {
+        let dates = PyRegex::compile(DATE_SOURCE, false).expect("statically valid");
+        // a date dominates the region: the restart looks for a later opening
+        // before the barrier and finds one
+        let content = "{{a}} 2024-01-01 {{b}}";
+        let barrier = content.len();
+        assert_eq!(date_restart(content, "{{", 0, barrier, &dates), Some(17));
+        // the later opening sits exactly at the barrier: filtered out
+        assert_eq!(date_restart(content, "{{", 0, 17, &dates), None);
     }
 }

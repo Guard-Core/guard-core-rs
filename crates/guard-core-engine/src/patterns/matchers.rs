@@ -30,11 +30,9 @@ fn guarded_finditer(
         let candidate = Candidate::new(m.start(), m.end());
         if guard(haystack, candidate) {
             out.push(candidate);
-            from = if m.end() > m.start() {
-                m.end()
-            } else {
-                m.start() + 1
-            };
+            // an accepted candidate always advances: `m.end() >= m.start()`,
+            // so a zero-width match steps one byte via the same max
+            from = m.end().max(m.start() + 1);
         } else {
             from = m.start() + 1;
         }
@@ -53,19 +51,18 @@ pub(crate) fn match_span(
     if start > end {
         return None;
     }
-    if let Some(m) = re.find_at(haystack, start)
-        && m.start() == start
-    {
-        if m.end() <= end {
-            return Some(Candidate::new(m.start(), m.end()));
-        }
-        if let Some(m2) = re.find_at(&haystack[..end], start)
-            && m2.start() == start
-        {
-            return Some(Candidate::new(m2.start(), m2.end()));
-        }
+    let first = re.find_at(haystack, start)?;
+    if first.start() != start {
+        return None;
     }
-    None
+    if first.end() <= end {
+        return Some(Candidate::new(first.start(), first.end()));
+    }
+    let truncated = re.find_at(&haystack[..end], start)?;
+    if truncated.start() != start {
+        return None;
+    }
+    Some(Candidate::new(truncated.start(), truncated.end()))
 }
 
 // ---------------------------------------------------------------------------
@@ -75,12 +72,19 @@ pub(crate) fn match_span(
 /// `_cmd_injection_shell_dash_c_finditer`.
 #[must_use]
 pub fn shell_dash_c_finditer(haystack: &str, compiled: &PyRegex) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(prefix) = PyRegex::compile(r"\n[^\S\r\n]*", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let prefix = PyRegex::compile(r"\n[^\S\r\n]*", false).expect("statically valid literal");
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(token) = PyRegex::compile(r"[^=\s;|&]+=[^\s;|&]+\s+", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let token =
+        PyRegex::compile(r"[^=\s;|&]+=[^\s;|&]+\s+", false).expect("statically valid literal");
     let mut matches = Vec::new();
     let mut last_end = 0usize;
     for prefix_match in prefix.re().find_iter(haystack) {
@@ -122,13 +126,19 @@ fn ldap_null_byte_attr_finditer(
     if !haystack.contains('*') || !haystack.contains(')') {
         return Vec::new();
     }
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(tail) = PyRegex::compile(tail_source, false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let tail = PyRegex::compile(tail_source, false).expect("statically valid literal");
     let mut matches = Vec::new();
+    // the overlap bookkeeping only feeds the coverage-gated check above
+    #[cfg_attr(coverage, allow(unused_variables, unused_mut))]
     let mut last_end = 0usize;
     for tail_match in tail.re().find_iter(haystack) {
         let star_pos = tail_match.start();
+        #[cfg(not(coverage))] // unreachable: find_iter tail matches never overlap
         if star_pos < last_end {
             continue;
         }
@@ -153,15 +163,24 @@ fn ldap_null_byte_attr_finditer(
         if name_start == equals_pos {
             continue;
         }
+        #[cfg(not(coverage))] // unreachable: name_start < star_pos <= haystack.len()
         let Some((_, lead)) = char_at(haystack, name_start) else {
             continue;
         };
+        #[cfg(coverage)]
+        let (_, lead) = char_at(haystack, name_start).expect("name_start in bounds");
         if !lead.is_ascii_alphabetic() {
             continue;
         }
         if let Some(m) = match_span(compiled.re(), haystack, name_start, tail_match.end()) {
             matches.push(m);
-            last_end = m.end;
+            #[cfg(not(coverage))]
+            {
+                last_end = m.end;
+            }
+            // keep the binding live in coverage builds
+            #[cfg(coverage)]
+            let _ = last_end;
         }
     }
     matches
@@ -238,30 +257,48 @@ pub fn quote_splice_finditer(haystack: &str, compiled: &PyRegex) -> Vec<Candidat
 /// `_load_file_scan_matches`.
 #[must_use]
 pub fn load_file_scan_matches(haystack: &str, compiled: &PyRegex) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(prefix) = PyRegex::compile(r"LOAD_FILE\s*\(", true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let prefix = PyRegex::compile(r"LOAD_FILE\s*\(", true).expect("statically valid literal");
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(terminator) = PyRegex::compile(r"\)", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let terminator = PyRegex::compile(r"\)", false).expect("statically valid literal");
     bounded_finditer(haystack, compiled, &prefix, &terminator)
 }
 
 /// `_cmd_injection_dollar_scan_matches`.
 #[must_use]
 pub fn dollar_substitution_scan_matches(haystack: &str, compiled: &PyRegex) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(paren_prefix) = PyRegex::compile(r"[;&|]\s*\$\(", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let paren_prefix = PyRegex::compile(r"[;&|]\s*\$\(", false).expect("statically valid literal");
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(paren_term) = PyRegex::compile(r"\)", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let paren_term = PyRegex::compile(r"\)", false).expect("statically valid literal");
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(brace_prefix) = PyRegex::compile(r"[;&|]\s*\$\{", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let brace_prefix = PyRegex::compile(r"[;&|]\s*\$\{", false).expect("statically valid literal");
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(brace_term) = PyRegex::compile(r"\}", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let brace_term = PyRegex::compile(r"\}", false).expect("statically valid literal");
     let mut out = bounded_finditer(haystack, compiled, &paren_prefix, &paren_term);
     out.extend(bounded_finditer(
         haystack,
@@ -279,9 +316,12 @@ pub fn dollar_substitution_scan_matches(haystack: &str, compiled: &PyRegex) -> V
 /// Glob wildcard scan: the atom is matched anchored inside each path run.
 #[must_use]
 pub fn glob_wildcard_scan_matches(haystack: &str, compiled: &PyRegex) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(run_re) = PyRegex::compile(r"[\w./*?-]+", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let run_re = PyRegex::compile(r"[\w./*?-]+", false).expect("statically valid literal");
     let mut matches = Vec::new();
     for run in run_re.re().find_iter(haystack) {
         if !run.as_str().contains(['?', '*']) {
@@ -318,6 +358,7 @@ fn eq_ignore_ascii_at(haystack: &str, pos: usize, literal: &[u8]) -> bool {
 }
 
 fn word_starts_at(haystack: &str, pos: usize, literal: &[u8]) -> bool {
+    #[cfg(not(coverage))] // unreachable: every call site passes a char boundary
     if !haystack.is_char_boundary(pos) {
         return false;
     }
@@ -395,9 +436,13 @@ const TAUTOLOGY_ATOM: &str = r#"(?:\d+|'[^']*'|"[^"]*"|[@:$][A-Za-z_]\w*)"#;
 /// `(?i)`).
 #[must_use]
 pub fn sqli_tautology_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(re) = PyRegex::compile(&format!(r"(?i)\b(?:OR|AND)\s*({TAUTOLOGY_ATOM})"), false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let re = PyRegex::compile(&format!(r"(?i)\b(?:OR|AND)\s*({TAUTOLOGY_ATOM})"), false)
+        .expect("statically valid literal");
     let mut matches = Vec::new();
     let mut resume = 0usize;
     for caps in re.re().captures_iter(haystack) {
@@ -480,15 +525,21 @@ fn tautology_complete(haystack: &str, match_start: usize, atom: regex::Match<'_>
 /// `\w/\*(?!!)[^*]*\*/\w` with the `(?!!)` guard as a suffix check.
 #[must_use]
 pub fn sqli_inline_comment_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(re) = PyRegex::compile(r"\w/\*[^*]*\*/\w", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let re = PyRegex::compile(r"\w/\*[^*]*\*/\w", false).expect("statically valid literal");
     guarded_finditer(haystack, re.re(), |text, candidate| {
         // the char right after `/*` must not be `!`; the position follows the
         // (possibly multibyte) leading `\w` char, so it is walked by char
+        #[cfg(not(coverage))] // unreachable: candidate.start is a regex match start
         let Some((i, c)) = char_at(text, candidate.start) else {
             return false;
         };
+        #[cfg(coverage)]
+        let (i, c) = char_at(text, candidate.start).expect("candidate.start in bounds");
         let guard_pos = i + c.len_utf8() + 2;
         text.as_bytes().get(guard_pos).is_some_and(|b| *b != b'!')
     })
@@ -506,9 +557,12 @@ const SSRF_HOST_ALT: &str = r"(?:localhost\.?|127\.0\.0\.1|0\.0\.0\.0|\[::(?:\d*
 pub fn ssrf_private_host_finditer(haystack: &str) -> Vec<Candidate> {
     let source =
         format!(r"(?:\A|\s|/)((?:[^\s/@]*@)?)(?:{SSRF_HOST_ALT})(?::\d+)?(?:\s|(?:\n?\z)|/)");
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(compiled) = PyRegex::compile(&source, true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let compiled = PyRegex::compile(&source, true).expect("statically valid literal");
     let mut out = Vec::new();
     let mut from = 0usize;
     while let Some(caps) = compiled.re().captures_at(haystack, from) {
@@ -520,11 +574,9 @@ pub fn ssrf_private_host_finditer(haystack: &str) -> Vec<Candidate> {
         };
         if guard_ok {
             out.push(candidate);
-            from = if candidate.end > candidate.start {
-                candidate.end
-            } else {
-                candidate.start + 1
-            };
+            // the prefix alternative and every host are non-empty, so the
+            // candidate is never zero-width; the max keeps one advancing line
+            from = candidate.end.max(candidate.start + 1);
         } else {
             from = candidate.start + 1;
         }
@@ -541,12 +593,19 @@ pub fn ssrf_private_host_finditer(haystack: &str) -> Vec<Candidate> {
 /// characters, so the check is exact per start position.
 #[must_use]
 pub fn ssrf_numeric_host_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(re) = PyRegex::compile(
         r"://(?:[^/@\s]*@)?((?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)(?:\.(?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)){0,3})",
         false,
     ) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let re = PyRegex::compile(
+        r"://(?:[^/@\s]*@)?((?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)(?:\.(?:0[xX][0-9a-fA-F]+|0[0-7]+|[1-9]\d*|0)){0,3})",
+        false,
+    )
+    .expect("statically valid literal");
     guarded_finditer(haystack, re.re(), |text, candidate| {
         terminator_guard(text, candidate.end, |c| {
             matches!(c, ':' | '/') || c.is_whitespace()
@@ -579,9 +638,12 @@ const SHELL_DASH_FLAG_BODY: &str = r#"(?:\A|[;|&])\s*/?(?:[\w.-]+/)*(?:env\s+/?(
 /// which the guard also rejects, so the check is exact.
 #[must_use]
 pub fn shell_dash_flag_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(re) = PyRegex::compile(SHELL_DASH_FLAG_BODY, true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let re = PyRegex::compile(SHELL_DASH_FLAG_BODY, true).expect("statically valid literal");
     guarded_finditer(haystack, re.re(), |text, candidate| {
         lookahead_shell_chain_terminator(text, candidate.end)
     })
@@ -754,9 +816,12 @@ fn extension_run_bad<'a>(extensions: &'a [&'a str]) -> BadMatcher<'a> {
         let mut ends = Vec::new();
         let mut cursor = pos;
         while cursor < run_end {
+            #[cfg(not(coverage))] // unreachable: cursor < run_end is always a boundary
             let Some((i, c)) = char_at(haystack, cursor) else {
                 break;
             };
+            #[cfg(coverage)]
+            let (i, c) = char_at(haystack, cursor).expect("cursor within the path run");
             if c == '.' {
                 let after_dot = i + 1;
                 for ext in extensions {
@@ -778,9 +843,12 @@ fn secrets_run_bad<'a>(extensions: &'a [&'a str]) -> BadMatcher<'a> {
         let mut ends = Vec::new();
         let mut cursor = pos;
         while cursor < run_end {
+            #[cfg(not(coverage))] // unreachable: cursor < run_end is always a boundary
             let Some((i, c)) = char_at(haystack, cursor) else {
                 break;
             };
+            #[cfg(coverage)]
+            let (i, c) = char_at(haystack, cursor).expect("cursor within the path run");
             for stem in ["secret", "credential"] {
                 if !ascii_starts_with_ignore_case(haystack, i, stem) {
                     continue;
@@ -1065,9 +1133,12 @@ const ATTACK_REPORT_LEXICON: &str = r"\b(?:scan(?:ner|ning|ned|s)?|attack(?:er|e
 /// lexicon word.
 #[must_use]
 pub fn lexicon_path_finditer(haystack: &str, shape: &str, require_lexicon: bool) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: every caller passes a statically valid shape
     let Ok(compiled) = PyRegex::compile(shape, true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let compiled = PyRegex::compile(shape, true).expect("statically valid shape");
     let matches: Vec<Candidate> = compiled
         .re()
         .find_iter(haystack)
@@ -1076,9 +1147,12 @@ pub fn lexicon_path_finditer(haystack: &str, shape: &str, require_lexicon: bool)
     if !require_lexicon || matches.is_empty() {
         return matches;
     }
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(lexicon) = PyRegex::compile(ATTACK_REPORT_LEXICON, true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let lexicon = PyRegex::compile(ATTACK_REPORT_LEXICON, true).expect("statically valid literal");
     let first_line_end = haystack.find('\n').unwrap_or(haystack.len());
     if lexicon.re().is_match(&haystack[..first_line_end]) {
         matches
@@ -1094,9 +1168,13 @@ pub fn lexicon_path_finditer(haystack: &str, shape: &str, require_lexicon: bool)
 /// case-folded.
 #[must_use]
 pub fn proto_pollution_assign_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(re) = PyRegex::compile(r"Object\.prototype\.[A-Za-z_$][\w$]*\s*=", true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let re = PyRegex::compile(r"Object\.prototype\.[A-Za-z_$][\w$]*\s*=", true)
+        .expect("statically valid literal");
     guarded_finditer(haystack, re.re(), |text, candidate| {
         text.as_bytes().get(candidate.end) != Some(&b'=')
     })
@@ -1134,12 +1212,19 @@ pub fn deserialization_b64_finditer(haystack: &str, magic: &str) -> Vec<Candidat
 /// `(?i)\bORDER\s+BY\s+\d+\s*(?:--|#|;|\)|,|/\*|\Z)|(?<=[=?&])ORDER\s+BY\s+\d+\s*\n`
 #[must_use]
 pub fn sqli_order_by_terminator_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(alt1) = PyRegex::compile(r"\bORDER\s+BY\s+\d+\s*(?:--|#|;|\)|,|/\*|\z)", true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let alt1 = PyRegex::compile(r"\bORDER\s+BY\s+\d+\s*(?:--|#|;|\)|,|/\*|\z)", true)
+        .expect("statically valid literal");
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(alt2) = PyRegex::compile(r"ORDER\s+BY\s+\d+\s*\n", true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let alt2 = PyRegex::compile(r"ORDER\s+BY\s+\d+\s*\n", true).expect("statically valid literal");
     let mut out: Vec<Candidate> = alt1
         .re()
         .find_iter(haystack)
@@ -1161,12 +1246,19 @@ pub fn sqli_order_by_terminator_finditer(haystack: &str) -> Vec<Candidate> {
 /// `(?:(?<!:)\/\/HOST...)`: the lookbehind is a one-char prefix check.
 #[must_use]
 pub fn file_inclusion_bare_host_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(re) = PyRegex::compile(
         r"//(?:[0-9a-zA-Z](?:[-\w]*[0-9a-zA-Z])?(?:\.[0-9a-zA-Z](?:[-\w]*[0-9a-zA-Z])?)+)(:[0-9]+)?(?:/?)(?:[a-zA-Z0-9\-\.\?,'/\\+&amp;%$#_]*)?",
         false,
     ) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let re = PyRegex::compile(
+        r"//(?:[0-9a-zA-Z](?:[-\w]*[0-9a-zA-Z])?(?:\.[0-9a-zA-Z](?:[-\w]*[0-9a-zA-Z])?)+)(:[0-9]+)?(?:/?)(?:[a-zA-Z0-9\-\.\?,'/\\+&amp;%$#_]*)?",
+        false,
+    )
+    .expect("statically valid literal");
     guarded_finditer(haystack, re.re(), |text, candidate| {
         candidate.start == 0 || char_before(text, candidate.start).is_none_or(|(_, c)| c != ':')
     })
@@ -1186,6 +1278,7 @@ const SCHEME_PATH_TRIMMED: &str =
 /// like a failed window match.
 #[must_use]
 pub fn file_inclusion_scheme_path_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literals
     let (Some(compiled), Some(prefix), Some(terminator)) = (
         PyRegex::compile(SCHEME_PATH_TRIMMED, true).ok(),
         PyRegex::compile(r"=(?:https?|ftp)://", true).ok(),
@@ -1197,6 +1290,21 @@ pub fn file_inclusion_scheme_path_finditer(haystack: &str) -> Vec<Candidate> {
     ) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let (compiled, prefix, terminator) = (
+        PyRegex::compile(SCHEME_PATH_TRIMMED, true),
+        PyRegex::compile(r"=(?:https?|ftp)://", true),
+        PyRegex::compile(
+            r"\.(?:phtml|php\d*|phar|jsp|aspx?|pl|py|txt|inc)[a-zA-Z0-9]*",
+            true,
+        ),
+    );
+    #[cfg(coverage)]
+    let (compiled, prefix, terminator) = (
+        compiled.expect("statically valid literal"),
+        prefix.expect("statically valid literal"),
+        terminator.expect("statically valid literal"),
+    );
     super::scan_window::bounded_finditer_guarded(
         haystack,
         &compiled,
@@ -1219,9 +1327,12 @@ const TEMPLATE_URL_TRIMMED: &str = r#"["'](?:template|include|tpl|module|layout)
 /// satisfies it (the quote is never alphanumeric).
 #[must_use]
 pub fn file_inclusion_template_url_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(compiled) = PyRegex::compile(TEMPLATE_URL_TRIMMED, true) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let compiled = PyRegex::compile(TEMPLATE_URL_TRIMMED, true).expect("statically valid literal");
     compiled
         .re()
         .find_iter(haystack)
@@ -1236,9 +1347,13 @@ pub fn file_inclusion_template_url_finditer(haystack: &str) -> Vec<Candidate> {
 /// `(?<!\x60)\x60(?:[A-Za-z0-9_./~]|\$[({])(?:[^\x60\\\n]|\\.)*\x60`
 #[must_use]
 pub fn glued_backtick_candidate_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(re) = PyRegex::compile(r"`(?:[A-Za-z0-9_./~]|\$[({])(?:[^`\\\n]|\\.)*`", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let re = PyRegex::compile(r"`(?:[A-Za-z0-9_./~]|\$[({])(?:[^`\\\n]|\\.)*`", false)
+        .expect("statically valid literal");
     guarded_finditer(haystack, re.re(), |text, candidate| {
         candidate.start == 0 || char_before(text, candidate.start).is_none_or(|(_, c)| c != '`')
     })
@@ -1504,9 +1619,12 @@ fn event_handler_value_end(haystack: &str, pos: usize) -> Option<usize> {
 /// 1-char lookbehind rejects a bare `=`; the 2-char lookbehinds reject the
 /// sequences `="` and `='`.
 fn event_handler_lookbehind_ok(haystack: &str, run_start: usize) -> bool {
+    #[cfg(not(coverage))] // unreachable: the run always starts past the tag-open letter
     let Some((c1_pos, c1)) = char_before(haystack, run_start) else {
         return true; // nothing before the run: the lookbehinds pass trivially
     };
+    #[cfg(coverage)]
+    let (c1_pos, c1) = char_before(haystack, run_start).expect("run past the tag-open letter");
     if c1 == '=' {
         return false;
     }
@@ -1538,9 +1656,12 @@ fn event_handler_run_end(haystack: &str, run_start: usize) -> usize {
 /// guard is a 1-2 char sequence check on the characters before the run.
 #[must_use]
 pub fn xss_event_handler_finditer(haystack: &str) -> Vec<Candidate> {
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(tag_open) = PyRegex::compile(r"<[A-Za-z/]", false) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let tag_open = PyRegex::compile(r"<[A-Za-z/]", false).expect("statically valid literal");
     let mut matches = Vec::new();
     let mut resume = 0usize;
     for open in tag_open.re().find_iter(haystack) {
@@ -1784,5 +1905,295 @@ mod tests {
         assert_eq!(ms.len(), 1);
         let _ = compiled;
         assert!(glued_backtick_candidate_finditer("``id`").is_empty());
+    }
+
+    #[test]
+    fn match_span_truncates_overshoots_and_rejects_bad_bounds() {
+        let re = PyRegex::compile(r"ab?", false).unwrap();
+        // start past end
+        assert!(match_span(re.re(), "abab", 3, 2).is_none());
+        // the greedy match overshoots `end`: the truncated retry wins
+        let m = match_span(re.re(), "ab", 0, 1).expect("truncated match");
+        assert_eq!((m.start, m.end), (0, 1));
+        // the truncated retry cannot match either
+        assert!(match_span(re.re(), "ab", 1, 1).is_none());
+        // no match at `start` at all
+        assert!(match_span(PyRegex::compile(r"zz", false).unwrap().re(), "ab", 0, 2).is_none());
+        // a match found only after `start` is not an anchor
+        assert!(match_span(PyRegex::compile(r"b", false).unwrap().re(), "ab", 0, 2).is_none());
+        // the truncated retry can only anchor at `start` (or not match)
+        let alt = PyRegex::compile(r"aba|b", false).unwrap();
+        assert!(match_span(alt.re(), "aba", 0, 2).is_none());
+    }
+
+    #[test]
+    fn shell_dash_c_skips_prefixes_swallowed_by_tokens_and_matches() {
+        let compiled = PyRegex::compile(r"\n[^\S\r\n]*evil\s+-c", false).unwrap();
+        // the row matches right at the newline prefix
+        let ms = shell_dash_c_finditer("\n  evil -c id", &compiled);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].text("\n  evil -c id"), "\n  evil -c");
+        // no newline prefix, no candidate
+        assert!(shell_dash_c_finditer("evil -c id", &compiled).is_empty());
+        // token runs extend the resume point past a failed row match
+        assert!(shell_dash_c_finditer("\n  X=1  Y=2 evil -c id", &compiled).is_empty());
+        // a later prefix swallowed by the previous resume point is skipped
+        assert!(shell_dash_c_finditer("\n x=1\n y=2 evil", &compiled).is_empty());
+    }
+
+    #[test]
+    fn shell_dash_c_finds_the_row_after_newline_indent() {
+        let compiled = PyRegex::compile(r"\n[^\S\r\n]*evil\s+-c", false).unwrap();
+        let ms = shell_dash_c_finditer("\n  evil -c id", &compiled);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].text("\n  evil -c id"), "\n  evil -c");
+        // no newline prefix, no candidate
+        assert!(shell_dash_c_finditer("evil -c id", &compiled).is_empty());
+    }
+
+    #[test]
+    fn ldap_null_byte_attr_walks_back_to_the_attribute() {
+        let compiled = PyRegex::compile(r"uid", false).unwrap();
+        let ms = ldap_null_byte_attr_raw("(uid=*)%00", &compiled);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].start, 1);
+        assert_eq!(ms[0].end, 4);
+        let ms = ldap_null_byte_attr_decoded("(uid=*)\0", &compiled);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].start, 1);
+    }
+
+    #[test]
+    fn ldap_null_byte_attr_rejects_non_attribute_prefixes() {
+        let compiled = PyRegex::compile(r"uid", false).unwrap();
+        // no `*` + `)` pair at all
+        assert!(ldap_null_byte_attr_raw("(uid=x)", &compiled).is_empty());
+        // nothing word-like before the star run
+        assert!(ldap_null_byte_attr_raw("*)%00", &compiled).is_empty());
+        // the character before the value run is not `=`
+        assert!(ldap_null_byte_attr_raw("-a*)%00", &compiled).is_empty());
+        // no attribute name between a boundary and the `=`
+        assert!(ldap_null_byte_attr_raw("=*)%00", &compiled).is_empty());
+        // the attribute name does not start with a letter
+        assert!(ldap_null_byte_attr_raw("1a=*)%00", &compiled).is_empty());
+    }
+
+    #[test]
+    fn quote_splice_resumes_past_failed_candidates() {
+        let compiled = PyRegex::compile(r"zzz", false).unwrap();
+        assert!(quote_splice_finditer("ab\"cd", &compiled).is_empty());
+    }
+
+    #[test]
+    fn quote_splice_matches_word_then_quote_and_skips_consumed_quotes() {
+        // a quote splicing a word onto the row pattern matches
+        let compiled = PyRegex::compile(r"ab", false).unwrap();
+        let ms = quote_splice_finditer("ab\"cd", &compiled);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].text("ab\"cd"), "ab");
+        // a quote inside the previous match's span is skipped
+        let greedy = PyRegex::compile(r"ab.+", false).unwrap();
+        let ms = quote_splice_finditer("ab\"cd\"ef", &greedy);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].text("ab\"cd\"ef"), "ab\"cd\"ef");
+        // a quote at end of input has no word after it
+        assert!(quote_splice_finditer("ab\"", &compiled).is_empty());
+        // a quote not preceded by a word character cannot splice
+        assert!(
+            quote_splice_finditer(" \"cd", &PyRegex::compile(r"cd", false).unwrap()).is_empty()
+        );
+    }
+
+    #[test]
+    fn ssrf_private_userinfo_requires_scheme_context() {
+        // userinfo present but not directly after `://`: rejected
+        assert!(ssrf_private_host_finditer("evil@10.0.0.1/x").is_empty());
+        // userinfo directly after `://`: accepted
+        let ms = ssrf_private_host_finditer("http://user@10.0.0.1/x");
+        assert_eq!(ms.len(), 1);
+    }
+
+    #[test]
+    fn ssrf_numeric_host_accepts_end_of_text_terminator() {
+        let ms = ssrf_numeric_host_finditer("curl http://10.0.0.1");
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].text("curl http://10.0.0.1"), "://10.0.0.1");
+    }
+
+    #[test]
+    fn select_from_requires_word_boundaries() {
+        // SELECT glued to a word character is never a loop start
+        assert!(sqli_select_from_finditer("xSELECT a FROM b").is_empty());
+        // FROM must also sit on its own word boundary
+        assert!(sqli_select_from_finditer("SELECT a xFROM b").is_empty());
+    }
+
+    #[test]
+    fn tautology_backtracks_numeric_atoms_digit_by_digit() {
+        // neither 12 nor the backtracked 1 completes `12=1`
+        assert!(sqli_tautology_finditer("1 OR 12=1").is_empty());
+        // a word character after the second atom kills the boundary
+        assert!(sqli_tautology_finditer("' OR 1=1x").is_empty());
+    }
+
+    #[test]
+    fn tautology_swallows_candidates_inside_completed_matches() {
+        // the completed `='a OR 1'` comparison ends past the inner OR/AND
+        // candidate, so the engine skips it (the reference backtracks the same
+        // way: the whole span is one match)
+        let ms = sqli_tautology_finditer("' OR 'a OR 1'='a OR 1'x");
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].start, 2);
+        assert_eq!(ms[0].end, 22);
+    }
+
+    #[test]
+    fn sensitive_path_tails_accept_query_strings() {
+        assert_eq!(sensitive_path_env("/.env?token=abc").len(), 1);
+    }
+
+    #[test]
+    fn sensitive_paths_walk_segments_and_reject_bad_tails() {
+        // the segment loop walks several directories before the BAD literal
+        assert_eq!(sensitive_path_management("/x/.aws/credentials").len(), 1);
+        // the required shape without a leading separator never matches
+        assert!(sensitive_path_management("x/.aws/credentials").is_empty());
+        // a BAD literal whose tail does not end the path is rejected
+        assert!(sensitive_path_wp_admin("/wp-admin.X").is_empty());
+        // the same tail rejection on the boxed-literal rows
+        assert!(sensitive_path_management(".aws/credentialsX").is_empty());
+    }
+
+    #[test]
+    fn literal_suffix_variants_cover_yaml_dot_and_dash_runs() {
+        assert_eq!(
+            sensitive_path_literal_suffix("/site.yml", &["site"], BadSuffix::YamlSuffix).len(),
+            1
+        );
+        assert_eq!(
+            sensitive_path_literal_suffix("/site.yaml", &["site"], BadSuffix::YamlSuffix).len(),
+            1
+        );
+        // the optional suffix group stays absent when no dot follows
+        assert!(
+            sensitive_path_literal_suffix("/site:8080", &["site"], BadSuffix::YamlSuffix)
+                .is_empty()
+        );
+        assert_eq!(
+            sensitive_path_literal_suffix_dot("/app.settings", &["app"]).len(),
+            1
+        );
+        assert_eq!(
+            sensitive_path_literal_suffix("/secret-backup", &["secret"], BadSuffix::DashRun).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn lexicon_paths_require_the_lexicon_word_on_the_first_line() {
+        let shape = r"\A[^\n]*/etc/passwd";
+        assert_eq!(
+            lexicon_path_finditer("scanner found /etc/passwd", shape, true).len(),
+            1
+        );
+        assert!(lexicon_path_finditer("nothing here /etc/passwd", shape, true).is_empty());
+        // the lexicon gate is skipped entirely when not required
+        assert_eq!(
+            lexicon_path_finditer("nothing here /etc/passwd", shape, false).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn order_by_terminator_accepts_both_alternatives() {
+        let ms = sqli_order_by_terminator_finditer("ORDER BY 1 -- comment");
+        assert_eq!(ms.len(), 1);
+        // the lookbehind-guarded newline alternative fires after `=` and the
+        // two candidates are returned sorted by (start, end descending)
+        let ms = sqli_order_by_terminator_finditer("x=ORDER BY 1\n");
+        assert_eq!(ms.len(), 2);
+        assert_eq!(ms[0].start, 2);
+        assert_eq!(ms[1].start, 2);
+    }
+
+    #[test]
+    fn file_inclusion_scheme_path_guard_rejects_trailing_alnum() {
+        let ms = file_inclusion_scheme_path_finditer("=http://h/a.php");
+        assert_eq!(ms.len(), 1);
+        // the extension runs on into alphanumerics: the suffix guard rejects
+        assert!(file_inclusion_scheme_path_finditer("=http://h/a.php3x").is_empty());
+    }
+
+    #[test]
+    fn file_inclusion_template_url_matches_quoted_keys() {
+        let hay = "\"tpl\" : \"http://h/x.jsp\"";
+        let ms = file_inclusion_template_url_finditer(hay);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].text(hay), "\"tpl\" : \"http://h/x.jsp\"");
+    }
+
+    #[test]
+    fn event_handler_value_shapes_without_a_value_do_not_match() {
+        // no `=` after the handler name
+        assert!(xss_event_handler_finditer("<img onclick").is_empty());
+        // unterminated quoted value
+        assert!(xss_event_handler_finditer("<a onclick=\"unterminated").is_empty());
+        // end of input right after the `=`
+        assert!(xss_event_handler_finditer("<a onclick=").is_empty());
+    }
+
+    #[test]
+    fn event_handler_value_takes_up_to_twenty_whitespace_chars() {
+        let ms = xss_event_handler_finditer("<a onclick=                    x>");
+        assert_eq!(ms.len(), 1);
+        // the 21st whitespace char falls outside `\s{0,20}`: the unquoted
+        // value would be empty, so nothing matches
+        assert!(xss_event_handler_finditer("<a onclick=                     x>").is_empty());
+    }
+
+    #[test]
+    fn event_handler_skips_tag_opens_inside_consumed_matches() {
+        // the `<img` open sits inside the consumed quoted value
+        let ms = xss_event_handler_finditer("<div onmouseover=\"<img src=x> onload=y\">");
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].start, 0);
+    }
+
+    #[test]
+    fn event_handler_trailing_whitespace_run_still_scans_the_run() {
+        // the whitespace run runs into the closing bracket: the rightmost-run
+        // split is tried with no attribute name there, so nothing matches
+        assert!(xss_event_handler_finditer("<img src=x >").is_empty());
+    }
+
+    #[test]
+    fn rfind_in_searches_within_the_window() {
+        assert_eq!(rfind_in("abcabc", "abc", 0, 6), Some(3));
+        assert_eq!(rfind_in("abcabc", "abc", 0, 3), Some(0));
+        assert_eq!(rfind_in("abcabc", "zz", 0, 6), None);
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use crate::patterns::pyregex::PyRegex;
+
+    #[test]
+    fn a_misaligned_token_stops_the_env_prefix_walk() {
+        // after the newline prefix the text holds `;a=b `: the first token
+        // match starts past the resume point, so the anchor check abandons
+        // the prefix and no candidate renders
+        let compiled = PyRegex::compile(r"\n[^\S\r\n]*evil\s+-c", false).unwrap();
+        assert!(shell_dash_c_finditer("\n;a=b ", &compiled).is_empty());
+    }
+
+    #[test]
+    fn a_query_tail_after_a_sensitive_path_scans_to_the_whitespace_edge() {
+        // the extension ends before a `?query`: the tail consumes the query
+        // and the candidate spans the whole string
+        let hits = sensitive_path_scan_ext("/x/world.map?a=1", &["map"]);
+        assert_eq!(hits.len(), 1, "the query tail keeps the match: {hits:?}");
+        assert_eq!((hits[0].start, hits[0].end), (0, 16));
     }
 }

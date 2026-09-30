@@ -501,3 +501,77 @@ mod tests {
         assert!(!is_valid_header_name(""));
     }
 }
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_header_with_an_unsanitizable_value_is_rejected() {
+        let config = SecurityHeadersConfig {
+            custom: std::iter::once(("X-Custom".to_owned(), "bad\nvalue".to_owned())).collect(),
+            ..SecurityHeadersConfig::reference_default()
+        };
+        let error = config.validate().expect_err("newline value");
+        assert_eq!(
+            error,
+            SecurityHeadersError::InvalidValue {
+                name: "X-Custom".to_owned(),
+                reason: validate_header_value("bad\nvalue").unwrap_err(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_invalid_custom_header_name_displays_the_reference_message() {
+        let config = SecurityHeadersConfig {
+            custom: std::iter::once(("X Custom".to_owned(), "value".to_owned())).collect(),
+            ..SecurityHeadersConfig::reference_default()
+        };
+        let error = config.validate().expect_err("space in name");
+        assert_eq!(error.to_string(), "invalid header name: X Custom");
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+
+    #[test]
+    fn a_valid_optional_header_passes_validation() {
+        // a populated fixed header (frame options) walks the Some arm of
+        // the fixed-header loop and validates clean
+        let config = SecurityHeadersConfig {
+            frame_options: Some("DENY".to_owned()),
+            ..SecurityHeadersConfig::reference_default()
+        };
+        assert!(config.validate().is_ok());
+        // unset fixed headers skip their arm and still validate clean
+        let config = SecurityHeadersConfig {
+            frame_options: None,
+            content_type_options: None,
+            xss_protection: None,
+            referrer_policy: None,
+            permissions_policy: None,
+            custom: std::collections::BTreeMap::new(),
+            ..SecurityHeadersConfig::reference_default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_error_variants_display_the_reference_messages() {
+        let name_error = SecurityHeadersError::InvalidName {
+            name: "X Custom".to_owned(),
+        };
+        assert_eq!(name_error.to_string(), "invalid header name: X Custom");
+        let value_error = SecurityHeadersError::InvalidValue {
+            name: "X-Custom".to_owned(),
+            reason: "control character",
+        };
+        assert_eq!(
+            value_error.to_string(),
+            "invalid value for header X-Custom: control character"
+        );
+    }
+}

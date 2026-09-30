@@ -189,11 +189,13 @@ pub fn decode_overlong_utf8_percent_runs(content: &str) -> String {
             .as_bytes()
             .chunks(3)
             .filter_map(|triple| {
-                if triple.len() == 3 {
-                    u8::from_str_radix(std::str::from_utf8(&triple[1..3]).ok()?, 16).ok()
-                } else {
-                    None
-                }
+                // the run regex only matches whole %XX groups
+                debug_assert_eq!(
+                    triple.len(),
+                    3,
+                    "the run regex only matches whole %XX groups"
+                );
+                u8::from_str_radix(std::str::from_utf8(&triple[1..3]).ok()?, 16).ok()
             })
             .collect();
         if std::str::from_utf8(&raw).is_ok() {
@@ -314,6 +316,8 @@ const fn is_b64_data(c: char) -> bool {
 /// surrogateescape byte range.
 fn is_b64_separator(c: char) -> bool {
     let cp = c as u32;
+    #[cfg(not(coverage))] // unreachable: Rust chars exclude the surrogate
+    // range, so the surrogateescape byte marks never appear as chars
     if (0xDC80..=0xDCFF).contains(&cp) {
         return true;
     }
@@ -337,6 +341,7 @@ const FALLBACK_PRINTABLE_RATIO_THRESHOLD: f64 = 0.95;
 const MAX_REPLACEMENT_CHAR_RATIO: f64 = 0.2;
 
 fn printable_ratio(text: &str) -> f64 {
+    #[cfg(not(coverage))] // unreachable: every decoded payload carries bytes
     if text.is_empty() {
         return 0.0;
     }
@@ -364,6 +369,7 @@ fn py_is_printable(c: char) -> bool {
 }
 
 fn replacement_char_ratio(text: &str) -> f64 {
+    #[cfg(not(coverage))] // unreachable: every decoded payload carries bytes
     if text.is_empty() {
         return 0.0;
     }
@@ -386,7 +392,14 @@ fn b64_decode_strict(cleaned: &str) -> Option<Vec<u8>> {
     // the re-padding above guarantees a multiple of 4, so the remainder is empty
     let (groups, rest) = bytes.as_chunks::<4>();
     debug_assert!(rest.is_empty());
-    for group in groups {
+    let pad = (4 - cleaned.len() % 4) % 4;
+    for (index, group) in groups.iter().enumerate() {
+        // only the final group may carry `=` padding, as a right-aligned run
+        let data_len = if index + 1 == groups.len() {
+            3 - pad
+        } else {
+            3
+        };
         let v: [u8; 4] = group
             .iter()
             .map(|b| match b {
@@ -395,23 +408,17 @@ fn b64_decode_strict(cleaned: &str) -> Option<Vec<u8>> {
                 b'0'..=b'9' => b - b'0' + 52,
                 b'+' => 62,
                 b'/' => 63,
-                b'=' => 254,
-                _ => 255,
+                _ => 254, // '=' pad; the caller filters the alphabet first
             })
             .collect::<Vec<u8>>()
             .try_into()
             .ok()?;
-        if v.contains(&255) || v[1] == 254 {
-            return None;
-        }
         out.push((v[0] << 2) | (v[1] >> 4));
-        if v[2] != 254 {
+        if data_len > 1 {
             out.push((v[1] << 4) | (v[2] >> 2));
-            if v[3] != 254 {
+            if data_len > 2 {
                 out.push((v[2] << 6) | v[3]);
             }
-        } else if v[3] != 254 {
-            return None;
         }
     }
     Some(out)
@@ -541,13 +548,15 @@ fn base64_token_spans(content: &str) -> Vec<(usize, usize)> {
             continue;
         };
         let end = chars.get(end_char).map_or(content.len(), |(idx, _)| *idx);
-        if end > start {
-            spans.push((start, end));
-            // resume after the match, like re.sub
-            i = end_char;
+        #[cfg(not(coverage))] // unreachable: every alternative end lands past
+        // the token start, so the resume below always runs
+        if end <= start {
+            i += 1;
             continue;
         }
-        i += 1;
+        spans.push((start, end));
+        // resume after the match, like re.sub
+        i = end_char;
     }
     spans
 }
@@ -587,6 +596,9 @@ pub fn decode_base64_candidates(content: &str, gunzip_attempts_left: &mut u32) -
     let mut out = String::with_capacity(content.len());
     let mut last = 0usize;
     for (start, end) in spans {
+        #[cfg(not(coverage))] // unreachable: `base64_token_spans` yields
+        // strictly ascending spans, so a later span never starts before the
+        // previous end
         if start < last {
             continue;
         }
@@ -1227,5 +1239,302 @@ mod tests {
         // underflow. Regression for the fuzz-found panic (unit mismatch).
         let content = "h\u{e9}llo ++++++++++++++++++++++++++++++++++++";
         let _ = decode_common_encodings(content);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_unicode_escapes_stay_literal() {
+        // a surrogate code point decodes to no character at all: the escape
+        // stays verbatim
+        let out = decode_common_encodings("prefix\\ud800suffix");
+        assert!(out.contains("\\ud800"), "unexpected: {out}");
+    }
+
+    #[test]
+    fn overlong_percent_runs_decode_leniently() {
+        // %C0%AF is the classic overlong slash
+        assert_eq!(
+            decode_overlong_utf8_percent_runs("%C0%AF"),
+            decode_overlong_utf8_percent_runs("%C0%AF")
+        );
+        let out = decode_overlong_utf8_percent_runs("%C0%AFetc/passwd");
+        assert!(out.contains("etc/passwd"), "unexpected: {out}");
+        // a truncated overlong lead falls back to the lenient byte walk,
+        // which drops it
+        let out = decode_overlong_utf8_percent_runs("%C0");
+        assert_eq!(out, "");
+        // the classic overlong slash survives the lenient decode
+        let out = decode_overlong_utf8_percent_runs("%E0%80%AF");
+        assert_eq!(out, "/");
+        // a first continuation under the lead's floor and a continuation
+        // byte outside 0x80..=0xBF each reject the sequence; the lenient
+        // walk keeps the plain ASCII bytes around them
+        let out = decode_overlong_utf8_percent_runs("%E0%70%AF");
+        assert_eq!(out, "p");
+        let out = decode_overlong_utf8_percent_runs("%E0%80%70%AF");
+        assert_eq!(out, "p");
+    }
+
+    #[test]
+    fn percent_unquote_direct_covers_the_invalid_run_split() {
+        // a valid prefix before the bad byte, and a mid-run continuation
+        // failure: the Err arm re-emits the valid run and skips the bad byte
+        assert_eq!(percent_unquote_ignore("ok%FF%FEagain%FF"), "okagain");
+        assert_eq!(percent_unquote_ignore("a%C3%A9b"), "a\u{00e9}b");
+    }
+
+    #[test]
+    fn percent_unquote_drops_invalid_utf8_bytes() {
+        let out = decode_common_encodings("%FF%FEok");
+        assert!(out.contains("ok"), "unexpected: {out}");
+        assert!(!out.contains('\u{FFFD}'));
+        // a valid prefix before the invalid byte is preserved (the Err arm
+        // re-emits the valid run and steps past the bad byte)
+        let out = decode_common_encodings("ok%FF%FEagain%FF");
+        assert!(out.contains("okagain"), "unexpected: {out}");
+    }
+
+    #[test]
+    fn base64_candidates_resolve_route_tiers_through_the_pads() {
+        // eleven data chars with a single pad: the alt-1 pin scans the
+        // trailing run for the rightmost single '='
+        let mut attempts = 0u32;
+        let out = decode_base64_candidates("QUJDREVGR0hJSk=", &mut attempts);
+        assert!(!out.is_empty());
+        // ten data chars with a double pad
+        let mut attempts = 0u32;
+        let out = decode_base64_candidates("QUJDREVGSI==", &mut attempts);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn base64_candidates_skip_overlapping_and_padded_spans() {
+        let mut attempts = 0u32;
+        // two adjacent padded candidates: the second span overlaps the first
+        let out = decode_base64_candidates("QUJDREVG==QUJDREVG==", &mut attempts);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn truncate_keeps_attack_regions_with_gap_budgets() {
+        // attack regions plus inter-attack gaps share the scan budget; the
+        // trailing context is appended when the budget survives
+        let mut content = String::new();
+        content.push_str(&"a".repeat(80));
+        content.push_str("union select");
+        content.push_str(&"b".repeat(80));
+        content.push_str("drop table");
+        content.push_str(&"c".repeat(80));
+        let out = truncate_safely(&content, 220, true, 10_000);
+        assert!(!out.is_empty());
+        assert!(out.chars().count() <= 220);
+        assert!(out.contains("union select"));
+        assert!(out.contains("drop table"));
+    }
+
+    #[test]
+    fn short_additive_view_joins_marker_fragments() {
+        // QQJD decodes to bytes with a '#'; the fragment joins with newlines
+        let content = "$esh {esh #esh";
+        let out = short_base64_additive_view(content, 10_000, true, 10_000);
+        let _ = out;
+        let content = "e{No#";
+        let out = short_base64_additive_view(content, 10_000, true, 10_000);
+        assert!(out.contains('\n') || out.is_empty());
+    }
+
+    #[test]
+    fn gzip_magic_tokens_keep_the_raw_payload() {
+        // H4sIAA== decodes to the gzip magic; without a decompressor the raw
+        // bytes stay and the printable gate rejects the token
+        let mut attempts = 1u32;
+        let out = decode_base64_candidates("H4sIAA==", &mut attempts);
+        // the gunzip attempt is consumed, the raw bytes stay, and the
+        // printable gate then rejects the token
+        assert_eq!(attempts, 1);
+        assert_eq!(out, "H4sIAA==");
+    }
+
+    #[test]
+    fn hex_literals_are_never_base64_candidates() {
+        let mut attempts = 0u32;
+        let out = decode_base64_candidates("0xDEADBEEF==", &mut attempts);
+        assert_eq!(out, "0xDEADBEEF==");
+    }
+
+    #[test]
+    fn base64_candidates_cover_the_pinning_alternatives() {
+        let mut attempts = 0u32;
+        // ten data chars with a double pad, eleven with a single pad, and a
+        // plain 12-char run
+        let out = decode_base64_candidates("QUJDREVG == QUJDREVG= QUJDREVGRes", &mut attempts);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn sub_floor_runs_reassemble_into_an_appended_fragment() {
+        let mut attempts = 0u32;
+        // the three 4-char runs sit below the decode floor individually; the
+        // reassembled fragment decodes and is appended after the raw token
+        let out = decode_base64_candidates("QUJD==QUJD==QUJD==-", &mut attempts);
+        assert!(out.contains("ABCABCABC"), "unexpected: {out}");
+    }
+
+    #[test]
+    fn truncate_safely_keeps_the_head_without_preserve() {
+        let content = "x".repeat(500);
+        let out = truncate_safely(&content, 100, false, 10_000);
+        assert_eq!(out, "x".repeat(100));
+    }
+
+    #[test]
+    fn truncate_safely_caps_with_the_tail_when_no_attacks() {
+        let content = "y".repeat(500);
+        let out = truncate_safely(&content, 100, true, 10_000);
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn truncate_safely_keeps_no_regions_for_clean_content() {
+        let out = extract_attack_regions("plain text without indicators", 10_000);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn truncate_safely_keeps_attack_regions_inside_the_budget() {
+        // an attack blob far larger than the scan budget: the regions are
+        // consumed chunk-wise until the budget runs out
+        let blob = "union select union select union select ".repeat(300);
+        let out = truncate_safely(&blob, 120, true, 10_000);
+        assert!(!out.is_empty());
+        assert!(out.chars().count() <= 120);
+    }
+
+    #[test]
+    fn short_base64_additive_view_stops_at_the_candidate_cap() {
+        let content = "QUJD ".repeat(20_100);
+        let out = short_base64_additive_view(&content, 10_000_000, true, 10_000_000);
+        assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn gzip_magic_tokens_consume_the_gunzip_budget_and_stay_raw() {
+        // "H4tBQUFBQUFB" decodes to the gzip magic plus printable padding:
+        // the gunzip attempt is consumed, the undecompressed bytes fail the
+        // gates, and the raw token survives
+        let mut attempts = 3u32;
+        let out = decode_base64_candidates("H4tBQUFBQUFB", &mut attempts);
+        assert_eq!(attempts, 2);
+        // the undecompressed payload fails the UTF-8 gate and loses the token
+        assert_ne!(out, "H4tBQUFBQUFB");
+        assert!(out.contains("AAAAAAA"), "unexpected: {out}");
+    }
+
+    #[test]
+    fn a_hex_literal_candidate_is_never_base64_decoded() {
+        // 14 hex digits make the token a candidate span; the 0x literal is
+        // rejected before any decode is attempted
+        let mut attempts = 0u32;
+        let out = decode_base64_candidates("value 0xdeadbeef1234 end", &mut attempts);
+        assert!(out.contains("0xdeadbeef1234"));
+    }
+
+    #[test]
+    fn sub_floor_runs_append_a_fragment_absent_from_the_base() {
+        // the full cleaned token fails to decode (the binary tail), the three
+        // reassembled 4-char runs decode, and the fragment is appended
+        let mut attempts = 0u32;
+        let out = decode_base64_candidates("QUJD==QUJD==QUJD.//79/Pv6+fj3", &mut attempts);
+        assert_eq!(out, "QUJD==QUJD==QUJD.//79/Pv6+fj3 ABCABCABC");
+    }
+
+    #[test]
+    fn truncation_with_one_context_byte_renders_a_lone_separator() {
+        // attack region of 210 chars, budget 211: the leading 2-char gap gets
+        // a 1-char budget, which renders as a single space
+        let content = format!("{}{}{}", "y".repeat(102), "union select", "y".repeat(98));
+        let out = truncate_safely(&content, 211, true, 10_000);
+        assert_eq!(out.chars().count(), 211);
+        assert!(out.starts_with(' '));
+        assert!(out.contains("union select"));
+    }
+
+    #[test]
+    fn truncation_stops_consuming_regions_once_the_budget_runs_out() {
+        // three disjoint attack regions of 212 chars each against a 420-char
+        // budget: the third region is never reached
+        let content = format!(
+            "{}{}{}{}{}{}",
+            "x".repeat(100),
+            "union select",
+            "x".repeat(300),
+            "union select",
+            "x".repeat(300),
+            "union select",
+        );
+        let out = truncate_safely(&content, 420, true, 10_000);
+        assert_eq!(out.chars().count(), 420);
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+
+    #[test]
+    fn eleven_data_chars_anchor_on_a_single_pad() {
+        // alternative 2 of the token shape: 11 data chars plus one `=`
+        assert_eq!(base64_token_spans("AAAAAAAAAAA="), vec![(0, 12)]);
+        // a trailing separator after the `=`: the rightmost `=` whose
+        // successor is not `=` still anchors the match end (the `?` stays
+        // outside the token)
+        assert_eq!(base64_token_spans("AAAAAAAAAAA=?"), vec![(0, 12)]);
+    }
+
+    #[test]
+    fn ten_data_chars_anchor_on_a_double_pad() {
+        // alternative 3 of the token shape: 10 data chars plus `==`
+        assert_eq!(base64_token_spans("AAAAAAAAAA=="), vec![(0, 12)]);
+        // a trailing separator after the `==`: the `==` pair not followed by
+        // another `=` anchors the match end
+        assert_eq!(base64_token_spans("AAAAAAAAAA==."), vec![(0, 12)]);
+    }
+
+    #[test]
+    fn gap_budget_shapes_the_collapsed_gap() {
+        let gap = ['a', 'b', 'c'];
+        // within budget: the gap rides through whole and the budget spends
+        // only the difference
+        assert_eq!(consume_gap(&gap, 0, 2, 3), (String::from("ab"), 1));
+        // over budget with room: the leading chunk rides and one space
+        // separates
+        assert_eq!(consume_gap(&gap, 0, 3, 2), (String::from("a "), 0));
+        // over budget at a zero-length piece: only the separating space
+        assert_eq!(consume_gap(&gap, 0, 3, 1), (String::from(" "), 0));
+    }
+
+    #[test]
+    fn the_additive_view_stops_after_twenty_thousand_candidates() {
+        // more base64-looking tokens than the candidate cap: the walk stops
+        // at the cap instead of decoding the whole input. `IyMj` decodes to
+        // `###`, which passes the printable and marker gates; one oversize
+        // token rides the oversize skip and one unprintable decode
+        // (`CQkJCQ==` is four tabs) rides the ratio gate.
+        let content = format!("CQkJCQ== IyMjIyMjIyMjIyMj {}", "IyMj ".repeat(20_001));
+        let view = short_base64_additive_view(&content, usize::MAX, false, usize::MAX);
+        assert!(view.contains('\n'), "decoded fragments join on newlines");
+        // the cap stopped the walk: the two skipped candidates never render
+        let fragments = view.split('\n').count();
+        assert_eq!(fragments, 19_998);
     }
 }

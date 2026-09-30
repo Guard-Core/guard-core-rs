@@ -976,8 +976,12 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::distributed::MemoryStore;
 
     /// A fake clock: f64 unix seconds starting at `1_000.0`, advanced by
     /// `advance`.
@@ -1561,5 +1565,466 @@ mod tests {
             assert!(decision.allowed());
         }
         assert_eq!(limiter.tracked_windows(), 0, "nothing was recorded");
+    }
+
+    #[test]
+    fn zero_request_entries_are_rejected() {
+        assert_eq!(RateLimitEntry::new(0, 60).err().unwrap().field, "requests");
+    }
+
+    #[test]
+    fn tier_names_read_like_the_reference_reasons() {
+        assert_eq!(RateLimitTier::Endpoint.name(), "endpoint");
+        assert_eq!(RateLimitTier::Route.name(), "route");
+        assert_eq!(RateLimitTier::Geo.name(), "geo");
+        assert_eq!(RateLimitTier::Global.name(), "global");
+    }
+
+    #[test]
+    fn limiter_debug_carries_the_config() {
+        let limiter = RateLimiter::with_clock(Arc::new(system_clock));
+        assert!(format!("{limiter:?}").contains("RateLimiter"));
+        assert_eq!(limiter.config().rate_limit_window, 60);
+    }
+
+    #[test]
+    fn distributed_checks_short_circuit_when_disabled() {
+        let limiter = RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: false,
+                ..RateLimitConfig::default()
+            },
+            Arc::new(system_clock),
+        )
+        .expect("config");
+        let decision = limiter
+            .check_distributed(ip("192.0.2.51"), None)
+            .expect("inert");
+        assert!(decision.allowed);
+
+        let tiers = limiter
+            .check_tiers_distributed(ip("192.0.2.51"), Some("/x"), None, None)
+            .expect("inert");
+        assert!(tiers.allowed());
+    }
+
+    #[test]
+    fn distributed_tiers_cover_endpoint_route_and_geo_windows() {
+        let fake = FakeClock::default();
+        let store = Arc::new(MemoryStore::default());
+        let geo_limits = HashMap::from([
+            ("RU".to_owned(), RateLimitEntry::new(2, 60).unwrap()),
+            ("*".to_owned(), RateLimitEntry::new(5, 60).unwrap()),
+        ]);
+        let route = RouteRateLimits::new(Some(3), Some(30), Some(geo_limits)).expect("valid route");
+        let limiter = RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 100,
+                endpoint_rate_limits: std::iter::once((
+                    "/api".to_owned(),
+                    RateLimitEntry::new(2, 60).unwrap(),
+                ))
+                .collect(),
+                ..RateLimitConfig::default()
+            },
+            fake.clock(),
+        )
+        .expect("config")
+        .with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::SlidingWindowStore>,
+            "gc:",
+            false,
+        );
+
+        // the country resolver only answers for one probe address: both of
+        // its arms run across the calls below
+        let country_ru = |probe: IpAddr| -> Option<String> {
+            if probe == ip("192.0.2.52") {
+                Some("RU".to_owned())
+            } else {
+                None
+            }
+        };
+        // the distributed tiers share the (ip, path) window, so each tier's
+        // record lands in the same sliding window: three tiers put three hits
+        // in it, and the RU geo entry (limit 2) throttles the first request
+        let first = limiter
+            .check_tiers_distributed(
+                ip("192.0.2.52"),
+                Some("/api"),
+                Some(&route),
+                Some(&country_ru),
+            )
+            .expect("store");
+        assert!(!first.allowed());
+        assert_eq!(first.tier(), RateLimitTier::Geo);
+        assert_eq!(first.count(), 3);
+
+        // without a resolvable country the '*' fallback applies on its own
+        // keyed window and stays under its limit
+        let second = limiter
+            .check_tiers_distributed(
+                ip("192.0.2.53"),
+                Some("/other"),
+                Some(&route),
+                Some(&country_ru),
+            )
+            .expect("store");
+        assert!(second.allowed());
+
+        // the resolvable country on its own keyed window stays under the RU
+        // entry (the resolver's hit arm)
+        let third = limiter
+            .check_tiers_distributed(
+                ip("192.0.2.52"),
+                Some("/other"),
+                Some(&route),
+                Some(&country_ru),
+            )
+            .expect("store");
+        assert!(third.allowed());
+    }
+
+    #[test]
+    fn a_store_error_propagates_from_the_endpoint_tier() {
+        let store = Arc::new(MemoryStore::default());
+        let limiter = RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 100,
+                endpoint_rate_limits: std::iter::once((
+                    "/api".to_owned(),
+                    RateLimitEntry::new(2, 60).unwrap(),
+                ))
+                .collect(),
+                ..RateLimitConfig::default()
+            },
+            FakeClock::default().clock(),
+        )
+        .expect("config")
+        .with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::SlidingWindowStore>,
+            "gc:",
+            false,
+        );
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            limiter
+                .check_tiers_distributed(ip("192.0.2.60"), Some("/api"), None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_store_error_propagates_from_the_geo_tier() {
+        let store = Arc::new(MemoryStore::default());
+        let geo_limits = HashMap::from([("RU".to_owned(), RateLimitEntry::new(2, 60).unwrap())]);
+        let route = RouteRateLimits::new(None, None, Some(geo_limits)).expect("valid route");
+        let limiter = RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: true,
+                ..RateLimitConfig::default()
+            },
+            FakeClock::default().clock(),
+        )
+        .expect("config")
+        .with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::SlidingWindowStore>,
+            "gc:",
+            false,
+        );
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        // no endpoint entry and no route limit: the geo tier records and the
+        // backend-down error surfaces
+        assert!(
+            limiter
+                .check_tiers_distributed(
+                    ip("192.0.2.61"),
+                    Some("/other"),
+                    Some(&route),
+                    Some(&|_| Some("RU".to_owned())),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_geo_limit_miss_falls_through_to_the_global_tier() {
+        let store = Arc::new(MemoryStore::default());
+        let geo_limits = HashMap::from([("CN".to_owned(), RateLimitEntry::new(2, 60).unwrap())]);
+        let route = RouteRateLimits::new(None, None, Some(geo_limits)).expect("valid route");
+        let limiter = RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: true,
+                ..RateLimitConfig::default()
+            },
+            FakeClock::default().clock(),
+        )
+        .expect("config")
+        .with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::SlidingWindowStore>,
+            "gc:",
+            false,
+        );
+        // the country has no geo entry and there is no '*' fallback
+        let decision = limiter
+            .check_tiers_distributed(
+                ip("192.0.2.62"),
+                Some("/other"),
+                Some(&route),
+                Some(&|_| Some("US".to_owned())),
+            )
+            .expect("store");
+        assert!(decision.allowed());
+        assert_eq!(decision.tier(), RateLimitTier::Global);
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use crate::distributed::MemoryStore;
+    use std::str::FromStr;
+
+    fn ip(text: &str) -> IpAddr {
+        IpAddr::from_str(text).expect("test address")
+    }
+
+    /// A limiter wired to a backend that answers every call with the
+    /// backend-down error, so each tier's `?` surfaces its `StoreError`.
+    fn failing_store_limiter(endpoint: Option<(&str, RateLimitEntry)>) -> RateLimiter {
+        let store = MemoryStore::default();
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut endpoint_rate_limits = HashMap::new();
+        if let Some((path, entry)) = endpoint {
+            endpoint_rate_limits.insert(path.to_owned(), entry);
+        }
+        RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 100,
+                endpoint_rate_limits,
+                ..RateLimitConfig::default()
+            },
+            Arc::new(system_clock),
+        )
+        .expect("config")
+        .with_distributed_store(
+            Arc::new(store) as Arc<dyn crate::distributed::SlidingWindowStore>,
+            "gc:",
+            false,
+        )
+    }
+
+    #[test]
+    fn the_endpoint_tier_surfaces_a_failing_backend() {
+        let limiter = failing_store_limiter(Some((
+            "/api",
+            RateLimitEntry::new(2, 60).expect("valid entry"),
+        )));
+        assert!(
+            limiter
+                .check_tiers_distributed(ip("192.0.2.60"), Some("/api"), None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_geo_tier_surfaces_a_failing_backend() {
+        let geo_limits = HashMap::from([(
+            "RU".to_owned(),
+            RateLimitEntry::new(2, 60).expect("valid entry"),
+        )]);
+        // the geo-only route reaches the geo stage before any record call
+        let route = RouteRateLimits::new(None, None, Some(geo_limits)).expect("valid route");
+        let limiter = failing_store_limiter(None);
+        let country = |probe: IpAddr| -> Option<String> {
+            if probe == ip("192.0.2.61") {
+                Some("RU".to_owned())
+            } else {
+                None
+            }
+        };
+        // a resolvable country runs the geo record against the failing
+        // backend
+        assert!(
+            limiter
+                .check_tiers_distributed(
+                    ip("192.0.2.61"),
+                    Some("/other"),
+                    Some(&route),
+                    Some(&country),
+                )
+                .is_err()
+        );
+        // an unresolvable country skips the geo entry and fails at the
+        // global stage instead
+        assert!(
+            limiter
+                .check_tiers_distributed(
+                    ip("192.0.2.62"),
+                    Some("/other"),
+                    Some(&route),
+                    Some(&country),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exhausted_tiers_answer_their_denials() {
+        // a working store: each tier's own limit trips its decision shape
+        let store = Arc::new(MemoryStore::default());
+        let geo_limits = HashMap::from([(
+            "RU".to_owned(),
+            RateLimitEntry::new(1, 60).expect("valid entry"),
+        )]);
+        let limiter = RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 1,
+                endpoint_rate_limits: std::iter::once((
+                    "/api".to_owned(),
+                    RateLimitEntry::new(1, 60).expect("valid entry"),
+                ))
+                .collect(),
+                ..RateLimitConfig::default()
+            },
+            Arc::new(system_clock),
+        )
+        .expect("config")
+        .with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::SlidingWindowStore>,
+            "gc:",
+            false,
+        );
+        let country_ru = |probe: IpAddr| -> Option<String> {
+            if probe == ip("192.0.2.63") || probe == ip("192.0.2.67") {
+                Some("RU".to_owned())
+            } else {
+                None
+            }
+        };
+        let route = RouteRateLimits::new(Some(1), Some(30), None).expect("valid route");
+        // the geo route carries no decorator limit of its own, so the geo
+        // entry's record is the first hit on the shared window
+        let geo_route = RouteRateLimits::new(None, None, Some(geo_limits)).expect("valid route");
+
+        // the endpoint tier denies at its own limit
+        let endpoint = limiter
+            .check_tiers_distributed(ip("192.0.2.63"), Some("/api"), None, None)
+            .expect("store");
+        assert!(endpoint.allowed());
+        let endpoint = limiter
+            .check_tiers_distributed(ip("192.0.2.63"), Some("/api"), None, None)
+            .expect("store");
+        assert!(!endpoint.allowed());
+
+        // the route tier denies on its decorator limit
+        let route_hit = limiter
+            .check_tiers_distributed(ip("192.0.2.64"), Some("/route"), Some(&route), None)
+            .expect("store");
+        assert!(route_hit.allowed());
+        let route_hit = limiter
+            .check_tiers_distributed(ip("192.0.2.64"), Some("/route"), Some(&route), None)
+            .expect("store");
+        assert!(!route_hit.allowed());
+
+        // the geo tier denies on its country limit
+        let geo = limiter
+            .check_tiers_distributed(
+                ip("192.0.2.67"),
+                Some("/geo"),
+                Some(&geo_route),
+                Some(&country_ru),
+            )
+            .expect("store");
+        assert!(geo.allowed(), "first geo: {geo:?}");
+        // an unresolvable country skips the geo entry entirely
+        let skipped = limiter
+            .check_tiers_distributed(
+                ip("192.0.2.68"),
+                Some("/geo"),
+                Some(&geo_route),
+                Some(&country_ru),
+            )
+            .expect("store");
+        assert!(skipped.allowed(), "skipped geo: {skipped:?}");
+        let geo = limiter
+            .check_tiers_distributed(
+                ip("192.0.2.67"),
+                Some("/geo"),
+                Some(&geo_route),
+                Some(&country_ru),
+            )
+            .expect("store");
+        assert!(!geo.allowed(), "second geo: {geo:?}");
+        assert_eq!(geo.tier(), RateLimitTier::Geo);
+
+        // the global tier denies on the workspace-wide limit
+        let global = limiter
+            .check_tiers_distributed(ip("192.0.2.65"), Some("/other"), None, None)
+            .expect("store");
+        assert!(global.allowed());
+        let global = limiter
+            .check_tiers_distributed(ip("192.0.2.65"), Some("/other"), None, None)
+            .expect("store");
+        assert!(!global.allowed());
+        assert_eq!(global.tier(), RateLimitTier::Global);
+    }
+
+    #[test]
+    fn the_global_tier_surfaces_a_failing_backend() {
+        // no endpoint entry, no route: the failure surfaces at the global
+        // stage's own record call
+        let limiter = failing_store_limiter(None);
+        assert!(
+            limiter
+                .check_tiers_distributed(ip("192.0.2.66"), Some("/other"), None, None)
+                .is_err()
+        );
+        assert!(
+            limiter
+                .check_tiers_distributed(ip("192.0.2.66"), None, None, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_geo_tier_without_a_matching_country_falls_through_to_the_global_tier() {
+        // the route carries only a `RU` entry: an unresolvable country finds
+        // no geo entry and the scan continues on the global tier
+        let store = Arc::new(MemoryStore::default());
+        let geo_limits = HashMap::from([(
+            "RU".to_owned(),
+            RateLimitEntry::new(2, 60).expect("valid entry"),
+        )]);
+        let route = RouteRateLimits::new(Some(3), Some(30), Some(geo_limits)).expect("valid route");
+        let limiter = RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: true,
+                rate_limit: 100,
+                ..RateLimitConfig::default()
+            },
+            Arc::new(system_clock),
+        )
+        .expect("config")
+        .with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::SlidingWindowStore>,
+            "gc:",
+            false,
+        );
+        let no_country = |_: IpAddr| -> Option<String> { None };
+        let decision = limiter
+            .check_tiers_distributed(
+                ip("192.0.2.62"),
+                Some("/other"),
+                Some(&route),
+                Some(&no_country),
+            )
+            .expect("store");
+        assert!(decision.allowed());
+        assert_eq!(decision.tier(), RateLimitTier::Global);
     }
 }

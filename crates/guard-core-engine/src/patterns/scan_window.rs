@@ -116,3 +116,57 @@ mod tests {
         assert!(bounded_finditer("<script>a", &compiled, &prefix, &terminator).is_empty());
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_finditer_returns_nothing_when_the_prefix_is_absent() {
+        let compiled =
+            crate::patterns::pyregex::PyRegex::compile(r"<script[^>]*>x</script>", false).unwrap();
+        let prefix = crate::patterns::pyregex::PyRegex::compile("<script", false).unwrap();
+        let terminator =
+            crate::patterns::pyregex::PyRegex::compile(r"<\/script\s*>", false).unwrap();
+        // the terminator exists but no prefix anywhere: nothing matches
+        assert!(bounded_finditer("tail </script>", &compiled, &prefix, &terminator).is_empty());
+    }
+
+    #[test]
+    fn a_prefix_position_the_window_cannot_anchor_is_abandoned() {
+        let compiled = PyRegex::compile(r"<script[^>]*>[^<]*<\/script\s*>", false).unwrap();
+        let prefix = PyRegex::compile("<script", false).unwrap();
+        let terminator = PyRegex::compile(r"<\/script\s*>", false).unwrap();
+        // the first prefix occurrence is followed by `a</b>` before any `>`:
+        // the window pattern cannot anchor there and the position is dropped
+        let text = "<script>a</b> <script>b</script>";
+        let ms = bounded_finditer(text, &compiled, &prefix, &terminator);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].text(text), "<script>b</script>");
+    }
+
+    #[test]
+    fn prefix_candidates_at_or_past_the_last_terminator_are_skipped() {
+        let compiled = PyRegex::compile(r"<script[^>]*>[^<]*<\/script\s*>", false).unwrap();
+        let prefix = PyRegex::compile("<script", false).unwrap();
+        let terminator = PyRegex::compile(r"<\/script\s*>", false).unwrap();
+        // the trailing `<script>` sits beyond the last terminator end
+        let text = "<script>a</script> tail <script>";
+        let ms = bounded_finditer(text, &compiled, &prefix, &terminator);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].text(text), "<script>a</script>");
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+    use crate::patterns::pyregex::PyRegex;
+
+    #[test]
+    fn an_inverted_window_is_never_anchored() {
+        // `start > end` truncates to an empty (inverted) span: no anchor
+        let re = PyRegex::compile(r"a", false).unwrap();
+        assert!(match_span(re.re(), "abc", 2, 1).is_none());
+    }
+}

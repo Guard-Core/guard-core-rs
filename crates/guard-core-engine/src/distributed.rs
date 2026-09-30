@@ -385,3 +385,30 @@ mod distributed_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_backend_surfaces_the_store_error() {
+        let store = MemoryStore::default();
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        // any backend call answers the backend-down error
+        assert!(store.record_hit("k", 1_000.0, 60).is_err());
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_backend_surfaces_the_store_error_for_ban_operations() {
+        let store = MemoryStore::default();
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(store.set_ban("k", 1_000.0, 60).is_err());
+        assert!(store.get_ban("k").is_err());
+        assert!(store.delete_ban("k").is_err());
+    }
+}

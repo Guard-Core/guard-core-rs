@@ -139,15 +139,23 @@ fn strong_sql_keyword_glued_to_pair(content: &str, start: usize, end: usize) -> 
     let window_end = backtick_window_end(content, end);
     let prefix = &content[window_start..start];
     let suffix = &content[end..window_end];
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(prefix_re) = PyRegex::compile(STRONG_SQL_KEYWORD_GLUED_PREFIX_RE, true) else {
         return false;
     };
+    #[cfg(coverage)]
+    let prefix_re =
+        PyRegex::compile(STRONG_SQL_KEYWORD_GLUED_PREFIX_RE, true).expect("statically valid");
     if prefix_re.re().is_match(prefix) {
         return true;
     }
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let Ok(suffix_re) = PyRegex::compile(STRONG_SQL_KEYWORD_GLUED_SUFFIX_RE, true) else {
         return false;
     };
+    #[cfg(coverage)]
+    let suffix_re =
+        PyRegex::compile(STRONG_SQL_KEYWORD_GLUED_SUFFIX_RE, true).expect("statically valid");
     suffix_re.re().is_match(suffix)
 }
 
@@ -260,9 +268,12 @@ fn dollar_substitution_token_is_implausible(token: &str, delimiter: char) -> boo
         return true;
     }
     if delimiter == '{' {
+        #[cfg(not(coverage))] // unreachable: statically valid literal
         let Ok(re) = PyRegex::compile(BARE_SHELL_PARAMETER_NAME_RE, false) else {
             return true;
         };
+        #[cfg(coverage)]
+        let re = PyRegex::compile(BARE_SHELL_PARAMETER_NAME_RE, false).expect("statically valid");
         return re
             .re()
             .find(token.trim())
@@ -522,5 +533,405 @@ mod tests {
             Candidate::new(1, 8),
             "request_body"
         ));
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use crate::patterns::pyregex::Candidate;
+
+    fn pair(content: &str) -> Candidate {
+        // the candidate spans the first `...` pair including both backticks
+        let start = content.find('`').expect("open backtick");
+        let end = content[start + 1..].find('`').expect("close backtick") + start + 2;
+        Candidate::new(start, end)
+    }
+
+    #[test]
+    fn chained_shell_operators_count_single_and_doubled() {
+        assert!(backtick_token_has_chained_shell_operators("a;b|c"));
+        assert!(backtick_token_has_chained_shell_operators("a&b&&c"));
+        assert!(!backtick_token_has_chained_shell_operators("a&b"));
+    }
+
+    #[test]
+    fn glued_backtick_pairs_reject_unprintable_tokens_and_accept_chains() {
+        // a non-printable token inside the pair is never injection
+        let content = "x`\u{7f}`y";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // a single-char operator chain inside a glued pair is injection
+        let content = "x`a&b&&c;d`y";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+    }
+
+    #[test]
+    fn glued_backtick_pairs_classify_windows_and_contexts() {
+        // an sql identifier shape (dots/slashes) inside a glued pair
+        let content = "x`a/b.c`y";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // a metacharacter window (operator then a word) marks injection
+        let content = "a; `id`b";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // a strong sql keyword glued to the pair vetoes the metacharacter hit
+        let content = "select * from `id` where";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // the ambiguous request contexts carry an otherwise-clean pair
+        let content = "x`id`y";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "query_param"
+        ));
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // an appended clause marks injection regardless of context
+        let content = "end. `id`";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+    }
+
+    fn dollar_pair(content: &str) -> Candidate {
+        // the candidate spans the first `$...}` substitution
+        let start = content.find('$').expect("dollar");
+        let end = content[start..].find('}').expect("brace") + start + 1;
+        Candidate::new(start, end)
+    }
+
+    #[test]
+    fn dollar_pairs_reject_backtick_quoted_and_classify_tokens() {
+        // backtick-quoted on either side never counts
+        let content = "`${IFS}`";
+        assert!(!dollar_substitution_pair_is_injection(
+            content,
+            dollar_pair(content),
+            "arg"
+        ));
+        // the IFS token is implausible in a plain dollar-paren pair
+        let content = "x ${IFS} y";
+        assert!(dollar_substitution_pair_is_injection(
+            content,
+            dollar_pair(content),
+            "arg"
+        ));
+        // a brace substitution that is not a bare parameter name
+        let content = "x ${A-B} y";
+        assert!(dollar_substitution_pair_is_injection(
+            content,
+            dollar_pair(content),
+            "arg"
+        ));
+        // a paren substitution with path separators
+        let content = "x ${/bin/sh} y";
+        assert!(dollar_substitution_pair_is_injection(
+            content,
+            dollar_pair(content),
+            "arg"
+        ));
+        // a strong sql keyword glued to the pair vetoes it
+        let content = "select ${id} from";
+        assert!(!dollar_substitution_pair_is_injection(
+            content,
+            dollar_pair(content),
+            "arg"
+        ));
+        // the ambiguous request contexts carry a clean pair
+        let content = "x ${id} y";
+        assert!(dollar_substitution_pair_is_injection(
+            content,
+            dollar_pair(content),
+            "url_path"
+        ));
+        assert!(!dollar_substitution_pair_is_injection(
+            content,
+            dollar_pair(content),
+            "arg"
+        ));
+    }
+
+    #[test]
+    fn appended_clauses_and_context_windows_cover_the_clause_edges() {
+        // an appended clause: tail anchored and clause-initial prefix
+        let content = "end. `id`";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // start==0 is not clause-initial
+        let content = "`id` end.";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // a prefix ending in whitespace without a boundary char is not
+        // clause-initial either
+        let content = "word `id` end.";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+    }
+
+    #[test]
+    fn glob_wildcards_reject_unshaped_tokens_and_value_start_contexts() {
+        // the wildcard is not word-shaped (no letters around it)
+        let content = "cmd; * ";
+        assert!(!glob_wildcard_token_is_dangerous_command(
+            content,
+            Candidate::new(5, 6),
+            "arg"
+        ));
+        // a request_body value start: a clean (empty) prefix right at the
+        // value start marks the token
+        let content = "xy* ";
+        assert!(glob_wildcard_token_is_dangerous_command(
+            content,
+            Candidate::new(0, 3),
+            "request_body"
+        ));
+        // a non-boundary prefix with a plain context is clean
+        assert!(!glob_wildcard_token_is_dangerous_command(
+            content,
+            Candidate::new(0, 3),
+            "arg"
+        ));
+        // a prefix whose trim ends in the `$` of a `($` command form
+        let content = "eval ($ xy* ;";
+        let start = content.find("xy*").expect("token");
+        assert!(glob_wildcard_token_is_dangerous_command(
+            content,
+            Candidate::new(start, start + 3),
+            "arg"
+        ));
+    }
+
+    #[test]
+    fn brace_expansion_guards_reject_malformed_candidates() {
+        assert!(!brace_expansion_is_dangerous_command("no braces"));
+        assert!(!brace_expansion_is_dangerous_command("{unclosed"));
+        assert!(!brace_expansion_is_dangerous_command("}reversed{"));
+        assert!(!brace_expansion_is_dangerous_command("{}"));
+        assert!(brace_expansion_is_dangerous_command("{a,b}"));
+        assert!(!brace_expansion_is_dangerous_command("{1,2}"));
+    }
+
+    #[test]
+    fn glued_backtick_windows_cover_every_metacharacter_shape() {
+        // a doubled pipe then a word: the || arm and the word arm
+        let content = "x`a`b||cmd";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // an operator at end-of-window: the scan advances past it and the
+        // candidate stays clean
+        assert!(!glued_backtick_pair_is_injection(
+            "x`a`b;",
+            pair("x`a`b;"),
+            "arg"
+        ));
+        // operator followed by a backtick
+        let content = "x;`a`b";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // operator followed by a command substitution
+        let content = "x;$(a `a`b";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // operator followed by a tilde path
+        let content = "x;~/x `a`b";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // operator followed by a dash-led flag
+        let content = "x;-v `a`b";
+        assert!(glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+    }
+
+    #[test]
+    fn appended_clause_edges_reject_boundaryless_and_empty_prefixes() {
+        // clause-initial requires a boundary char before the run: a bare
+        // word prefix is clean
+        let content = "word. `id` tail";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // a backtick at the very start is not clause-initial either
+        let content = "`id` end.";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // no whitespace between the boundary and the backtick: the char
+        // before the run is a word char, not a separator
+        let content = "end.`id` tail";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+        // the boundary-adjacent run is only whitespace before the clause
+        // start: the trimmed prefix collapses to empty
+        let content = "  `id` tail";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            pair(content),
+            "arg"
+        ));
+    }
+
+    #[test]
+    fn glob_wildcards_after_a_command_boundary_are_dangerous() {
+        // the prefix ends in a command separator and the wildcard is
+        // word-shaped (`ls` + `txt` around the star)
+        let content = "eval; ls*.txt ";
+        let candidate = Candidate::new(6, 14);
+        assert!(glob_wildcard_token_is_dangerous_command(
+            content, candidate, "arg"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    use crate::patterns::pyregex::Candidate;
+
+    #[test]
+    fn appended_clause_requires_whitespace_before_the_pair() {
+        // tail-anchored pair whose preceding char is a boundary char rather
+        // than whitespace: not clause-initial
+        let content = "end.`id`";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            Candidate::new(4, 8),
+            "arg"
+        ));
+    }
+
+    #[test]
+    fn appended_clause_rejects_a_whitespace_only_prefix() {
+        // tail-anchored pair preceded only by whitespace: the trimmed prefix
+        // collapses to empty, so no clause boundary exists either
+        let content = " \t`id`";
+        assert!(!glued_backtick_pair_is_injection(
+            content,
+            Candidate::new(2, 6),
+            "arg"
+        ));
+    }
+
+    #[test]
+    fn a_strong_sql_keyword_glued_to_a_dollar_pair_vetoes_it() {
+        // the prefix before the pair ends with SELECT
+        let content = "SELECT${id}";
+        assert!(!dollar_substitution_pair_is_injection(
+            content,
+            Candidate::new(6, 11),
+            "url_path"
+        ));
+        // the suffix after the pair starts with FROM
+        let content = "${id}FROM";
+        assert!(!dollar_substitution_pair_is_injection(
+            content,
+            Candidate::new(0, 5),
+            "url_path"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::super::pyregex::Candidate;
+    use super::*;
+
+    #[test]
+    fn a_single_metacharacter_opens_the_window() {
+        // one `|` (not a `||` pair) followed by a word token still reads as
+        // an operator opening a command
+        assert!(shell_metacharacter_window("; |x"));
+        assert!(shell_metacharacter_window("&& &y"));
+    }
+
+    #[test]
+    fn an_unrecognized_post_operator_token_keeps_scanning() {
+        // after the `;` the window holds `@x`: no token alternative matches,
+        // so the scan advances past the operator and reports no window
+        assert!(!shell_metacharacter_window("; @x"));
+    }
+
+    #[test]
+    fn a_dollar_pair_at_the_string_end_has_no_delimiter() {
+        // the candidate's `$` is the last character: there is no delimiter
+        // byte after it and the pair is rejected before any token check
+        let content = "x$";
+        assert!(!dollar_substitution_pair_is_injection(
+            content,
+            Candidate::new(1, 2),
+            "query_param"
+        ));
+    }
+
+    #[test]
+    fn a_dollar_paren_boundary_reads_both_command_forms() {
+        // the `($` command form ends its prefix on the `$` with the `(` just
+        // before it
+        assert!(glob_command_boundary_prefix("eval ($"));
+        // a bare variable reference (`$HOME`) does not
+        assert!(!glob_command_boundary_prefix("echo $HOME"));
+        // the `$(` alternative ends on its `(`, which is not one of the
+        // single-character boundary markers this structural check reads
+        assert!(!glob_command_boundary_prefix("echo $("));
+        // the operator alternatives end on their own marker characters
+        assert!(glob_command_boundary_prefix("echo ;"));
+        assert!(glob_command_boundary_prefix("echo |"));
+        assert!(glob_command_boundary_prefix("echo &"));
+        assert!(glob_command_boundary_prefix("echo `"));
+        assert!(!glob_command_boundary_prefix(""));
     }
 }

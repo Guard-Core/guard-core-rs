@@ -173,3 +173,27 @@ mod tests {
         assert!(!re.re().is_match("ro0ab"));
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn find_all_maps_every_match_to_a_candidate() {
+        let re = PyRegex::compile(r"ab", false).unwrap();
+        let ms = find_all(re.re(), "abxab");
+        assert_eq!(ms.len(), 2);
+        assert_eq!(ms[0].start, 0);
+        assert_eq!(ms[1].start, 3);
+    }
+
+    #[test]
+    fn a_trailing_escape_passes_through_the_translator() {
+        // a source ending in a lone backslash has no escaped char to consume
+        assert_eq!(translate("x\\"), "x\\");
+        assert_eq!(translate("\\"), "\\");
+        // the regex crate rejects the malformed source, but only after the
+        // translation ran
+        assert!(PyRegex::compile("x\\", false).is_err());
+    }
+}

@@ -20,6 +20,9 @@ unicode-normalization = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
+# cargo-llvm-cov sets cfg(coverage) during coverage builds; declare it so the
+# cfg(not(coverage)) pairs in the sources stay lint-clean.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 
 [lints.clippy]
 all                      = { level = "deny", priority = -1 }

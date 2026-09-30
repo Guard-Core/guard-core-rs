@@ -576,4 +576,50 @@ mod tests {
         let response = block_on(second.call(request_from_client("203.0.113.9"))).expect("ready");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
+
+    #[test]
+    fn stage_and_layer_debug_render_their_names() {
+        let config = CloudProviderStageConfig::default();
+        let stage = CloudProviderStage::new(config);
+        assert!(format!("{stage:?}").contains("CloudProviderStage"));
+        let layer = CloudProviderStageLayer::new(stage);
+        assert!(format!("{layer:?}").contains("CloudProviderStageLayer"));
+    }
+
+    #[test]
+    fn block_on_drives_a_pending_once_future() {
+        struct PendingOnce {
+            polled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Future for PendingOnce {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if !self.polled.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        block_on(PendingOnce {
+            polled: std::sync::Arc::clone(&polled),
+        });
+    }
+
+    #[test]
+    fn the_layer_service_polls_ready() {
+        let layer = CloudProviderStageLayer::new(CloudProviderStage::new(
+            CloudProviderStageConfig::default(),
+        ));
+        let mut service = ::tower::ServiceBuilder::new()
+            .layer(layer)
+            .service(Inner::new());
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
 }

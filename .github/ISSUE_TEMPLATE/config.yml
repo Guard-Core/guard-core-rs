@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Guard Core Rust Documentation
+    url: https://rennf93.github.io/guard-core-rs/
+    about: Check the documentation for usage information and tutorials
+  - name: Usage Questions
+    url: https://github.com/rennf93/guard-core-rs/discussions
+    about: Please ask and answer questions in GitHub Discussions
+  - name: Discord
+    url: https://discord.gg/ZW7ZJbjMkK
+    about: Questions and support in #help, new versions in #releases, development stream in #dev-feed

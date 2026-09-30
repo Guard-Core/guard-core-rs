@@ -100,3 +100,27 @@ impl Default for AttackKeywords {
         Self { categories }
     }
 }
+
+#[cfg(test)]
+mod empty_category_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_category_scores_zero_without_blocking_the_rest() {
+        // a caller can wire a category with no keywords yet: it scores 0.0
+        // while the populated categories still compute normally
+        let keywords = AttackKeywords {
+            categories: HashMap::from([
+                ("empty_kind", HashSet::new()),
+                ("path", HashSet::from(["etc", "passwd"])),
+            ]),
+        };
+        let probabilities = crate::semantic::attack_probability_with_tokens(
+            "/etc/passwd",
+            &[String::from("etc"), String::from("passwd")],
+            &keywords,
+        );
+        assert!(probabilities["empty_kind"].abs() < f64::EPSILON);
+        assert!(probabilities["path"] > 0.0, "path: {probabilities:?}");
+    }
+}

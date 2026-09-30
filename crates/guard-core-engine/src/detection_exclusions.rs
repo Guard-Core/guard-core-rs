@@ -867,3 +867,120 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    fn config() -> DetectConfig {
+        DetectConfig {
+            max_content_length: 10_000,
+            max_full_scan_bytes: 262_144,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            binary_min_run_length: 16,
+        }
+    }
+
+    #[test]
+    fn an_unterminated_bracket_entry_keeps_its_port_text() {
+        assert_eq!(strip_forwarded_entry_port("[::1"), "[::1");
+    }
+
+    #[test]
+    fn a_chain_of_only_empty_tokens_is_not_an_address_chain() {
+        assert!(!value_looks_like_address_chain(" , ,, "));
+    }
+
+    #[test]
+    fn empty_header_values_never_scan() {
+        let exclusions = ResolvedExclusions {
+            excluded_params: std::collections::HashSet::new(),
+            excluded_headers: std::collections::HashSet::new(),
+            excluded_body_fields: std::collections::HashSet::new(),
+            enabled_categories: None,
+            scan_body: false,
+        };
+        let headers = vec![
+            ("x-empty".to_owned(), String::new()),
+            ("x-attack".to_owned(), "10.0.0.5, 127.0.0.1".to_owned()),
+        ];
+        let verdict = scan_request(
+            &RequestSurfaces {
+                url_path: None,
+                query_params: &[],
+                headers: &headers,
+                content_type: "",
+                raw_body: "",
+            },
+            &exclusions,
+            &config(),
+        );
+        // only the non-empty header scans
+        assert!(verdict.is_threat);
+        assert_eq!(verdict.categories, vec!["ssrf".to_owned()]);
+    }
+
+    #[test]
+    fn an_excluded_address_header_suppresses_its_ssrf_category() {
+        let mut excluded_headers = std::collections::HashSet::new();
+        excluded_headers.insert("x-forwarded-for".to_owned());
+        let exclusions = ResolvedExclusions {
+            excluded_params: std::collections::HashSet::new(),
+            excluded_headers,
+            excluded_body_fields: std::collections::HashSet::new(),
+            enabled_categories: None,
+            scan_body: false,
+        };
+        let headers = vec![(
+            "x-forwarded-for".to_owned(),
+            "10.0.0.5, 127.0.0.1".to_owned(),
+        )];
+        let verdict = scan_request(
+            &RequestSurfaces {
+                url_path: None,
+                query_params: &[],
+                headers: &headers,
+                content_type: "",
+                raw_body: "",
+            },
+            &exclusions,
+            &config(),
+        );
+        // the ssrf category is filtered out, and with nothing left the scan
+        // ends clean (the terminal per-value filter)
+        assert!(!verdict.is_threat);
+        assert!(verdict.categories.is_empty());
+    }
+
+    #[test]
+    fn a_semantic_threat_contributes_no_category_to_the_reason() {
+        // the obfuscated keyword blob trips the semantic analyzer alongside
+        // the regex sqli hits: only the regex categories are reportable
+        let content = format!(
+            "select union insert update delete drop from where order group having concat \
+             substring database table column (1 OR 1=1) {}",
+            "A".repeat(120)
+        );
+        let verdict = scan_request(
+            &RequestSurfaces {
+                url_path: None,
+                query_params: &[],
+                headers: &[],
+                content_type: "text/plain",
+                raw_body: &content,
+            },
+            &ResolvedExclusions {
+                excluded_params: std::collections::HashSet::new(),
+                excluded_headers: std::collections::HashSet::new(),
+                excluded_body_fields: std::collections::HashSet::new(),
+                enabled_categories: None,
+                scan_body: true,
+            },
+            &config(),
+        );
+        assert!(verdict.is_threat);
+        assert_eq!(verdict.categories, vec!["sqli".to_owned()]);
+    }
+}

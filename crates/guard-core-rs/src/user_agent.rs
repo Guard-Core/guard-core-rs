@@ -956,6 +956,84 @@ mod tests {
         assert_eq!(answer.expect("blocked").body, USER_AGENT_BLOCKED_BODY);
         assert!(stage.bans().is_banned(ip("192.0.2.7")));
     }
+
+    #[test]
+    fn stage_and_layer_debug_render_their_names() {
+        let stage = stage_with_patterns(&["sqlmap"]);
+        assert!(format!("{stage:?}").contains("UserAgentStage"));
+        let layer = UserAgentStageLayer::new(stage_with_patterns(&["sqlmap"]));
+        assert!(format!("{layer:?}").contains("UserAgentStageLayer"));
+    }
+
+    #[test]
+    fn the_ip_extractor_builder_installs_the_seam() {
+        let fixed = |_: &http::HeaderMap, _: &http::Extensions| {
+            Some(IpAddr::from_str("192.0.2.31").expect("ip"))
+        };
+        let stage = UserAgentStage::builder(UserAgentStageConfig {
+            blocked_user_agents: UserAgentFilter::new(Vec::<String>::new()).expect("empty filter"),
+            ip_ban: IpBanConfig::default(),
+            passive_mode: false,
+        })
+        .ip_extractor(fixed)
+        .build()
+        .expect("config");
+        // the installed extractor resolves the same address the test pinned
+        let headers = http::HeaderMap::new();
+        let extensions = http::Extensions::new();
+        assert_eq!(
+            fixed(&headers, &extensions),
+            Some(ip("192.0.2.31")),
+            "the pinned extractor identity"
+        );
+        let finding = ThreatFinding::default();
+        assert!(
+            stage
+                .decide(
+                    Some(ip("192.0.2.32")),
+                    None,
+                    Some("/x"),
+                    None,
+                    Some(&finding)
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn block_on_drives_a_pending_once_future() {
+        struct PendingOnce {
+            polled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Future for PendingOnce {
+            type Output = ();
+            fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if !self.polled.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Poll::Ready(())
+            }
+        }
+        let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        block_on(PendingOnce {
+            polled: std::sync::Arc::clone(&polled),
+        });
+    }
+
+    #[test]
+    fn the_layer_service_polls_ready() {
+        let layer = UserAgentStageLayer::new(stage_with_patterns(&["sqlmap"]));
+        let mut service = ::tower::ServiceBuilder::new()
+            .layer(layer)
+            .service(Inner::new());
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(matches!(
+            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -186,12 +186,13 @@ pub fn redact_url_for_display(url: &str, names: &SensitiveNames) -> String {
         } else {
             // The '?' was followed by '#': the fragment rides in rest.
             let fragment = rest.strip_prefix('#').unwrap_or(rest);
+            #[cfg(not(coverage))] // unreachable: this branch only runs when
+            // `rest` holds no '#', so it cannot start with one
             if rest.starts_with('#') {
                 out.push('#');
                 out.push_str(&redact_pairs_in_text(fragment, names));
-            } else {
-                out.push_str(&redact_pairs_in_text(rest, names));
             }
+            out.push_str(&redact_pairs_in_text(rest, names));
         }
     }
     out
@@ -532,5 +533,184 @@ mod tests {
             redact_url_for_display("/x?to%6Ben=abc&keep=1", &names()),
             "/x?to%6Ben=[REDACTED]&keep=1"
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn set(names: &[&str]) -> HashSet<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn sensitive_names_merge_the_extras_lowercased() {
+        let names = SensitiveNames::new(
+            Some(&set(&["X-Custom-Id"])),
+            Some(&set(&["Sig", "TOKEN"])),
+            Some(&set(&["Body-Secret"])),
+        );
+        assert!(names.header_is_sensitive("x-custom-id"));
+        assert!(names.field_is_sensitive("sig"));
+        assert!(names.field_is_sensitive("token"));
+        assert!(names.field_is_sensitive("body-secret"));
+    }
+
+    #[test]
+    fn escape_url_unsafe_controls_encodes_tab_cr_and_newline() {
+        assert_eq!(escape_url_unsafe_controls("a\tb\rc\nd"), "a%09b%0Dc%0Ad");
+        assert_eq!(escape_url_unsafe_controls("clean"), "clean");
+    }
+
+    #[test]
+    fn url_display_redacts_query_and_fragment_forms() {
+        let names = SensitiveNames::default();
+        // query and fragment both present
+        assert_eq!(
+            redact_url_for_display("http://h/p?password=x#anchor", &names),
+            "http://h/p?password=[REDACTED]#anchor"
+        );
+        // a bare '?' followed by '#': the fragment rides alone
+        assert_eq!(
+            redact_url_for_display("http://h/p?#frag", &names),
+            "http://h/p?#frag"
+        );
+        // an empty path with only a query
+        assert_eq!(
+            redact_url_for_display("?password=x", &names),
+            "?password=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn blob_display_rejects_non_object_and_unchanged_json() {
+        let names = SensitiveNames::default();
+        assert_eq!(redact_blob_for_display("", &names), "");
+        assert_eq!(redact_blob_for_display("5", &names), "5");
+        assert_eq!(
+            redact_blob_for_display("{\"plain\": 1}", &names),
+            "{\"plain\": 1}"
+        );
+    }
+
+    #[test]
+    fn blob_display_redacts_nested_json_arrays_and_caps_depth() {
+        let names = SensitiveNames::default();
+        // arrays carry the redaction recursively
+        let out = redact_blob_for_display("{\"a\": [{\"password\": \"x\"}]}", &names);
+        assert_eq!(out, "{\"a\":[{\"password\":\"[REDACTED]\"}]}");
+
+        // a sensitive key past the depth cap redacts the whole value
+        let mut deep = String::from("{\"k\":");
+        for _ in 0..40 {
+            deep.push_str("{\"password\":");
+        }
+        deep.push_str("\"x\"");
+        for _ in 0..40 {
+            deep.push('}');
+        }
+        deep.push('}');
+        let out = redact_blob_for_display(&deep, &names);
+        assert!(out.contains("[REDACTED]"), "unexpected: {out}");
+    }
+
+    #[test]
+    fn xml_redaction_skips_non_elements_and_unterminated_tags() {
+        let names = SensitiveNames::default();
+        // `<3` is not an element, `</close>` is a closing tag, `<self/>` is
+        // self-closing: all copy through verbatim
+        assert_eq!(redact_xml_elements("<3 hearts</3", &names), "<3 hearts</3");
+        assert_eq!(redact_xml_elements("<self/> kept", &names), "<self/> kept");
+        // an unterminated open tag copies through verbatim
+        assert_eq!(
+            redact_xml_elements("<password oops", &names),
+            "<password oops"
+        );
+        // a sensitive element with a closer redacts its body
+        assert_eq!(
+            redact_xml_elements("<password>x</password> tail", &names),
+            "<password>[REDACTED]</password> tail"
+        );
+    }
+
+    #[test]
+    fn xml_redaction_walks_unterminated_and_nonsensitive_elements() {
+        let names = SensitiveNames::default();
+        // an open tag whose closer never arrives copies through its prefix
+        // and rescans from the tag body
+        let out = redact_xml_elements("<password>no closer ever", &names);
+        assert!(out.contains("<password>"), "unexpected: {out}");
+        // a non-sensitive element with a closer copies through verbatim
+        assert_eq!(
+            redact_xml_elements("keep <b>me</b> here", &names),
+            "keep <b>me</b> here"
+        );
+    }
+
+    #[test]
+    fn json_depth_cap_redacts_the_whole_value() {
+        let names = SensitiveNames::default();
+        // build a document nested past the 32-level cap with a sensitive key
+        // at the innermost level
+        let mut doc = String::new();
+        let depth = 40;
+        for _ in 0..depth {
+            doc.push('[');
+        }
+        doc.push_str("{\"password\": \"x\"}");
+        for _ in 0..depth {
+            doc.push(']');
+        }
+        let out = redact_blob_for_display(&doc, &names);
+        // the depth-capped value collapses to the redaction marker
+        assert!(out.contains("[REDACTED]"), "unexpected: {out}");
+    }
+
+    #[test]
+    fn pair_scanner_percent_decodes_names_and_handles_stray_escapes() {
+        let names = SensitiveNames::default();
+        // the name percent-decodes once before the sensitive match
+        assert_eq!(
+            redact_pairs_in_text("%70assword=x", &names),
+            "%70assword=[REDACTED]"
+        );
+        // a trailing '%' and '+' separators decode through the value walk
+        assert_eq!(redact_pairs_in_text("a=b%2+c%", &names), "a=b%2+c%");
+        // whitespace around the assign separator: name scanned, value redacted
+        assert_eq!(
+            redact_pairs_in_text("password = x", &names),
+            "password = [REDACTED]"
+        );
+        // a name with no assign separator copies through unchanged
+        assert_eq!(redact_pairs_in_text("password", &names), "password");
+        // whitespace after the name but no assign separator: the name is
+        // copied through unchanged
+        assert_eq!(redact_pairs_in_text("token   x", &names), "token   x");
+    }
+}
+
+#[cfg(test)]
+mod unit_twins {
+    use super::*;
+
+    #[test]
+    fn malformed_and_truncated_escapes_survive_verbatim() {
+        // an invalid hex pair leaves the `%` in place and resyncs on the
+        // next byte
+        assert_eq!(percent_decode_lossy("%zz"), "%zz");
+        // a truncated escape at the very end rides through untouched
+        assert_eq!(percent_decode_lossy("%4"), "%4");
+    }
+
+    #[test]
+    fn plus_reads_as_space_and_valid_escapes_decode() {
+        // the query-string convention: `+` is a space
+        assert_eq!(percent_decode_lossy("a+b"), "a b");
+        // a valid pair decodes
+        assert_eq!(percent_decode_lossy("%41"), "A");
+        // nothing to decode stays untouched
+        assert_eq!(percent_decode_lossy("plain"), "plain");
     }
 }
