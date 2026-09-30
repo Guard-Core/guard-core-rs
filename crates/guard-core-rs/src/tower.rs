@@ -506,16 +506,35 @@ impl RateLimitStage {
         let ip = ip?;
         let passive = self.config.passive_mode;
 
-        if self.bans.is_banned(ip) && !passive {
-            return Some(self.error_response(
-                StatusCode::FORBIDDEN,
-                BANNED_BODY,
-                None,
-                "ip_security",
-                &format!("Banned IP attempted access: {ip}"),
-                ip,
-                observation,
-            ));
+        // The distributed ban lookup fails secure (the reference
+        // `ip_security._check_banned_ip` -> `ip_ban_manager.is_ip_banned`
+        // -> `redis_handler.safe_operation` raising
+        // `GuardRedisError(503, "Redis operation failed")` out of a failed
+        // lookup, passive mode included: an unavailable store is an
+        // exception, not a detection). The 503 mirrors the stage's
+        // rate-limit fail-closed answer and never fires `on_block`.
+        match self.bans.try_is_banned(ip) {
+            Err(_) => {
+                return Some(StageResponse {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    body: REDIS_UNAVAILABLE_BODY,
+                    retry_after: None,
+                    custom_body: None,
+                });
+            }
+            // The banned answer is passive-suppressed like every block.
+            Ok(true) if !passive => {
+                return Some(self.error_response(
+                    StatusCode::FORBIDDEN,
+                    BANNED_BODY,
+                    None,
+                    "ip_security",
+                    &format!("Banned IP attempted access: {ip}"),
+                    ip,
+                    observation,
+                ));
+            }
+            Ok(_) => {}
         }
 
         let whitelisted = gate.is_some_and(|gate| gate.is_whitelisted);
@@ -3305,6 +3324,56 @@ mod tests {
             .expect("fail closed");
         assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(answer.body, REDIS_UNAVAILABLE_BODY);
+    }
+
+    #[test]
+    fn failing_distributed_ban_lookup_fails_secure_with_the_503() {
+        // The reference's `is_ip_banned` -> `redis_handler.safe_operation`
+        // raises `GuardRedisError(503)` out of a failed ban lookup: the
+        // request is never read as unbanned. The stage mirrors it on the
+        // ban path (not just the window path).
+        let store = Arc::new(MemoryStore::default());
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stage = RateLimitStage::builder(RateLimitStageConfig::default())
+            .clock(Arc::new(system_clock))
+            .distributed_store(
+                Arc::new(MemoryStore::default()) as Arc<dyn SlidingWindowStore>,
+                "guard_core:",
+                false,
+            )
+            .distributed_ban_store(Arc::clone(&store) as Arc<dyn BanStore>)
+            .build()
+            .expect("config");
+        let answer = stage
+            .decide_for_path(Some(ip("192.0.2.94")), None, None, None, None)
+            .expect("fail secure");
+        assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(answer.body, REDIS_UNAVAILABLE_BODY);
+    }
+
+    #[test]
+    fn the_ban_lookup_503_fires_in_passive_mode_too() {
+        // The reference 503 is an exception, not a detection: passive mode
+        // suppresses blocks, not backend failures.
+        let store = Arc::new(MemoryStore::default());
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let stage = RateLimitStage::builder(RateLimitStageConfig {
+            passive_mode: true,
+            ..RateLimitStageConfig::default()
+        })
+        .clock(Arc::new(system_clock))
+        .distributed_store(
+            Arc::new(MemoryStore::default()) as Arc<dyn SlidingWindowStore>,
+            "guard_core:",
+            false,
+        )
+        .distributed_ban_store(Arc::clone(&store) as Arc<dyn BanStore>)
+        .build()
+        .expect("config");
+        let answer = stage
+            .decide_for_path(Some(ip("192.0.2.95")), None, None, None, None)
+            .expect("fail secure");
+        assert_eq!(answer.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]

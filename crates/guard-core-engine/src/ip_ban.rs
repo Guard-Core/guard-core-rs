@@ -432,10 +432,10 @@ impl IpBanManager {
     /// degrades to the local store, the reference `except` branch), and
     /// lookups fall through to the store on a local miss, caching the
     /// answer (the reference `_check_redis_exact`). A failing lookup
-    /// reads as unbanned locally: the reference propagates the backend
-    /// error into the pipeline's fail-secure handling, which this sync
-    /// `bool` seam cannot express; the deviation is recorded in the
-    /// module docs.
+    /// surfaces the backend error through [`IpBanManager::try_is_banned`]
+    /// so a caller can fail secure the way the reference's
+    /// `GuardRedisError(503)` propagates into the pipeline; the lossy
+    /// [`IpBanManager::is_banned`] keeps reading an error as unbanned.
     #[must_use]
     pub fn with_distributed_store(
         mut self,
@@ -508,14 +508,33 @@ impl IpBanManager {
 
     /// Whether `ip` currently carries a live ban. An entry past its expiry
     /// reads as unbanned and is dropped from the store.
+    ///
+    /// This is the lossy form: a failing distributed lookup reads as
+    /// unbanned. Fail-secure callers use [`IpBanManager::try_is_banned`],
+    /// which surfaces the backend error the way the reference's
+    /// `GuardRedisError(503)` propagates into its pipeline.
     #[must_use]
     pub fn is_banned(&self, ip: IpAddr) -> bool {
+        self.try_is_banned(ip).unwrap_or(false)
+    }
+
+    /// [`IpBanManager::is_banned`] with the backend error surfaced: a
+    /// failing distributed ban lookup returns [`Err`] instead of reading
+    /// as unbanned, so a caller can fail secure (the reference
+    /// `redis_handler.safe_operation` raising `GuardRedisError(503, "Redis
+    /// operation failed")` out of `_check_redis_exact`'s `get_key`).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::distributed::StoreError`] when the distributed lookup
+    /// fails and the local cache holds no live answer.
+    pub fn try_is_banned(&self, ip: IpAddr) -> Result<bool, crate::distributed::StoreError> {
         let ip = canonical(ip);
         let now = (self.clock)();
         {
             let mut bans = self.bans.lock().expect("ban store");
             match bans.get(&ip) {
-                Some(record) if now <= record.expiry => return true,
+                Some(record) if now <= record.expiry => return Ok(true),
                 Some(_) => {
                     bans.pop(&ip);
                 }
@@ -528,10 +547,15 @@ impl IpBanManager {
     /// The distributed lookup on a local miss (the reference
     /// `_check_redis_exact`): a stored expiry at or after `now` counts as
     /// banned and is cached locally, a stale one is deleted, a backend
-    /// error reads as unbanned.
-    fn check_distributed_ban(&self, ip: IpAddr, now: f64) -> bool {
+    /// error is returned to the caller (the fail-secure seam; the lossy
+    /// [`IpBanManager::is_banned`] flattens it to unbanned).
+    fn check_distributed_ban(
+        &self,
+        ip: IpAddr,
+        now: f64,
+    ) -> Result<bool, crate::distributed::StoreError> {
         let Some(store) = &self.ban_store else {
-            return false;
+            return Ok(false);
         };
         match store.get_ban(&crate::distributed::ban_key(&self.redis_prefix, ip)) {
             Ok(Some(expiry)) if now <= expiry => {
@@ -542,13 +566,14 @@ impl IpBanManager {
                         reason: String::from("distributed"),
                     },
                 );
-                true
+                Ok(true)
             }
             Ok(Some(_)) => {
                 let _ = store.delete_ban(&crate::distributed::ban_key(&self.redis_prefix, ip));
-                false
+                Ok(false)
             }
-            Ok(None) | Err(_) => false,
+            Ok(None) => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
@@ -1414,5 +1439,53 @@ mod unit_twins {
             "gc:",
         );
         assert!(!failed.is_banned(ip("192.0.2.71")));
+    }
+
+    #[test]
+    fn failing_distributed_ban_lookup_fails_secure() {
+        // The reference `_check_redis_exact` -> `redis_handler.get_key` ->
+        // `safe_operation` raises `GuardRedisError(503, "Redis operation
+        // failed")` on a backend failure: the pipeline never reads a
+        // failing lookup as unbanned.
+        let store = Arc::new(crate::distributed::MemoryStore::default());
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0)).with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::BanStore>,
+            "guard_core:",
+        );
+        let stranger = ip("192.0.2.77");
+
+        // The fail-secure seam surfaces the backend error.
+        let error = manager.try_is_banned(stranger).expect_err("fail secure");
+        assert!(error.to_string().contains("backend down"));
+        // The lossy form keeps its documented shape (reads unbanned) so
+        // existing callers stay total.
+        assert!(!manager.is_banned(stranger));
+    }
+
+    #[test]
+    fn live_local_ban_answers_ok_even_when_the_store_is_down() {
+        // The reference checks the local TTLCache before Redis, so a live
+        // local ban short-circuits and a backend failure never surfaces.
+        let store = Arc::new(crate::distributed::MemoryStore::default());
+        let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0)).with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::BanStore>,
+            "guard_core:",
+        );
+        let attacker = ip("192.0.2.78");
+        manager
+            .ban_ip(attacker, 60, "threshold_exceeded")
+            .expect("ban");
+
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(manager.try_is_banned(attacker).expect("local hit"));
+    }
+
+    #[test]
+    fn distributed_ban_lookup_error_names_the_backend() {
+        // Without a store at all the fail-secure seam still answers: no
+        // backend, no error, just the local store's verdict.
+        let manager = IpBanManager::with_clock(Arc::new(|| 1_000.0));
+        assert!(!manager.try_is_banned(ip("192.0.2.79")).expect("no store"));
     }
 }
