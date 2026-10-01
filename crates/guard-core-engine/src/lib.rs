@@ -1,3 +1,10 @@
+// The suite's `assert!(x.is_empty())` idiom is pervasive (120+ sites) and several
+// subjects carry no `PartialEq`, so clippy 1.99's new `assert_is_empty` lint
+// (suggest `assert_eq!(x, [])` for the failure printout) is allowed crate-wide
+// rather than rewriting the assertion surface in a release train.
+#![allow(unknown_lints)] // the lint name below postdates the 1.92 MSRV clippy
+#![allow(clippy::assert_is_empty)]
+
 pub mod behavior;
 pub mod binary_islands;
 pub mod body_scan;

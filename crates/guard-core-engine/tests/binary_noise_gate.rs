@@ -1,3 +1,9 @@
+// The suite's assert-on-emptiness idiom is pervasive here; clippy 1.99's new
+// assert_is_empty lint (assert_eq!(x, []) for the failure printout) is allowed
+// file-wide rather than rewriting the assertion surface in a release train.
+#![allow(unknown_lints)] // the lint name below postdates the 1.92 MSRV clippy
+#![allow(clippy::assert_is_empty)]
+
 //! Honesty tests for the binary-body noise gate (guard-core 4.0.3, upstream
 //! commit `436d6f72`, ported from
 //! `tests/test_sus_patterns/test_pattern_binary_noise_gate.py`).

@@ -1,3 +1,10 @@
+// The suite's `assert!(x.is_empty())` idiom is pervasive (120+ sites) and several
+// subjects carry no `PartialEq`, so clippy 1.99's new `assert_is_empty` lint
+// (suggest `assert_eq!(x, [])` for the failure printout) is allowed crate-wide
+// rather than rewriting the assertion surface in a release train.
+#![allow(unknown_lints)] // the lint name below postdates the 1.92 MSRV clippy
+#![allow(clippy::assert_is_empty)]
+
 //! Framework-agnostic application-layer API security engine.
 //!
 //! Rust port of [guard-core](https://github.com/rennf93/guard-core)'s

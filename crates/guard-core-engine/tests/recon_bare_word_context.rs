@@ -1,3 +1,9 @@
+// The suite's assert-on-emptiness idiom is pervasive here; clippy 1.99's new
+// assert_is_empty lint (assert_eq!(x, []) for the failure printout) is allowed
+// file-wide rather than rewriting the assertion surface in a release train.
+#![allow(unknown_lints)] // the lint name below postdates the 1.92 MSRV clippy
+#![allow(clippy::assert_is_empty)]
+
 //! Honesty tests for the recon leading-separator gate (upstream guard-core
 //! #115, fix PR #116, commit `08f79d67`, ported from
 //! `tests/test_sus_patterns/test_recon_bare_word_context.py`).
