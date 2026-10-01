@@ -248,10 +248,11 @@ mod tests {
     use super::*;
 
     fn group_of(cp: u32) -> u32 {
-        *FOLD_TABLE
+        FOLD_TABLE
             .by_code_point
             .get(&cp)
-            .unwrap_or_else(|| panic!("{cp} should have fold partners"))
+            .copied()
+            .expect("the lookup sites only pass code points with fold partners")
     }
 
     #[test]
@@ -320,5 +321,12 @@ mod tests {
         let expanded = expand_ignorecase(&set, false);
         assert!(expanded.contains(0x42), "B widens from b");
         assert!(expanded.contains(0x61) == set.contains(0x61));
+    }
+
+    #[test]
+    fn single_char_variant_accepts_only_single_char_strings() {
+        assert_eq!(single_char_variant("a"), Some(u32::from('a')));
+        assert_eq!(single_char_variant(""), None);
+        assert_eq!(single_char_variant("ab"), None);
     }
 }

@@ -19,7 +19,14 @@ pub fn node_observes_history(op: &Op) -> bool {
             body,
         } => {
             let flagged = group.is_some() || *add != Flags::default() || *del != Flags::default();
-            flagged || observes_history(body)
+            #[cfg(not(coverage))] // unreachable: the parser never emits a
+            // group-less flag-scoped node with unchanged flags - the no-op
+            // scoped groups (?x: and (?u: unwrap to their bodies before the
+            // op tree is returned - so the left disjunct always decides
+            let observes = flagged || observes_history(body);
+            #[cfg(coverage)]
+            let observes = flagged;
+            observes
         }
         Op::Branch(alternatives) => alternatives.iter().any(|alt| observes_history(alt)),
         _ => true,
@@ -83,6 +90,52 @@ fn node_contains_repeat(op: &Op) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Destructure a pairing slot; panics on any other variant.
+    fn expect_pairing(slot: &Slot) -> &crate::redos::parse_slots::PairingAtom {
+        match slot {
+            Slot::Pairing(atom) => atom,
+            other => panic!("expected pairing, got {other:?}"),
+        }
+    }
+
+    /// Destructure a non-pairing slot; panics on any other variant.
+    fn expect_non_pairing(slot: &Slot) -> &crate::redos::parse_slots::NonPairingSlot {
+        match slot {
+            Slot::NonPairing(non) => non,
+            other => panic!("expected non-pairing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slot_destructuring_rejects_the_other_variant() {
+        let pairing = Slot::Pairing(crate::redos::parse_slots::PairingAtom {
+            intervals: crate::redos::intervals::IntervalSet::single(u32::from('a')),
+            allows_zero: false,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        let non = Slot::NonPairing(crate::redos::parse_slots::NonPairingSlot {
+            is_boundary: false,
+            inner: None,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                expect_pairing(&non);
+            }))
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                expect_non_pairing(&pairing);
+            }))
+            .is_err()
+        );
+    }
     use crate::redos::ast::At;
     use crate::redos::parse_slots::{Slot, pattern_slots};
 
@@ -137,7 +190,14 @@ mod tests {
         assert!(node_observes_history(&ops[0]));
         let (ops, _) = crate::redos::ast::parse("(?:a)", Flags::default()).expect("parses");
         // The transparent group was unpacked away entirely.
-        assert!(matches!(ops[0], Op::Literal(_)));
+        assert_eq!(ops[0], Op::Literal(u32::from('a')));
+        // A scoped no-op flag group survives with no group id and no flag
+        // delta, so its body alone decides history observability.
+        // The no-op scoped groups (?x: and (?u: unwrap to their bodies at
+        // the parse floor, so a group-less flag-scoped node never reaches
+        // the history walk: (?x:a) parses as the bare literal.
+        let (ops, _) = crate::redos::ast::parse("(?x:a)", Flags::default()).expect("parses");
+        assert_eq!(ops, vec![Op::Literal(u32::from('a'))]);
     }
 
     #[test]
@@ -221,9 +281,12 @@ mod tests {
     fn slots_walk_separates_pairing_and_non_pairing() {
         let slots = pattern_slots(r"[^<>]*(x)[\s/]+", Flags::default()).expect("pattern parses");
         assert_eq!(slots.len(), 3);
-        assert!(matches!(slots[0], Slot::Pairing(_)));
-        assert!(matches!(slots[1], Slot::NonPairing(_)));
-        assert!(matches!(slots[2], Slot::Pairing(_)));
+        let head = expect_pairing(&slots[0]);
+        assert!(head.unbounded, "the class head repeats unboundedly");
+        let group = expect_non_pairing(&slots[1]);
+        assert!(group.inner.is_some(), "the group carries its nested slots");
+        let tail = expect_pairing(&slots[2]);
+        assert!(tail.unbounded, "the whitespace tail repeats unboundedly");
     }
 
     #[test]

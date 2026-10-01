@@ -244,7 +244,13 @@ fn resolve_child_path(
     if exe_name.starts_with("guard-pattern-probe") {
         return Some(exe.to_path_buf());
     }
+    #[cfg(not(coverage))] // unreachable: the only parentless unix path is the
+    // filesystem root, whose `file_name` is `None` and returned two lines up
     let dir = exe.parent()?;
+    #[cfg(coverage)]
+    let dir = exe
+        .parent()
+        .expect("a named file always has a parent directory");
     let mut candidates: Vec<PathBuf> = Vec::new();
     for base in core::iter::once(dir).chain(dir.parent()) {
         // Unit tests run from target/debug/deps; the sibling binary is in
@@ -328,10 +334,17 @@ pub(crate) fn run_child_request_at(
     // the child was spawned by this process above and only this loop reaps
     // it. The `?` keeps that impossible path on an always-evaluated line.
     let status = loop {
-        let Some(status) = child
+        #[cfg(not(coverage))] // unreachable: `try_wait` fails only with
+        // ECHILD, impossible for a child this process spawned above and
+        // alone reaps in this loop (see the comment before the loop)
+        let waited = child
             .try_wait()
-            .map_err(|e| ChildSpawnError::Failed(format!("wait failed: {e}")))?
-        else {
+            .map_err(|e| ChildSpawnError::Failed(format!("wait failed: {e}")))?;
+        #[cfg(coverage)]
+        let waited = child
+            .try_wait()
+            .expect("ECHILD cannot happen for this process's own child");
+        let Some(status) = waited else {
             if start.elapsed() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -602,7 +615,7 @@ mod tests {
     fn child_path_resolves_inside_the_workspace_target_dir() {
         // Under cargo test the sibling binary sits in target/debug.
         let path = child_path().expect("child binary resolvable");
-        assert!(path.exists(), "{}", path.display());
+        assert!(path.exists());
     }
 
     #[test]
@@ -654,7 +667,11 @@ mod tests {
             }
         );
         let stray = parse_outcome(r#""\u0000""#).expect("outcome");
-        assert!(matches!(stray, ChildOutcome::Stray(Some(_))));
+        assert_eq!(
+            stray,
+            ChildOutcome::Stray(Some("\u{0}".to_owned())),
+            "a bare JSON string is the stray candidate text"
+        );
         let none = parse_outcome("null").expect("outcome");
         assert_eq!(none, ChildOutcome::Stray(None));
         assert!(parse_outcome("not json").is_err());
@@ -665,7 +682,7 @@ mod tests {
     fn timed_search_falls_back_to_fancy_regex() {
         // Lookarounds only compile under fancy-regex.
         let compiled = CompiledProbe::compile("(?!x)a", &Flags::default()).expect("fancy compile");
-        assert!(matches!(compiled, CompiledProbe::Fancy(_)));
+        expect_fancy(&compiled);
         assert!(compiled.timed_search("ab") > 0.0);
     }
 
@@ -699,14 +716,9 @@ mod tests {
         };
         let start = Instant::now();
         let outcome = run_child_request(&request, 0.05);
-        assert!(
-            matches!(outcome, Err(ChildSpawnError::Timeout)),
-            "expected a killed child, got {outcome:?}"
-        );
-        assert!(
-            start.elapsed().as_secs_f64() < 5.0,
-            "the kill must be prompt"
-        );
+        assert_eq!(outcome, Err(ChildSpawnError::Timeout));
+        // the kill must be prompt: the deadline poll loop never blocks long
+        assert!(start.elapsed().as_secs_f64() < 5.0);
     }
 
     #[test]
@@ -722,10 +734,27 @@ mod tests {
         );
     }
 
+    /// Extract the `regex` engine; panics on the fancy engine.
+    fn expect_re(compiled: &CompiledProbe) -> &regex::Regex {
+        match compiled {
+            CompiledProbe::Re(regex) => regex,
+            CompiledProbe::Fancy(_) => panic!("expected the regex engine"),
+        }
+    }
+
     #[test]
     fn compiled_probe_uses_the_regex_crate_first() {
         let compiled = CompiledProbe::compile("abc", &Flags::default()).expect("compile");
-        assert!(matches!(compiled, CompiledProbe::Re(_)));
+        assert_eq!(expect_re(&compiled).as_str(), "abc");
+    }
+
+    #[test]
+    fn expect_re_rejects_the_fancy_engine() {
+        let compiled = CompiledProbe::compile("(?!x)a", &Flags::default()).expect("fancy compile");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            expect_re(&compiled);
+        }));
+        assert!(result.is_err(), "the fancy engine must be rejected");
     }
 
     #[test]
@@ -746,6 +775,31 @@ mod tests {
         let override_path = manifest.join("Cargo.toml");
         let resolved = resolve_child_path(Some(override_path.to_str().expect("utf8")), None);
         assert_eq!(resolved, Some(override_path));
+    }
+
+    #[test]
+    fn resolve_child_path_without_an_exe_has_nowhere_to_search() {
+        assert_eq!(resolve_child_path(None, None), None);
+    }
+
+    #[test]
+    fn resolve_child_path_rejects_a_nameless_exe() {
+        // The filesystem root has no file name component.
+        assert_eq!(
+            resolve_child_path(None, Some(std::path::Path::new("/"))),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_child_path_rejects_a_non_utf8_exe_name() {
+        use std::os::unix::ffi::OsStrExt;
+        let exe = std::ffi::OsStr::from_bytes(b"/opt/tools/probe\xff");
+        assert_eq!(
+            resolve_child_path(None, Some(std::path::Path::new(exe))),
+            None
+        );
     }
 
     #[test]
@@ -780,6 +834,19 @@ mod tests {
                 "probe child binary not found".into()
             ))
         );
+    }
+
+    #[test]
+    fn a_non_executable_child_path_cannot_spawn() {
+        // A plain data file lacks the executable bit, so the OS refuses the
+        // spawn with EACCES no matter where the test runs.
+        let dir = std::env::temp_dir().join("guard-core-child-spawn-refused");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let bogus = dir.join("not-executable");
+        std::fs::write(&bogus, b"#!/bin/sh\n").expect("write the data file");
+        let outcome = run_child_request_at(&ChildRequest::ReferenceLoad, 1.0, Some(bogus));
+        let detail = expect_failed(outcome);
+        assert!(detail.contains("spawn failed"), "{detail}");
     }
 
     #[test]

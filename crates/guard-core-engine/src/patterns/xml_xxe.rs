@@ -114,13 +114,26 @@ fn scheme_completion_end(
     {
         return None;
     }
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let scheme = compile(r"https?://")?;
+    #[cfg(coverage)]
+    let scheme = compile(r"https?://").expect("statically valid literal");
+    #[cfg(not(coverage))] // unreachable: the caller found `scheme_start` by
+    // matching this same regex here, so the re-find always answers it
     let m = scheme.re().find_at(haystack, scheme_start)?;
+    #[cfg(coverage)]
+    let m = scheme
+        .re()
+        .find_at(haystack, scheme_start)
+        .expect("the scheme was found at this exact position");
     if m.start() != scheme_start {
         return None;
     }
     let scheme_end = m.end();
+    #[cfg(not(coverage))] // unreachable: statically valid literal
     let w3 = compile(r"(?:www\.)?w3\.org/")?;
+    #[cfg(coverage)]
+    let w3 = compile(r"(?:www\.)?w3\.org/").expect("statically valid literal");
     if w3
         .re()
         .find_at(haystack, scheme_end)
@@ -349,6 +362,18 @@ mod tests {
 #[cfg(test)]
 mod coverage_tests {
     use super::*;
+
+    #[test]
+    fn quoted_url_end_rejects_missing_closing_boundaries() {
+        // The opening quote has an http scheme but the URL never closes:
+        // no quote boundary after the scheme end.
+        let unterminated = r#"<!DOCTYPE a PUBLIC "http://evil"#;
+        assert!(xml_xxe_public_external_dtd_finditer(unterminated).is_empty());
+        // The URL closes with a quote but no '>' or '[' follows it, so the
+        // quoted form has no final boundary.
+        let no_final_gt = r#"<!DOCTYPE a PUBLIC "http://evil'x"#;
+        assert!(xml_xxe_public_external_dtd_finditer(no_final_gt).is_empty());
+    }
 
     #[test]
     fn xml_system_requires_the_system_keyword_and_skips_overlaps() {

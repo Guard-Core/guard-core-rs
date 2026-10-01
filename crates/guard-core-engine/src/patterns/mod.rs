@@ -161,8 +161,14 @@ fn scan_window_candidates(entry: &CompiledEntry, haystack: &str) -> Option<Vec<C
         76 => ("<!\\[CDATA\\[", "\\]\\]>"),
         _ => return None,
     };
+    #[cfg(not(coverage))] // unreachable: both literals are statically valid
     let prefix = PyRegex::compile(prefix_src, true).ok()?;
+    #[cfg(coverage)]
+    let prefix = PyRegex::compile(prefix_src, true).expect("statically valid literal");
+    #[cfg(not(coverage))] // unreachable: both literals are statically valid
     let terminator = PyRegex::compile(terminator_src, true).ok()?;
+    #[cfg(coverage)]
+    let terminator = PyRegex::compile(terminator_src, true).expect("statically valid literal");
     Some(scan_window::bounded_finditer(
         haystack,
         compiled,

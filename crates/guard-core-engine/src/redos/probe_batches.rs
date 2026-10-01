@@ -292,6 +292,37 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_batch_multiple_leaves_no_final_flush() {
+        let probe_sets: Vec<Vec<String>> = (0..(2 * REACH_PROBE_BATCH_SIZE))
+            .map(|index| probes(&[&format!("p{index}")]))
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let calls: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+        let time_probes = |_pattern: &str,
+                           batch: Vec<String>,
+                           _deadline: std::time::Instant,
+                           _flags: super::super::ast::Flags|
+         -> Option<ReachProbeTiming> {
+            calls.lock().expect("mutex").push(batch.len());
+            Some(ReachProbeTiming {
+                samples_by_size: batch.iter().map(|_probe| vec![0.0]).collect(),
+                load_factor: 1.0,
+            })
+        };
+        let result = batched_reach_probe_timings(
+            "test",
+            probe_sets,
+            deadline,
+            super::super::ast::Flags::default(),
+            &time_probes,
+        );
+        let calls = calls.into_inner().expect("mutex");
+        // exactly two full batches and nothing left over
+        assert_eq!(calls, vec![REACH_PROBE_BATCH_SIZE, REACH_PROBE_BATCH_SIZE]);
+        assert_eq!(result.len(), 2 * REACH_PROBE_BATCH_SIZE);
+    }
+
+    #[test]
     fn batched_timings_fail_closed_for_malformed_child_results() {
         let probe_sets = vec![probes(&["a", "b"])];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);

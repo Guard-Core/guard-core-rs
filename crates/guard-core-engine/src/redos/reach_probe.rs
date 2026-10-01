@@ -366,6 +366,23 @@ fn synthesize_segment(
 }
 
 /// Reference `_synthesize_reaching_probe`.
+#[test]
+fn a_break_candidate_exhaustion_answers_none() {
+    // A pattern whose representatives already cover every break candidate
+    // leaves no breaking character to append.
+    let pattern = "[\u{1}][\u{2}][\u{3}][\u{4}][\u{5}][\u{6}][\u{7}][\u{8}]";
+    assert_eq!(synthesize_reaching_probe(pattern), None);
+}
+
+#[test]
+fn brace_ranges_reject_bounds_beyond_usize() {
+    let chars: Vec<char> = "a{99999999999999999999,}b".chars().collect();
+    assert_eq!(reach_brace_quantifier_range(&chars, 1), None);
+    let chars: Vec<char> = "a{2,5}?b".chars().collect();
+    let (low, high, end) = reach_brace_quantifier_range(&chars, 1).expect("parses");
+    assert_eq!((low, high, end), (2, 5, 7));
+}
+
 #[must_use]
 pub fn synthesize_reaching_probe(pattern: &str) -> Option<String> {
     let mut chars_seen: HashSet<char> = HashSet::new();

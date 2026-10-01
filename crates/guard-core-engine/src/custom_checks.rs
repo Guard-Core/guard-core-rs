@@ -312,10 +312,14 @@ mod tests {
             path: "/private",
             client_ip: None,
         };
-        assert!(matches!(
+        assert_eq!(
             decide_custom_validators(&validators, &post),
-            CustomValidatorsVerdict::Failed { block: Some(_), .. }
-        ));
+            CustomValidatorsVerdict::Failed {
+                block: Some(CustomResponse { status: Some(403) }),
+                validator: "gate".to_owned()
+            },
+            "a real GuardResponse both blocks and carries the response"
+        );
     }
 
     #[test]

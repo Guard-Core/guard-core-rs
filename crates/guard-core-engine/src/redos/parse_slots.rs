@@ -344,6 +344,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn expect_pairing_rejects_non_pairing_slots() {
+        let non = Slot::NonPairing(NonPairingSlot {
+            is_boundary: true,
+            inner: None,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            expect_pairing(&non);
+        }));
+        assert!(result.is_err(), "non-pairing slots must be rejected");
+    }
+
     /// Destructure a non-pairing slot; panics on any other variant.
     fn expect_non_pairing(slot: &Slot) -> &NonPairingSlot {
         match slot {
@@ -568,7 +583,8 @@ mod tests {
         for pattern in [r"\d", r"\s", r"\w", r"\D", r"\S", r"\W"] {
             let parsed = pattern_slots(pattern, ascii).expect("parses");
             assert_eq!(parsed.len(), 1, "{pattern}");
-            assert!(matches!(&parsed[0], Slot::Pairing(_)), "{pattern}");
+            let atom = expect_pairing(&parsed[0]);
+            assert!(!atom.intervals.is_empty(), "{pattern}");
         }
     }
 
@@ -577,7 +593,8 @@ mod tests {
         for pattern in [r"\D", r"\S", r"\W"] {
             let parsed = pattern_slots(pattern, Flags::default()).expect("parses");
             assert_eq!(parsed.len(), 1, "{pattern}");
-            assert!(matches!(&parsed[0], Slot::Pairing(_)), "{pattern}");
+            let atom = expect_pairing(&parsed[0]);
+            assert!(!atom.intervals.is_empty(), "{pattern}");
         }
     }
 

@@ -692,10 +692,9 @@ mod tests {
             .service(Inner::new());
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
-        assert!(matches!(
-            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
+        let polled = ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx);
+        assert!(polled.is_ready());
+        assert_eq!(polled.map(|result| result.is_ok()), Poll::Ready(true));
     }
 
     /// A bus-backed recorder: the events the stage emits land here.

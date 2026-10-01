@@ -137,7 +137,19 @@ mod tests {
         // \d repeats produce single-char states, filtered by the len > 1
         // rule.
         let pairs = repeat_group_units(r"(\d)*x", Flags::default(), None).expect("units");
-        assert!(pairs.iter().all(|(_prefix, unit)| unit.chars().count() > 1));
+        assert!(
+            pairs.is_empty(),
+            "single-char states are dropped by the len > 1 rule: {pairs:?}"
+        );
+    }
+
+    #[test]
+    fn repeat_group_units_propagate_collector_deadlines() {
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        // the collector's body-units pass runs under the same clock
+        let error =
+            repeat_group_units("a*", Flags::default(), Some(expired)).expect_err("deadline");
+        assert!(error.0.contains("deadline"), "{error}");
     }
 
     #[test]

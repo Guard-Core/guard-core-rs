@@ -422,6 +422,14 @@ mod tests {
         }
     }
 
+    /// Destructure a non-pairing slot; panics on any other variant.
+    fn expect_non_pairing(slot: &Slot) -> &NonPairingSlot {
+        match slot {
+            Slot::NonPairing(non) => non,
+            other => panic!("expected non-pairing, got {other:?}"),
+        }
+    }
+
     #[test]
     fn leading_literal_prefix_unwraps_transparent_groups() {
         assert_eq!(leading_literal_prefix(r"(?:<[^<>]*)"), "<");
@@ -534,7 +542,8 @@ mod tests {
         let flags = Flags::ignorecase_multiline();
         let slots =
             crate::redos::parse_slots::pattern_slots(pattern, flags).expect("pattern parses");
-        assert!(matches!(&slots[2], Slot::NonPairing(_)));
+        let lookahead = expect_non_pairing(&slots[2]);
+        assert!(lookahead.inner.is_some());
         let left = expect_pairing(&slots[0]);
         let middle = expect_pairing(&slots[1]);
         let _tail_atom = expect_pairing(&slots[3]);
@@ -684,6 +693,32 @@ mod tests {
                 .expect("none"),
             None
         );
+    }
+
+    #[test]
+    fn repeat_probe_to_length_zero_is_empty() {
+        // A zero-length probe has no last character to replace.
+        assert_eq!(repeat_probe_to_length("abc", 0, "x"), "");
+    }
+
+    #[test]
+    fn stray_for_pair_falls_back_when_the_union_covers_everything() {
+        use crate::redos::intervals::IntervalSet;
+        let full = IntervalSet::new(&[(0, char::MAX as u32)]);
+        assert_eq!(stray_for_pair(&full, &full), "\u{0}");
+    }
+
+    #[test]
+    #[should_panic(expected = "expected non-pairing")]
+    fn expect_non_pairing_rejects_other_variants() {
+        let pairing = Slot::Pairing(PairingAtom {
+            intervals: crate::redos::intervals::IntervalSet::single(u32::from('a')),
+            allows_zero: false,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        let _ = expect_non_pairing(&pairing);
     }
 
     #[test]

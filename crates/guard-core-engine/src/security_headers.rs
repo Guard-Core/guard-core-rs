@@ -441,6 +441,16 @@ mod tests {
         })
         .expect("max_age set");
         assert_eq!(full, "max-age=31536000; includeSubDomains; preload");
+        let minimal = build_hsts(&HstsConfig {
+            max_age: Some(600),
+            include_subdomains: false,
+            preload: false,
+        })
+        .expect("max_age set");
+        assert_eq!(
+            minimal, "max-age=600",
+            "both optional parts stay off their flags"
+        );
         assert!(
             build_hsts(&HstsConfig {
                 max_age: None,
@@ -449,6 +459,16 @@ mod tests {
             })
             .is_none()
         );
+        // An HSTS block whose max_age is unset contributes no header.
+        let config = SecurityHeadersConfig {
+            hsts: Some(HstsConfig {
+                max_age: None,
+                include_subdomains: true,
+                preload: false,
+            }),
+            ..SecurityHeadersConfig::reference_default()
+        };
+        assert!(!security_headers(&config).contains_key("Strict-Transport-Security"));
     }
 
     #[test]
@@ -457,10 +477,12 @@ mod tests {
             custom: BTreeMap::from([("bad name\n".to_owned(), "v".to_owned())]),
             ..SecurityHeadersConfig::reference_default()
         };
-        assert!(matches!(
+        assert_eq!(
             bad_name.validate(),
-            Err(SecurityHeadersError::InvalidName { .. })
-        ));
+            Err(SecurityHeadersError::InvalidName {
+                name: "bad name\n".to_owned()
+            })
+        );
         let bad_value = SecurityHeadersConfig {
             frame_options: Some("DENY\r\nX-Evil: 1".to_owned()),
             ..SecurityHeadersConfig::reference_default()

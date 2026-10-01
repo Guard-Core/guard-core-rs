@@ -481,6 +481,37 @@ mod tests {
         });
         assert_eq!(rule_from_config(&cfg), Some(rule("status:404", 2)));
     }
+
+    #[test]
+    fn malformed_configs_answer_none_instead_of_erroring() {
+        // a bare array is not an object
+        assert_eq!(rule_from_config(&serde_json::json!([])), None);
+        // the rule_type key is missing or not a string
+        assert_eq!(rule_from_config(&serde_json::json!({})), None);
+        assert_eq!(
+            rule_from_config(&serde_json::json!({ "rule_type": 7 })),
+            None
+        );
+        // the threshold key is missing, not a number, or out of u32 range
+        assert_eq!(
+            rule_from_config(&serde_json::json!({ "rule_type": "return_pattern" })),
+            None
+        );
+        assert_eq!(
+            rule_from_config(&serde_json::json!({
+                "rule_type": "return_pattern",
+                "threshold": "many",
+            })),
+            None
+        );
+        assert_eq!(
+            rule_from_config(&serde_json::json!({
+                "rule_type": "return_pattern",
+                "threshold": 5_000_000_000u64,
+            })),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -634,6 +665,21 @@ mod gap_tests {
         assert_eq!(
             tracker.check_response_pattern(200, Some(body), "json:meta==zzz", 1024),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn unevaluable_patterns_answer_none() {
+        let mut tracker = BehaviorTracker::new();
+        // a status rule with a non-numeric target cannot be evaluated
+        assert_eq!(
+            tracker.check_response_pattern(200, Some(b"b"), "status:soon", 1024),
+            None
+        );
+        // a json rule over a non-JSON body cannot be evaluated
+        assert_eq!(
+            tracker.check_response_pattern(200, Some(b"not json"), "json:a==1", 1024),
+            None
         );
     }
 }

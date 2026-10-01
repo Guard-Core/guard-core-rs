@@ -1009,10 +1009,14 @@ impl RateLimitStage {
                 trigger_info,
                 "suspicious_activity",
             );
-        } else if let Some(log_reason) = log_reason {
+        } else {
+            // The only active-mode caller builds the reason infallibly (see
+            // the match at the call site); a missing reason still logs the
+            // generic reference line.
+            let reason = log_reason.unwrap_or("Suspicious activity detected");
             let _ = self.compose_suspicious_log(
                 ip,
-                log_reason,
+                reason,
                 observation,
                 false,
                 "",
@@ -2479,6 +2483,17 @@ mod tests {
     }
 
     #[test]
+    fn a_ban_store_without_a_distributed_store_is_ignored() {
+        let store = Arc::new(MemoryStore::default());
+        // the setter is only meaningful together with `distributed_store`
+        let _stage = RateLimitStage::builder(RateLimitStageConfig::default())
+            .clock(Arc::new(system_clock))
+            .distributed_ban_store(Arc::clone(&store) as Arc<dyn BanStore>)
+            .build()
+            .expect("config");
+    }
+
+    #[test]
     fn distributed_ban_store_builder_wires_the_shared_bans() {
         let store = Arc::new(MemoryStore::default());
         let stage = RateLimitStage::builder(RateLimitStageConfig {
@@ -2539,10 +2554,9 @@ mod tests {
 
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
-        assert!(matches!(
-            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
+        let polled = ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx);
+        assert!(polled.is_ready());
+        assert_eq!(polled.map(|result| result.is_ok()), Poll::Ready(true));
 
         let mut request = request_from_client("192.0.2.76");
         *request.uri_mut() = "/login?next=/home".parse().expect("uri");

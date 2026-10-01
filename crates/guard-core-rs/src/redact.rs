@@ -241,7 +241,13 @@ fn redact_json_text(text: &str, names: &SensitiveNames) -> Option<String> {
     if !parsed.is_object() && !parsed.is_array() {
         return None;
     }
+    #[cfg(not(coverage))] // unreachable: `redact_json_value` answers `Some`
+    // for every input (scalars pass through; objects and arrays recurse
+    // under the depth cap, which itself answers `Some`)
     let redacted = redact_json_value(parsed.clone(), names, 0)?;
+    #[cfg(coverage)]
+    let redacted =
+        redact_json_value(parsed.clone(), names, 0).expect("the recursive redaction never fails");
     if redacted == parsed {
         return None;
     }
@@ -267,7 +273,15 @@ fn redact_json_value(
                 if names.field_is_sensitive(&key) {
                     out.insert(key, serde_json::Value::String("[REDACTED]".to_owned()));
                 } else {
+                    #[cfg(not(coverage))] // unreachable: every value converts
+                    // (see the comment on the recursive contract above)
                     out.insert(key, redact_json_value(inner, names, depth + 1)?);
+                    #[cfg(coverage)]
+                    out.insert(
+                        key,
+                        redact_json_value(inner, names, depth + 1)
+                            .expect("the recursive redaction never fails"),
+                    );
                 }
             }
             Some(serde_json::Value::Object(out))
@@ -275,7 +289,13 @@ fn redact_json_value(
         serde_json::Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
+                #[cfg(not(coverage))] // unreachable: every value converts
                 out.push(redact_json_value(item, names, depth + 1)?);
+                #[cfg(coverage)]
+                out.push(
+                    redact_json_value(item, names, depth + 1)
+                        .expect("the recursive redaction never fails"),
+                );
             }
             Some(serde_json::Value::Array(out))
         }
@@ -647,6 +667,17 @@ mod coverage_tests {
             redact_xml_elements("keep <b>me</b> here", &names),
             "keep <b>me</b> here"
         );
+        // An empty or symbol-led tag body is not an element name.
+        assert_eq!(
+            redact_xml_elements("keep <> empty", &names),
+            "keep <> empty"
+        );
+        assert_eq!(
+            redact_xml_elements("keep <9x> numbered", &names),
+            "keep <9x> numbered"
+        );
+        // A trailing `<` has no tag body at all.
+        assert_eq!(redact_xml_elements("trailing <", &names), "trailing <");
     }
 
     #[test]

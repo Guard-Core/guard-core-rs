@@ -327,15 +327,17 @@ mod tests {
         assert!(v.threats.is_empty());
     }
 
+    /// The sqli-comment predicate shared by the positive and negative
+    /// context-filtering assertions so both match arms execute.
+    fn is_sqli_comment_threat(t: &Threat) -> bool {
+        matches!(t, Threat::Regex(r) if r.category == "sqli" && r.pattern.contains("/\\*"))
+    }
+
     #[test]
     fn context_filtering_gates_sqli_narrow() {
         // `\w/\*(?!!)[^*]*\*/\w` is SQLI_NARROW (no url_path/header)
         let hit = detect("a/**/b", "request_body", &corpus_config());
-        assert!(
-            hit.threats
-                .iter()
-                .any(|t| matches!(t, Threat::Regex(r) if r.category == "sqli"))
-        );
+        assert!(hit.threats.iter().any(is_sqli_comment_threat));
         // a url_path verdict carrying other threats has no sqli comment hit
         let miss = detect("/files?name=../../etc/passwd", "url_path", &corpus_config());
         assert!(
@@ -343,9 +345,7 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t, Threat::Regex(r) if r.category == "dir_traversal"))
         );
-        assert!(!miss.threats.iter().any(
-            |t| matches!(t, Threat::Regex(r) if r.category == "sqli" && r.pattern.contains("/\\*"))
-        ));
+        assert!(!miss.threats.iter().any(is_sqli_comment_threat));
     }
 
     #[test]

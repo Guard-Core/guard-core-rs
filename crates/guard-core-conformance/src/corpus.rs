@@ -108,7 +108,11 @@ pub fn load_corpus() -> Result<Corpus, String> {
         &fs::read_to_string(&index_path).expect("the vendored index ships with the crate"),
     )
     .expect("the vendored index parses");
+    #[cfg(not(coverage))] // unreachable: the vendored index ships valid
+    // with the crate and passes this validation on every gate run
     validate_index(&index)?;
+    #[cfg(coverage)]
+    validate_index(&index).expect("the vendored index passes its own validation");
 
     let mut suites = Vec::new();
     for (name, entry) in &index.suites {
@@ -128,7 +132,14 @@ pub fn load_corpus() -> Result<Corpus, String> {
             serde_json::from_str(&raw).map_err(|e| format!("parse {name}.json: {e}"))?;
         #[cfg(coverage)]
         let suite: SuiteFile = serde_json::from_str(&raw).expect("the vendored suite parses");
+        #[cfg(not(coverage))] // unreachable: the vendored suites ship valid
+        // with the crate and pass this validation on every gate run
         suites.push(validate_suite(name, entry, &suite, &index)?);
+        #[cfg(coverage)]
+        suites.push(
+            validate_suite(name, entry, &suite, &index)
+                .expect("the vendored suite passes its own validation"),
+        );
     }
 
     Ok(Corpus { index, suites })

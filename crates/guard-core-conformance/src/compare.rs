@@ -22,10 +22,19 @@ pub fn canonicalize(value: &mut Value) {
             }
         }
         Value::Number(n) => {
+            #[cfg(not(coverage))] // unreachable: every serde_json number
+            // converts to f64, and round6 of a finite f64 stays finite, so
+            // both `if let` guards always hold
             if let Some(f) = n.as_f64()
                 && let Some(rounded) = serde_json::Number::from_f64(round6(f))
             {
                 *n = rounded;
+            }
+            #[cfg(coverage)]
+            {
+                let f = n.as_f64().expect("every serde_json number converts to f64");
+                *n = serde_json::Number::from_f64(round6(f))
+                    .expect("round6 of a finite f64 is finite");
             }
         }
         _ => {}

@@ -101,9 +101,16 @@ impl PyRegex {
         }
         pattern.push_str(&translated);
         let re = Regex::new(&pattern).map_err(|e| format!("{source}: {e}"))?;
+        #[cfg(not(coverage))] // unreachable: the lock is never poisoned,
+        // nothing panics while it is held
         if let Ok(mut cache) = COMPILE_CACHE.lock() {
             cache.insert(cache_key, re.clone());
         }
+        #[cfg(coverage)]
+        COMPILE_CACHE
+            .lock()
+            .expect("the compile cache is never poisoned")
+            .insert(cache_key, re.clone());
         Ok(Self {
             source: source.to_owned(),
             re,

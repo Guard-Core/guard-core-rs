@@ -262,6 +262,14 @@ mod tests {
     }
 
     #[test]
+    fn flat_atom_scan_propagates_a_malformed_brace_quantifier() {
+        // `{x` is neither a valid quantifier nor plain literal text here,
+        // so the whole scan answers None like the reference parser.
+        assert_eq!(parse_flat_quantified_atoms_with_text("a{x}b"), None);
+        assert_eq!(parse_flat_quantified_atoms_with_text("a{2"), None);
+    }
+
+    #[test]
     fn flat_atom_scan_rejects_groups_and_alternations() {
         assert!(parse_flat_quantified_atoms_with_text("a|b").is_none());
         assert!(parse_flat_quantified_atoms_with_text("(a)").is_none());

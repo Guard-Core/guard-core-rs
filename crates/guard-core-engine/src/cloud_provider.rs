@@ -524,7 +524,14 @@ mod tests {
 
     #[test]
     fn carve_outs_exempt_only_networks_with_a_known_region() {
-        let selectors = parse_cloud_selectors(["GCP:!us-central1"]).expect("valid selectors");
+        // A repeated carve-out region is deduplicated in place.
+        let selectors =
+            parse_cloud_selectors(["GCP:!us-central1", "GCP:!us-central1"]).expect("valid");
+        assert_eq!(
+            selectors.carveouts.get("GCP").expect("carveouts"),
+            &vec![String::from("us-central1")],
+            "the same carve-out region is not recorded twice"
+        );
         let table = CloudIpTable::default();
         table
             .set_provider_ranges(

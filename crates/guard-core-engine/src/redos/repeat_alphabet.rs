@@ -216,4 +216,32 @@ mod tests {
         let fills = repeat_alphabet_fills(r"\d\w", Flags::default(), None, true).expect("fills");
         assert!(fills.contains(&"0".to_owned()));
     }
+
+    #[test]
+    fn a_quantified_non_pairing_slot_can_repeat() {
+        let unbounded = Slot::NonPairing(super::super::parse_slots::NonPairingSlot {
+            is_boundary: true,
+            inner: None,
+            unbounded: true,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        assert!(can_repeat(&unbounded));
+        let bounded = Slot::NonPairing(super::super::parse_slots::NonPairingSlot {
+            is_boundary: false,
+            inner: None,
+            unbounded: false,
+            max_repeat: Some(3),
+            variable_bounded: false,
+        });
+        assert!(can_repeat(&bounded));
+        let single = Slot::NonPairing(super::super::parse_slots::NonPairingSlot {
+            is_boundary: false,
+            inner: None,
+            unbounded: false,
+            max_repeat: Some(1),
+            variable_bounded: false,
+        });
+        assert!(!can_repeat(&single));
+    }
 }

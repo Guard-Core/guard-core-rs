@@ -1788,6 +1788,9 @@ mod tests {
         assert_eq!(ms.len(), 1);
         let ms = sensitive_path_env("/app/.env");
         assert_eq!(ms.len(), 1);
+        // a dot with no word after it falls back to the bare `.env` arm
+        assert_eq!(env_bad("/app/.env./x", 5), vec![9]);
+        assert_eq!(env_bad("/app/.env.local", 5), vec![15, 9]);
     }
 
     #[test]
@@ -1819,6 +1822,11 @@ mod tests {
     fn deserialization_magic_boundary() {
         assert_eq!(deserialization_b64_finditer("rO0ABXNy", "rO0AB").len(), 1);
         assert!(deserialization_b64_finditer("BASE64rO0AB", "rO0AB").is_empty());
+        // `/` and `+` are mid-token base64 alphabet: no boundary, no match
+        assert!(deserialization_b64_finditer("/rO0AB", "rO0AB").is_empty());
+        assert!(deserialization_b64_finditer("+rO0AB", "rO0AB").is_empty());
+        // any other non-alphanumeric boundary passes
+        assert_eq!(deserialization_b64_finditer("x rO0AB", "rO0AB").len(), 1);
     }
 
     #[test]
@@ -1908,6 +1916,25 @@ mod tests {
     }
 
     #[test]
+    fn terminator_guard_accepts_terminators_end_and_trailing_newline() {
+        let guard = |c: char| c == ';';
+        // end of text and the terminator itself pass
+        assert!(terminator_guard("abc", 3, guard));
+        assert!(terminator_guard("ab;c", 2, guard));
+        // Python `$`: one newline immediately before the end is an anchor
+        assert!(terminator_guard("ab;\n", 3, guard));
+        // a newline with content after it is not
+        assert!(!terminator_guard("ab;\ncd", 3, guard));
+    }
+
+    #[test]
+    fn secrets_run_bad_accepts_the_plural_stems() {
+        assert_eq!(sensitive_path_secrets("/x/secret.txt").len(), 1);
+        assert_eq!(sensitive_path_secrets("/x/secrets.txt").len(), 1);
+        assert_eq!(sensitive_path_secrets("/x/credentials.json").len(), 1);
+    }
+
+    #[test]
     fn match_span_truncates_overshoots_and_rejects_bad_bounds() {
         let re = PyRegex::compile(r"ab?", false).unwrap();
         // start past end
@@ -1917,6 +1944,8 @@ mod tests {
         assert_eq!((m.start, m.end), (0, 1));
         // the truncated retry cannot match either
         assert!(match_span(re.re(), "ab", 1, 1).is_none());
+        // the truncated window has no room for the whole pattern at all
+        assert!(match_span(PyRegex::compile(r"ab", false).unwrap().re(), "ab", 0, 1).is_none());
         // no match at `start` at all
         assert!(match_span(PyRegex::compile(r"zz", false).unwrap().re(), "ab", 0, 2).is_none());
         // a match found only after `start` is not an anchor
@@ -1949,6 +1978,14 @@ mod tests {
         assert_eq!(ms[0].text("\n  evil -c id"), "\n  evil -c");
         // no newline prefix, no candidate
         assert!(shell_dash_c_finditer("evil -c id", &compiled).is_empty());
+    }
+
+    #[test]
+    fn ldap_null_byte_attr_skips_names_the_pattern_cannot_anchor() {
+        let compiled = PyRegex::compile(r"uidabcdef", false).unwrap();
+        // the attribute name carries no match for the compiled pattern, so
+        // the anchored window match fails and the tail row is dropped
+        assert!(ldap_null_byte_attr_raw("(uidlong=*)%00", &compiled).is_empty());
     }
 
     #[test]

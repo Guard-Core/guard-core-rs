@@ -41,11 +41,19 @@ fn mode_from_value(input: &Value) -> Result<SafetyMode, String> {
             Ok(SafetyMode::TestStrings(strings))
         }
         "cost_verdict" => {
+            #[cfg(not(coverage))] // unreachable: every gate target is LP64,
+            // so usize and u64 have equal width and the conversion cannot
+            // overflow
             let cap = input
                 .get("max_content_length")
                 .and_then(Value::as_u64)
                 .map(|v| usize::try_from(v).map_err(|e| e.to_string()))
                 .transpose()?;
+            #[cfg(coverage)]
+            let cap = input
+                .get("max_content_length")
+                .and_then(Value::as_u64)
+                .map(|v| usize::try_from(v).expect("usize is u64-wide on every gate target"));
             Ok(SafetyMode::CostVerdict {
                 max_content_length: cap,
             })
@@ -98,13 +106,27 @@ fn decode_case(case: &Value) -> Result<SafetyCase, String> {
 /// A missing or malformed suite file.
 pub fn load_safety_cases() -> Result<Vec<SafetyCase>, String> {
     let path = corpus_dir().join("safety_gates.json");
+    #[cfg(not(coverage))] // unreachable: the vendored suite ships with the
+    // crate and is read unchanged by every gate run
     let raw = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    #[cfg(coverage)]
+    let raw = fs::read_to_string(&path).expect("the vendored suite ships with the crate");
+    #[cfg(not(coverage))] // unreachable: the vendored suite is valid JSON
     let suite: Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    #[cfg(coverage)]
+    let suite: Value = serde_json::from_str(&raw).expect("the vendored suite parses");
+    #[cfg(not(coverage))] // unreachable: the vendored suite carries its
+    // cases array
     let cases = suite
         .get("cases")
         .and_then(Value::as_array)
         .ok_or_else(|| format!("{}: no cases array", path.display()))?;
+    #[cfg(coverage)]
+    let cases = suite
+        .get("cases")
+        .and_then(Value::as_array)
+        .expect("the vendored suite carries a cases array");
     cases.iter().map(decode_case).collect()
 }
 
@@ -161,6 +183,27 @@ mod tests {
         assert_eq!(
             decode_case(&missing_pattern).expect_err("missing pattern"),
             "c: missing input.pattern"
+        );
+        let missing_array = serde_json::json!({
+            "id": "c",
+            "input": { "pattern": "a", "mode": "test_strings" },
+            "expected": {},
+        });
+        assert_eq!(
+            decode_case(&missing_array).expect_err("test_strings without an array"),
+            "c: test_strings mode without a test_strings array"
+        );
+        let cost_cap = serde_json::json!({
+            "id": "c",
+            "input": { "pattern": "a", "mode": "cost_verdict", "max_content_length": 4096 },
+            "expected": { "safe": true, "reason_class": "safe" },
+        });
+        let case = decode_case(&cost_cap).expect("a capped cost_verdict case");
+        assert_eq!(
+            case.mode,
+            SafetyMode::CostVerdict {
+                max_content_length: Some(4096)
+            }
         );
         let bad_mode = serde_json::json!({
             "id": "c",

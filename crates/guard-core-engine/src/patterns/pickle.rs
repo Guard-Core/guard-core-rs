@@ -834,6 +834,67 @@ mod gap_tests {
     }
 
     #[test]
+    fn short_read_operand_arms_are_tolerated_like_the_reference() {
+        // Every fixed-size and length-prefixed read reports ShortRead when
+        // the window ends mid-operand; the walker tolerates it.
+        let cases: Vec<Vec<u8>> = vec![
+            vec![0x4b],                         // BININT1
+            vec![0x4d, 1],                      // BININT2
+            vec![0x47, 1, 2, 3],                // BINFLOAT
+            vec![b'I', b'1'],                   // INT line
+            vec![b'L', b'1'],                   // LONG line
+            vec![b'F', b'1'],                   // FLOAT line
+            vec![b'S', b'\'', b'a'],            // STRING line
+            vec![b'V', b'x'],                   // UNICODE line
+            vec![0x58, 9, 0, 0, 0, b'a'],       // BINUNICODE payload
+            vec![0x8c, 9, b'a'],                // SHORT_BINUNICODE payload
+            vec![0x54, 9, 0, 0, 0, b'a'],       // BINSTRING payload
+            vec![0x55, 9, b'a'],                // SHORT_BINSTRING payload
+            vec![0x42, 9, 0, 0, 0, b'a'],       // BINBYTES payload
+            vec![0x8e, 9, 0, 0, 0, 0, 0, 0, 0], // BINBYTES8 payload
+            vec![0x43, 9, b'a'],                // SHORT_BINBYTES payload
+            vec![0x96, 9, 0, 0, 0, 0, 0, 0, 0], // BYTEARRAY8 payload
+            vec![0x8a, 9, b'a'],                // 1-byte length payload
+            vec![0x8b, 9, 0, 0, 0, b'a'],       // 4-byte length payload
+            vec![0x80],                         // PROTO level byte
+            vec![0x71],                         // BINPUT index byte
+            vec![0x68],                         // BINGET index byte
+            vec![0x6a, 1, 2],                   // LONG_BINGET index
+        ];
+        // The length read itself can also run out of input.
+        for key in [0x58u8, 0x8c, 0x54, 0x55, 0x42, 0x8e, 0x43, 0x96, 0x8a, 0x8b] {
+            assert!(
+                pickle_suffix_reaches_reduce_or_build(&stream(&[key])),
+                "a missing length operand for {key:#x} is tolerated"
+            );
+        }
+        for case in cases {
+            let text = stream(&case);
+            let label = String::from_utf8_lossy(&case);
+            assert!(
+                pickle_suffix_reaches_reduce_or_build(&text),
+                "a truncated {label} operand is tolerated"
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_opcode_arms_report_the_reference_verdicts() {
+        // SETITEM on a one-deep stack fails its second pop; on a completely
+        // empty stack (the prefix walk) it fails the first.
+        assert!(!pickle_suffix_reaches_reduce_or_build(&stream(b"Ns")));
+        assert!(!pickle_prefix_is_opcode_stream("\u{73}"));
+        // A FLOAT line that is not valid UTF-8 is blocked.
+        assert!(!pickle_suffix_reaches_reduce_or_build(&stream(&[
+            b'F', 0xFF, 0x0a
+        ])));
+        // A GET index line that is not valid UTF-8 is blocked.
+        assert!(!pickle_suffix_reaches_reduce_or_build(&stream(&[
+            b'g', 0xFF, 0x0a
+        ])));
+    }
+
+    #[test]
     fn get_reads_a_memo_entry_seeded_by_binput() {
         // NONE, BINPUT 0, GET "0", REDUCE: the text GET hits the memo entry
         // the binary BINPUT seeded

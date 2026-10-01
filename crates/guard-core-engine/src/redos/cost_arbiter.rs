@@ -206,6 +206,7 @@ pub fn time_reach_probes_ascending(
 pub type TimeProbes<'a> =
     &'a dyn Fn(&str, Vec<String>, Instant, super::ast::Flags) -> Option<ReachProbeTiming>;
 
+#[derive(Debug, PartialEq)]
 pub(crate) enum TimingStrategy {
     Combined,
     Ascending,
@@ -761,18 +762,12 @@ mod tests {
 
     #[test]
     fn timing_strategy_selects_ascending_for_flagged_patterns() {
-        assert!(matches!(
+        assert_eq!(
             timing_strategy(Some("ambiguous optional tail"), false),
             TimingStrategy::Ascending
-        ));
-        assert!(matches!(
-            timing_strategy(None, true),
-            TimingStrategy::Ascending
-        ));
-        assert!(matches!(
-            timing_strategy(None, false),
-            TimingStrategy::Combined
-        ));
+        );
+        assert_eq!(timing_strategy(None, true), TimingStrategy::Ascending);
+        assert_eq!(timing_strategy(None, false), TimingStrategy::Combined);
         // Sizes widen for flagged patterns.
         assert_eq!(
             reach_probe_sizes_for_strategy(Some("x"), false),
@@ -795,11 +790,16 @@ mod tests {
         );
         let timing = result.expect("timing");
         assert_eq!(timing.samples_by_size.len(), 2);
+        // The finite-comparator contract holds on a deterministic pair even
+        // when the child took a single sample per probe.
+        let mut pair = vec![2.0_f64, 1.0];
+        pair.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        assert_eq!(pair, vec![1.0, 2.0]);
         for samples in &timing.samples_by_size {
             assert!((1..=REACH_PROBE_SAMPLE_COUNT).contains(&samples.len()));
             let mut sorted = samples.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-            assert_eq!(samples, &sorted);
+            sorted.sort_unstable_by(f64::total_cmp);
+            assert_eq!(samples.as_slice(), sorted.as_slice(), "samples are sorted");
         }
         assert!((LOAD_FACTOR_FLOOR..=LOAD_FACTOR_CEILING).contains(&timing.load_factor));
     }
@@ -876,10 +876,27 @@ mod tests {
         assert_eq!(outcome, TestStringsOutcome::Safe);
     }
 
+    /// Extract the compile-failure detail; panics on any other outcome.
+    fn expect_compile_failed(outcome: TestStringsOutcome) -> String {
+        match outcome {
+            TestStringsOutcome::CompileFailed(detail) => detail,
+            other => panic!("expected a compile failure, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_strings_probe_reports_compile_failures() {
         let outcome = run_pattern_safety_probe("[invalid", vec!["a".to_owned()], Flags::default());
-        assert!(matches!(outcome, TestStringsOutcome::CompileFailed(_)));
+        let detail = expect_compile_failed(outcome);
+        assert!(!detail.is_empty(), "the engine error text is carried");
+    }
+
+    #[test]
+    fn expect_compile_failed_rejects_other_outcomes() {
+        let result = std::panic::catch_unwind(|| {
+            expect_compile_failed(TestStringsOutcome::Safe);
+        });
+        assert!(result.is_err(), "non-compile outcomes must be rejected");
     }
 
     #[test]
@@ -1024,9 +1041,11 @@ mod tests {
             Instant::now() - std::time::Duration::from_secs(1),
             &stub_probes(1e-9),
         );
-        assert!(
-            matches!(outcome, CostOutcome::BuilderDeadline(_)),
-            "expected a builder deadline, got {outcome:?}"
+        assert_eq!(
+            outcome,
+            CostOutcome::BuilderDeadline(
+                "Pattern validation alphabet exceeded its deadline".into()
+            )
         );
     }
 
@@ -1092,7 +1111,8 @@ mod tests {
             false,
             &stub_probes(0.1),
         );
-        assert!(matches!(outcome, Some(CostOutcome::Over(_))));
+        let over = expect_over(outcome.expect("an outcome"));
+        assert!((over.min_32 - 0.1).abs() < 1e-9);
     }
 
     #[test]
@@ -1162,6 +1182,13 @@ mod tests {
         let over = expect_over(outcome.expect("an outcome"));
         assert!((over.min_32 - 0.1).abs() < 1e-9, "retry payload wins");
         assert!((over.load_factor - 2.0).abs() < 1e-9);
+        // A failed retry cannot overturn the initial over-budget verdict.
+        let outcome = verdict_for_set(&probes, &rows, 1.0, 262_144, deadline, &|_retry: Vec<
+            String,
+        >| None);
+        let over = expect_over(outcome.expect("an outcome"));
+        assert!((over.min_32 - 0.1).abs() < 1e-9, "initial payload wins");
+        assert!((over.load_factor - 1.0).abs() < 1e-9);
     }
 
     #[test]

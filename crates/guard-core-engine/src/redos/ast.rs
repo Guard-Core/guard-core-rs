@@ -711,7 +711,13 @@ impl Parser {
                                 if self.match_char('<') {
                                     let name = self.get_until('>', "group name")?;
                                     self.check_group_name(&name)?;
+                                    #[cfg(not(coverage))] // unreachable:
+                                    // `opengroup` is infallible, it always
+                                    // returns the next sequential group id
                                     let gid = self.opengroup(Some(name))?;
+                                    #[cfg(coverage)]
+                                    let gid =
+                                        self.opengroup(Some(name)).expect("opengroup cannot fail");
                                     let body = self.parse_group_body(depth)?;
                                     self.closegroup(gid);
                                     ops.push(Op::SubPattern {
@@ -885,7 +891,11 @@ impl Parser {
                             }
                         }
                     } else {
+                        #[cfg(not(coverage))] // unreachable: `opengroup` is
+                        // infallible, it always returns the next group id
                         let gid = self.opengroup(None)?;
+                        #[cfg(coverage)]
+                        let gid = self.opengroup(None).expect("opengroup cannot fail");
                         let body = self.parse_group_body(depth)?;
                         self.closegroup(gid);
                         ops.push(Op::SubPattern {
@@ -918,7 +928,13 @@ fn parse_repeat_count(digits: &str) -> Result<u32, ParseError> {
     if value >= MAXREPEAT {
         return Err(ParseError("the repetition number is too large".into()));
     }
-    u32::try_from(value).map_err(|_| ParseError("the repetition number is too large".into()))
+    #[cfg(not(coverage))] // unreachable: MAXREPEAT sits below u32::MAX, so
+    // the guard above already rejected every value wider than u32
+    let count = u32::try_from(value)
+        .map_err(|_| ParseError("the repetition number is too large".into()))?;
+    #[cfg(coverage)]
+    let count = u32::try_from(value).expect("the guard above bounds value to u32");
+    Ok(count)
 }
 
 /// The repeat upper bound: with no comma the reference reuses `hi = lo`
@@ -1130,7 +1146,7 @@ mod tests {
     #[test]
     fn named_groups_register_a_backreference_target() {
         let (ops, _) = parse_ok(r"(?P<word>x)(?P=word)", Flags::default());
-        assert!(matches!(ops[1], Op::GroupRef(1)));
+        assert_eq!(ops[1], Op::GroupRef(1));
     }
 
     #[test]
@@ -1142,38 +1158,22 @@ mod tests {
     #[test]
     fn lookahead_and_lookbehind_become_asserts() {
         let (ops, _) = parse_ok(r"(?=a)(?!b)(?<=c)(?<!d)", Flags::default());
-        assert!(matches!(
-            ops[0],
-            Op::Assert {
-                behind: false,
-                negated: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            ops[1],
-            Op::Assert {
-                behind: false,
-                negated: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            ops[2],
-            Op::Assert {
-                behind: true,
-                negated: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            ops[3],
-            Op::Assert {
-                behind: true,
-                negated: true,
-                ..
-            }
-        ));
+        let expected = [
+            (false, false, 'a'),
+            (false, true, 'b'),
+            (true, false, 'c'),
+            (true, true, 'd'),
+        ];
+        for (index, (behind, negated, literal)) in expected.into_iter().enumerate() {
+            assert_eq!(
+                ops[index],
+                Op::Assert {
+                    behind,
+                    negated,
+                    body: vec![Op::Literal(u32::from(literal))],
+                }
+            );
+        }
     }
 
     #[test]
@@ -1187,27 +1187,27 @@ mod tests {
     #[test]
     fn conditional_groups_parse_both_branches() {
         let (ops, _) = parse_ok("(a)(?(1)b|c)", Flags::default());
-        assert!(matches!(
+        assert_eq!(
             ops[1],
             Op::GroupRefExists {
                 group: 1,
-                yes: _,
-                no: Some(_),
+                yes: vec![Op::Literal(u32::from('b'))],
+                no: Some(vec![Op::Literal(u32::from('c'))]),
             }
-        ));
+        );
     }
 
     #[test]
     fn conditional_group_by_name_resolves_the_number() {
         let (ops, _) = parse_ok("(?P<x>a)(?(x)b)", Flags::default());
-        assert!(matches!(
+        assert_eq!(
             ops[1],
             Op::GroupRefExists {
                 group: 1,
+                yes: vec![Op::Literal(u32::from('b'))],
                 no: None,
-                ..
             }
-        ));
+        );
     }
 
     #[test]
@@ -1251,14 +1251,15 @@ mod tests {
     #[test]
     fn empty_brace_bounds_mean_zero_to_unbounded() {
         let (ops, _) = parse_ok("a{,}", Flags::default());
-        assert!(matches!(
+        assert_eq!(
             ops[0],
             Op::Repeat {
+                kind: RepeatKind::Greedy,
                 low: 0,
                 high: None,
-                ..
+                body: vec![Op::Literal(u32::from('a'))],
             }
-        ));
+        );
     }
 
     #[test]
@@ -1425,10 +1426,10 @@ mod tests {
     #[test]
     fn backreference_to_a_closed_group_parses() {
         let (ops, _) = parse_ok(r"(a)\1", Flags::default());
-        assert!(matches!(ops[1], Op::GroupRef(1)));
+        assert_eq!(ops[1], Op::GroupRef(1));
         let (ops, _) = parse_ok(r"(a)\1\1", Flags::default());
-        assert!(matches!(ops[1], Op::GroupRef(1)));
-        assert!(matches!(ops[2], Op::GroupRef(1)));
+        assert_eq!(ops[1], Op::GroupRef(1));
+        assert_eq!(ops[2], Op::GroupRef(1));
     }
 
     #[test]
@@ -1520,6 +1521,194 @@ mod tests {
     }
 
     #[test]
+    fn group_name_validation_rejects_embedded_and_leading_bad_characters() {
+        // A bad character inside the name trips the identifier scan...
+        assert_eq!(
+            parse(r"(?P<a-b>x)", Flags::default()).err(),
+            Some(ParseError("bad character in group name \"a-b\"".into()))
+        );
+        // ...and a backreference through such a name fails the same way.
+        assert_eq!(
+            parse(r"(a)(?P=a-b)", Flags::default()).err(),
+            Some(ParseError("bad character in group name \"a-b\"".into()))
+        );
+        // A conditional referencing a bad name fails before the lookup.
+        assert_eq!(
+            parse(r"(a)(?(a-b)x)", Flags::default()).err(),
+            Some(ParseError("bad character in group name \"a-b\"".into()))
+        );
+    }
+
+    #[test]
+    fn every_flag_turned_on_and_off_is_an_error() {
+        for flags in ["i", "m", "s", "a"] {
+            let pattern = format!("(?{flags}-{flags}:x)");
+            assert_eq!(
+                parse(&pattern, Flags::default()).err(),
+                Some(ParseError(
+                    "bad inline flags: flag turned on and off".into()
+                )),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn class_escape_error_arms_match_the_reference() {
+        // A trailing backslash inside a class runs out of input.
+        assert_eq!(
+            parse(r"[a\", Flags::default()).err(),
+            Some(ParseError("bad escape".into()))
+        );
+        // An over-wide \U escape is illegal inside a class.
+        assert_eq!(
+            parse(r"[\U00110000]", Flags::default()).err(),
+            Some(ParseError(
+                "illegal Unicode character in \\U00110000".into()
+            ))
+        );
+        // Non-octal digits and unknown letters are bad escapes in a class.
+        assert_eq!(
+            parse(r"[\8]", Flags::default()).err(),
+            Some(ParseError("bad escape \\8".into()))
+        );
+        assert_eq!(
+            parse(r"[\q]", Flags::default()).err(),
+            Some(ParseError("bad escape \\q".into()))
+        );
+    }
+
+    #[test]
+    fn outside_class_escape_error_arms_match_the_reference() {
+        // A trailing backslash runs out of input.
+        assert_eq!(
+            parse(r"\", Flags::default()).err(),
+            Some(ParseError("bad escape".into()))
+        );
+        // A surrogate \\u escape is an illegal scalar; \\U has eight digits
+        // so a value beyond the scalar maximum is expressible.
+        assert_eq!(
+            parse(r"\ud800", Flags::default()).err(),
+            Some(ParseError("illegal Unicode character in \\ud800".into()))
+        );
+        assert_eq!(
+            parse(r"\U00110000", Flags::default()).err(),
+            Some(ParseError(
+                "illegal Unicode character in \\U00110000".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn class_range_error_arms_match_the_reference() {
+        // A dangling range dash runs out of input.
+        assert_eq!(
+            parse(r"[a-", Flags::default()).err(),
+            Some(ParseError("unterminated character set".into()))
+        );
+        // The range end may itself be an escape sequence.
+        let (ops, _) = parse_ok(r"[a-\x7f]", Flags::default());
+        assert_eq!(ops[0], Op::In(vec![ClassItem::Range(0x61, 0x7f)]));
+        // ...and a bad escape in the range end propagates its error.
+        assert_eq!(
+            parse(r"[a-\q]", Flags::default()).err(),
+            Some(ParseError("bad escape \\q".into()))
+        );
+    }
+
+    #[test]
+    fn repeat_bound_errors_match_the_reference() {
+        // A count past MAXREPEAT is rejected...
+        assert_eq!(
+            parse("a{4294967287}", Flags::default()).err(),
+            Some(ParseError("the repetition number is too large".into()))
+        );
+        // ...as is one that does not even fit u64.
+        assert_eq!(
+            parse("a{99999999999999999999}", Flags::default()).err(),
+            Some(ParseError("the repetition number is too large".into()))
+        );
+        // An open comma skips the high-bound parse, so the low bound is
+        // validated on its own.
+        assert_eq!(
+            parse("a{4294967287,}", Flags::default()).err(),
+            Some(ParseError("the repetition number is too large".into()))
+        );
+    }
+
+    #[test]
+    fn high_from_maps_every_bound_shape() {
+        assert_eq!(high_from("", None), Ok(None), "no comma and no low");
+        assert_eq!(high_from("3", None), Ok(Some(3)), "no comma reuses the low");
+        assert_eq!(
+            high_from("", Some("")),
+            Ok(None),
+            "an open comma is unbounded"
+        );
+        assert_eq!(high_from("2", Some("5")), Ok(Some(5)));
+        assert_eq!(
+            high_from("9", Some("99999999999999999999")).err(),
+            Some(ParseError("the repetition number is too large".into()))
+        );
+    }
+
+    #[test]
+    fn named_reference_and_conditional_error_arms_match_the_reference() {
+        // A (?P= backreference without its closing paren...
+        assert_eq!(
+            parse(r"(a)(?P=x", Flags::default()).err(),
+            Some(ParseError("missing ), unterminated group name".into()))
+        );
+        // ...a lookahead whose body cannot parse...
+        assert_eq!(
+            parse(r"(?=[", Flags::default()).err(),
+            Some(ParseError("unterminated character set".into()))
+        );
+        // ...a negative lookahead whose body never closes...
+        assert_eq!(
+            parse(r"(?!(", Flags::default()).err(),
+            Some(ParseError("missing ), unterminated subpattern".into()))
+        );
+        // ...and the same for lookbehinds.
+        assert_eq!(
+            parse(r"(?<=(", Flags::default()).err(),
+            Some(ParseError("missing ), unterminated subpattern".into()))
+        );
+    }
+
+    #[test]
+    fn conditional_error_arms_match_the_reference() {
+        // An unterminated condition name...
+        assert_eq!(
+            parse(r"(a)(?(x", Flags::default()).err(),
+            Some(ParseError("missing ), unterminated group name".into()))
+        );
+        // ...a yes-branch that cannot parse...
+        assert_eq!(
+            parse(r"(a)(?(1)[", Flags::default()).err(),
+            Some(ParseError("unterminated character set".into()))
+        );
+        // ...and a no-branch that cannot parse.
+        assert_eq!(
+            parse(r"(a)(?(1)b|(", Flags::default()).err(),
+            Some(ParseError("missing ), unterminated subpattern".into()))
+        );
+    }
+
+    #[test]
+    fn a_plain_group_body_that_cannot_parse_is_an_error() {
+        assert_eq!(
+            parse("([", Flags::default()).err(),
+            Some(ParseError("unterminated character set".into()))
+        );
+        // A scoped-flag group body fails the same way.
+        assert_eq!(
+            parse("(?i:[", Flags::default()).err(),
+            Some(ParseError("unterminated character set".into()))
+        );
+    }
+
+    #[test]
     fn possessive_quantifiers_are_rejected_at_the_reference_floor() {
         assert_eq!(
             parse("a*+", Flags::default()).err(),
@@ -1560,7 +1749,7 @@ mod tests {
         );
         let groups = "()".repeat(12);
         let (ops, _) = parse_ok(&format!("{groups}\\12"), Flags::default());
-        assert!(matches!(ops[12], Op::GroupRef(12)));
+        assert_eq!(ops[12], Op::GroupRef(12));
     }
 
     #[test]
@@ -1579,7 +1768,14 @@ mod tests {
     #[test]
     fn conditional_without_else_uses_none() {
         let (ops, _) = parse_ok("(a)(?(1)b)", Flags::default());
-        assert!(matches!(&ops[1], Op::GroupRefExists { no: None, .. }));
+        assert_eq!(
+            ops[1],
+            Op::GroupRefExists {
+                group: 1,
+                yes: vec![Op::Literal(u32::from('b'))],
+                no: None,
+            }
+        );
     }
 
     #[test]

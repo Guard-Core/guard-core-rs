@@ -437,6 +437,7 @@ pub fn validate_pattern_safety_compat(pattern: &str) -> (bool, String) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ast::Flags;
     use super::*;
 
     /// Extract the structural rule; panics on any other reason.
@@ -492,6 +493,30 @@ mod tests {
                 verdict.reason
             );
         }
+    }
+
+    #[test]
+    fn the_flag_prefix_tracks_every_flag_independently() {
+        // dotall-only flags still enter the prefix builder, so the
+        // ignorecase and multiline arms stay independent of each other.
+        let verdict = validate_pattern_safety_with_flags(
+            "(unclosed",
+            &cost(None),
+            Flags {
+                dotall: true,
+                ..Flags::default()
+            },
+        );
+        assert_eq!(verdict.reason_class(), "compile_failed");
+        let verdict = validate_pattern_safety_with_flags(
+            "(unclosed",
+            &cost(None),
+            Flags {
+                ascii: true,
+                ..Flags::default()
+            },
+        );
+        assert_eq!(verdict.reason_class(), "compile_failed");
     }
 
     #[test]

@@ -394,6 +394,8 @@ mod unit_twins {
         // a well-formed frame inside the window renders
         let frame = template_frame("{{x}} tail", "{{", "}}", 0, 10).expect("frame");
         assert_eq!((frame.start, frame.end), (0, 5));
+        // an empty closing delimiter has no leading char to scan for
+        assert_eq!(template_frame("{{x}}", "{{", "", 0, 5), None);
     }
 
     #[test]

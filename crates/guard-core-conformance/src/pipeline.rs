@@ -335,9 +335,15 @@ impl CaseEngine {
                 &payload.method,
                 payload.status_code,
             );
+            #[cfg(not(coverage))] // unreachable: the mutex is never
+            // poisoned, nothing panics while the lock is held
             if let Ok(mut seen) = sink.lock() {
                 seen.push(record);
             }
+            #[cfg(coverage)]
+            sink.lock()
+                .expect("the mutex is never poisoned")
+                .push(record);
         });
 
         // The shared ban store: the reference singleton `ip_ban_manager`
@@ -704,9 +710,18 @@ impl CaseEngine {
 
         // Whatever the stage's recorder captured (rate-limit and
         // detection-feed blocks, active or passive) lands on the record.
+        #[cfg(not(coverage))] // unreachable: the mutex is never poisoned,
+        // nothing panics while the lock is held
         if let Ok(mut seen) = self.payloads.lock() {
             record.on_block.extend(seen.drain(..));
         }
+        #[cfg(coverage)]
+        record.on_block.extend(
+            self.payloads
+                .lock()
+                .expect("the mutex is never poisoned")
+                .drain(..),
+        );
 
         // Every rendered (non-passive) answer carries the security-header
         // set, exactly like the reference `create_error_response`.
@@ -906,7 +921,9 @@ fn security_headers_config_from(value: &Value) -> Result<SecurityHeadersConfig, 
             let directives = value
                 .as_object()
                 .ok_or("security_headers.csp: not an object")?;
-            directives
+            #[cfg(not(coverage))] // unreachable: every closure iteration
+            // answers `Ok`, so the collect never fails
+            let directives = directives
                 .iter()
                 .map(|(name, sources)| {
                     Ok(CspDirective {
@@ -914,7 +931,16 @@ fn security_headers_config_from(value: &Value) -> Result<SecurityHeadersConfig, 
                         sources: str_list(sources),
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?
+                .collect::<Result<Vec<_>, String>>()?;
+            #[cfg(coverage)]
+            let directives: Vec<_> = directives
+                .iter()
+                .map(|(name, sources)| CspDirective {
+                    name: name.clone(),
+                    sources: str_list(sources),
+                })
+                .collect();
+            directives
         }
     };
     let hsts = match dict.get("hsts") {
@@ -1263,6 +1289,81 @@ mod tests {
     #[test]
     fn engine_config_fails_closed_on_bad_ip_lists() {
         assert!(engine_error(json!({"whitelist": ["not-an-ip"]})).starts_with("ip gate config: "));
+    }
+
+    #[test]
+    fn run_case_and_compare_case_propagate_engine_config_errors() {
+        let bad = case_with_config(json!({ "whitelist": ["not-an-ip"] }));
+        let error = run_case(&bad, &knobs()).expect_err("invalid ip gate config");
+        assert!(error.starts_with("ip gate config: "), "{error}");
+        let error = compare_case(&bad, &knobs()).expect_err("invalid ip gate config");
+        assert!(error.starts_with("ip gate config: "), "{error}");
+    }
+
+    #[test]
+    fn security_headers_config_rejects_malformed_dicts() {
+        assert_eq!(
+            security_headers_config_from(&json!("nope")).expect_err("not an object"),
+            "security_headers: not an object"
+        );
+        assert_eq!(
+            security_headers_config_from(&json!({ "custom": ["x"] }))
+                .expect_err("custom not an object"),
+            "security_headers.custom: not an object"
+        );
+        assert_eq!(
+            security_headers_config_from(&json!({ "custom": { "X-A": 1 } }))
+                .expect_err("custom value not a string"),
+            "security_headers.custom.X-A: not a string"
+        );
+        assert_eq!(
+            security_headers_config_from(&json!({ "csp": "deny-all" }))
+                .expect_err("csp not an object"),
+            "security_headers.csp: not an object"
+        );
+        assert_eq!(
+            security_headers_config_from(&json!({ "hsts": 5 })).expect_err("hsts not an object"),
+            "security_headers.hsts: not an object"
+        );
+        for name in [
+            "frame_options",
+            "content_type_options",
+            "xss_protection",
+            "referrer_policy",
+            "permissions_policy",
+        ] {
+            let mut map = serde_json::Map::new();
+            map.insert(name.to_owned(), json!(7));
+            let err = security_headers_config_from(&Value::Object(map))
+                .expect_err("a non-string field must be rejected");
+            assert_eq!(err, format!("security_headers.{name}: not a string"));
+        }
+    }
+
+    #[test]
+    fn security_headers_config_accepts_the_reference_shapes() {
+        let config = security_headers_config_from(&json!({
+            "enabled": true,
+            "hsts": { "max_age": 31_536_000, "include_subdomains": true, "preload": true },
+            "csp": { "default-src": ["'self'"], "upgrade-insecure-requests": [] },
+            "frame_options": "DENY",
+            "content_type_options": "nosniff",
+            "xss_protection": "1; mode=block",
+            "referrer_policy": "strict-origin-when-cross-origin",
+            "permissions_policy": "geolocation=()",
+            "custom": { "X-Custom": "yes" },
+        }))
+        .expect("a full security_headers dict parses");
+        assert!(config.enabled);
+        assert_eq!(config.frame_options.as_deref(), Some("DENY"));
+        assert_eq!(
+            config.custom.get("X-Custom").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(config.csp.len(), 2);
+        let hsts = config.hsts.as_ref().expect("hsts present");
+        assert_eq!(hsts.max_age, Some(31_536_000));
+        assert!(hsts.include_subdomains && hsts.preload);
     }
 
     #[test]

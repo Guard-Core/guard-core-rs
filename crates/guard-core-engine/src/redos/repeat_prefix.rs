@@ -447,6 +447,79 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_deadline_surfaces_from_every_public_entry() {
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        // the prefix walk itself
+        let error = walk_with_deadline("ab", expired).expect_err("deadline");
+        assert!(error.0.contains("deadline"), "{error}");
+        // the mandatory-repeat unroll and the pending-repeat ladder
+        let error = repeat_reaching_prefixes("a{40}b", Flags::default(), Some(expired), false)
+            .expect_err("deadline");
+        assert!(error.0.contains("deadline"), "{error}");
+        // the assertion-witness walker under a quantified assertion body
+        let (ops, _) = crate::redos::ast::parse("(?=a{40})", Flags::default()).expect("parses");
+        let error =
+            assertion_witnesses(&ops, Flags::default(), Some(expired)).expect_err("deadline");
+        assert!(error.0.contains("deadline"), "{error}");
+    }
+
+    #[test]
+    fn single_bound_repeats_never_record_or_collect() {
+        // `a?` has high == Some(1): no prefix candidates, no repeat collect.
+        let (prefixes, states) = walk("xa?", true, false).expect("walk");
+        assert!(
+            !prefixes.iter().any(|prefix| prefix == "x"),
+            "high == 1 records nothing: {prefixes:?}"
+        );
+        assert_eq!(states.len(), 1);
+    }
+
+    #[test]
+    fn a_fully_excluded_class_consumes_nothing() {
+        // `(?!\S)` excludes every non-space char, so the following `\S`
+        // cannot consume and the walk dies before the terminator.
+        let (_prefixes, states) = walk(r"(?!\S)\S", false, false).expect("walk");
+        assert!(states.is_empty(), "no state survives: {states:?}");
+    }
+
+    #[test]
+    fn an_uncaptured_conditional_takes_the_no_branch() {
+        // No group 1 exists, so the conditional walks its `no` branch.
+        let (_prefixes, states) = walk("(?(1)y|z)", false, false).expect("walk");
+        let texts: Vec<String> = states.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(texts, vec!["z".to_owned()]);
+        // The captured branch walks when group 1 is live.
+        let (_prefixes, states) = walk("(x)(?(1)y|z)", false, false).expect("walk");
+        assert_eq!(states[0].text, "xy");
+    }
+
+    #[test]
+    fn a_parse_failure_flows_through_the_harness() {
+        assert!(walk("[unterminated", false, false).is_err());
+    }
+
+    /// The walk harness with an injected deadline, for the arms only an
+    /// expired clock can reach.
+    fn walk_with_deadline(
+        pattern: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Vec<RepeatPrefixState>, BuilderTimeout> {
+        let (ops, flags) = crate::redos::ast::parse(pattern, Flags::default()).expect("parses");
+        let mut prefixes = Vec::new();
+        let mut walker = PrefixWalk {
+            flags,
+            prefixes: &mut prefixes,
+            deadline: Some(deadline),
+            collect: false,
+            alphabet: Vec::new(),
+            repeat_collector: None,
+            canonical_optionals: true,
+            require_reachable: false,
+        };
+        walker.walk(&ops, vec![RepeatPrefixState::default()], false)
+    }
+
+    #[test]
     fn literals_consume_their_first_member() {
         let (_prefixes, states) = walk("ab", false, false).expect("walk");
         assert_eq!(states.len(), 1);
@@ -615,9 +688,7 @@ mod tests {
 
     #[test]
     fn assertion_witnesses_reject_unresolved_nested_assertions() {
-        let (ops, _) = crate::redos::ast::parse("a(?=x)", Flags::default())
-            .map_err(|_| BuilderTimeout("parse error".into()))
-            .expect("parses");
+        let (ops, _) = crate::redos::ast::parse("a(?=x)", Flags::default()).expect("parses");
         let error = assertion_witnesses(&ops, Flags::default(), None).expect_err("pending");
         assert_eq!(
             error.0,
@@ -629,9 +700,7 @@ mod tests {
     fn collected_prefixes_honor_the_candidate_budget() {
         // Seed the collector past its budget; the very next collected
         // repeat must trip the guard.
-        let (ops, flags) = crate::redos::ast::parse("x+", Flags::default())
-            .map_err(|_| BuilderTimeout("parse error".into()))
-            .expect("parses");
+        let (ops, flags) = crate::redos::ast::parse("x+", Flags::default()).expect("parses");
         let mut prefixes = vec![String::new(); REPEAT_PREFIX_STATE_LIMIT * 4 + 1];
         let mut walker = PrefixWalk {
             flags,
