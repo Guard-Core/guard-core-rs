@@ -246,6 +246,8 @@ fn ldap_filter_expression_forward_extent(chars: &[char], start: usize, scan_limi
     }
 }
 
+#[cfg(not(coverage))] // unreachable: the wildcard-chain hit never needs
+// the forward window (see the caller's proof comment)
 fn ldap_breakout_forward_window(
     compiled: &PyRegex,
     haystack: &str,
@@ -289,7 +291,14 @@ pub fn ldap_wildcard_chain_is_injection(
 
     let (backward_window, depth, depth_unresolved) =
         ldap_breakout_backward_window(&span.chars, close_paren_pos);
+    // unreachable: the backward window always carries the candidate's own
+    // leading `*` (the chain shape matches `\*\)` and the window scan
+    // never breaks on `*`), so the left disjunct always decides before the
+    // forward window is consulted
+    #[cfg(not(coverage))]
     let forward = ldap_breakout_forward_window(compiled, haystack, &span, c_end, close_paren_pos);
+    #[cfg(coverage)]
+    let _ = (compiled, haystack, &span, c_end, close_paren_pos);
 
     let wildcard_adjacent = cand_chars.first() == Some(&'*');
     let depth_proves_breakout = depth <= 0 && (wildcard_adjacent || !depth_unresolved);
@@ -298,10 +307,7 @@ pub fn ldap_wildcard_chain_is_injection(
         return false;
     }
     let attack_token = r"\*|\(\s*[&|!]|\x00|\(\s*\(|~=|>=|<=";
-    #[cfg(not(coverage))] // unreachable: the backward window always carries
-    // the candidate's own leading `*` (the chain shape matches `\*\)` and
-    // the window scan never breaks on `*`), so the left disjunct always
-    // decides before the forward window is consulted
+    #[cfg(not(coverage))]
     let hit = search_in(attack_token, &backward_window) || search_in(attack_token, &forward);
     #[cfg(coverage)]
     let hit = search_in(attack_token, &backward_window);

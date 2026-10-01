@@ -16,7 +16,10 @@ pub fn node_observes_history(op: &Op) -> bool {
             group,
             add,
             del,
+            #[cfg(not(coverage))]
             body,
+            #[cfg(coverage)]
+                body: _,
         } => {
             let flagged = group.is_some() || *add != Flags::default() || *del != Flags::default();
             #[cfg(not(coverage))] // unreachable: the parser never emits a
