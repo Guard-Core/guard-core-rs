@@ -1716,7 +1716,7 @@ mod tests {
             load_pipeline_suites(&stale_engine)
                 .err()
                 .unwrap()
-                .starts_with("suite pipeline_ip_control engine_version '4.2.0' does not match")
+                .starts_with("suite pipeline_ip_control engine_version '4.3.0' does not match")
         );
 
         // declared case count mismatch
@@ -1748,7 +1748,7 @@ mod tests {
     fn sample_index() -> corpus::IndexFile {
         corpus::IndexFile {
             spec_version: "4.1.0".to_owned(),
-            engine_version: "4.2.0".to_owned(),
+            engine_version: "4.3.0".to_owned(),
             engine_commit: "deadbeef".to_owned(),
             fixed_ip: "10.0.0.1".to_owned(),
             config_knobs: json!({}),

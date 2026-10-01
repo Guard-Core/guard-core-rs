@@ -1,6 +1,6 @@
 [package]
 name          = "guard-core-rs"
-version       = "4.2.0"
+version       = "4.3.0"
 authors       = { workspace = true }
 categories    = { workspace = true }
 description   = "Framework-agnostic security engine for the Guard ecosystem."
