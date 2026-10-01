@@ -406,3 +406,182 @@ pub fn verify_stray_forces_failure(
 ) -> Result<bool, BuilderTimeout> {
     class_intersection_probe_forces_failure(ctx, fill_char, candidate)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redos::ast::Flags;
+
+    #[test]
+    fn leading_literal_prefix_unwraps_transparent_groups() {
+        assert_eq!(leading_literal_prefix(r"(?:<[^<>]*)"), "<");
+    }
+
+    #[test]
+    fn leading_literal_prefix_handles_escaped_literal_runs() {
+        assert_eq!(leading_literal_prefix(r"\.\.;[^/\\]*"), "..;");
+    }
+
+    #[test]
+    fn leading_literal_prefix_empty_when_the_pattern_opens_with_a_metachar() {
+        assert_eq!(leading_literal_prefix(r"[^<>]*x"), "");
+    }
+
+    #[test]
+    fn fill_to_length_pads_truncates_and_places_the_stray() {
+        assert_eq!(fill_to_length("ab", "x", "!", 4), "abx!");
+        assert_eq!(fill_to_length("abcdef", "x", "!", 3), "abc");
+        assert_eq!(fill_to_length("ab", "x", "!", 6), "abxxx!");
+        // Body room of one or fewer never forces the stray in.
+        assert_eq!(fill_to_length("ab", "x", "!", 3), "abx");
+        assert_eq!(fill_to_length("ab", "x", "!", 2), "ab");
+    }
+
+    #[test]
+    fn repeat_probe_forces_non_alignment_on_exact_multiples() {
+        let result = repeat_probe_to_length("ab", 10, "\0");
+        assert_eq!(result.chars().count(), 10);
+        assert_eq!(result.chars().last(), Some('\0'));
+    }
+
+    #[test]
+    fn repeat_probe_stays_pure_repetition_when_not_aligned() {
+        let result = repeat_probe_to_length("abc", 10, "\0");
+        assert_eq!(result.chars().count(), 10);
+        assert!(!result.contains('\0'));
+    }
+
+    #[test]
+    fn repeat_probe_empty_unit_returns_empty() {
+        assert_eq!(repeat_probe_to_length("", 10, "\0"), "");
+    }
+
+    #[test]
+    fn stray_for_pair_reaches_past_the_byte_range() {
+        let left = IntervalSet::from_range(0, 0xFF);
+        let right = IntervalSet::from_range(0, 0xFE);
+        let stray = stray_for_pair(&left, &right);
+        let code = stray.chars().next().map(u32::from).expect("char");
+        assert!(code >= 0x100);
+        assert!(!left.contains(code));
+        assert!(!right.contains(code));
+    }
+
+    #[test]
+    fn stray_for_pair_falls_back_to_nul_on_a_universal_union() {
+        assert_eq!(stray_for_pair(&IntervalSet::full(), &IntervalSet::full()), "\0");
+    }
+
+    #[test]
+    fn first_complement_char_is_none_for_a_universal_set() {
+        assert_eq!(first_complement_char(&IntervalSet::full()), None);
+        // The complement starts at NUL, not at 'a' + 1.
+        assert_eq!(
+            first_complement_char(&IntervalSet::single(u32::from('a'))),
+            Some("\0".to_owned())
+        );
+    }
+
+    #[test]
+    fn pattern_complement_chars_collect_per_intervals() {
+        let chars = pattern_complement_chars(r"\d\d", Flags::default());
+        assert_eq!(chars, vec!["\0".to_owned()]);
+        // Parse failures contribute nothing.
+        assert!(pattern_complement_chars("[oops", Flags::default()).is_empty());
+    }
+
+    #[test]
+    fn build_stray_context_carries_the_pattern_union() {
+        let ctx = build_stray_context(r"\d", Flags::default(), None);
+        assert_eq!(ctx.pattern, r"\d");
+        assert!(ctx.pattern_union.contains(u32::from('5')));
+        assert!(!ctx.pattern_union.contains(u32::from('x')));
+        assert_eq!(ctx.prefix, "");
+    }
+
+    #[test]
+    fn choose_repeat_unit_stray_rejects_empty_units() {
+        let ctx = build_stray_context("abc", Flags::default(), None);
+        assert_eq!(
+            choose_repeat_unit_stray(&ctx, "").expect("stray"),
+            "\0"
+        );
+    }
+
+    #[test]
+    fn choose_repeat_unit_stray_verifies_in_the_child() {
+        let ctx = build_stray_context("abc", Flags::default(), None);
+        // The literal pattern never matches a probe with stray breaks.
+        let stray = choose_repeat_unit_stray(&ctx, "abc").expect("stray");
+        assert!(!stray.is_empty());
+    }
+
+    #[test]
+    fn choose_class_intersection_stray_prefers_tail_complements() {
+        let pattern = r"\s*[\s\S]+[\x00-\x08]";
+        let flags = Flags::ignorecase_multiline();
+        let slots = crate::redos::parse_slots::pattern_slots(pattern, flags)
+            .expect("pattern parses");
+        let Slot::Pairing(left) = &slots[0] else {
+            panic!("expected pairing");
+        };
+        let Slot::Pairing(middle) = &slots[1] else {
+            panic!("expected pairing");
+        };
+        let Slot::Pairing(tail_atom) = &slots[2] else {
+            panic!("expected pairing");
+        };
+        let _ = tail_atom;
+        let fill_member = left
+            .intervals
+            .intersection(&middle.intervals)
+            .first_member()
+            .expect("overlap");
+        let fill = char::from_u32(fill_member).expect("char");
+        let ctx = build_stray_context(pattern, flags, None);
+        let slots_ints: Vec<IntervalSet> = slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Pairing(atom) => Some(atom.intervals.clone()),
+                Slot::NonPairing(_) => None,
+            })
+            .collect();
+        let stray = choose_class_intersection_stray(
+            &ctx,
+            &fill.to_string(),
+            &left.intervals,
+            &middle.intervals,
+            &[slots_ints[2].clone()],
+        )
+        .expect("stray");
+        assert_ne!(stray, "\0");
+    }
+
+    #[test]
+    fn verify_stray_forces_failure_for_a_forcing_probe() {
+        let ctx = build_stray_context("^a+$", Flags::default(), None);
+        assert!(
+            verify_stray_forces_failure(&ctx, "a", "\0").expect("verified"),
+            "the NUL stray must force the anchored class to fail"
+        );
+    }
+
+    #[test]
+    fn stray_verification_timeout_honors_the_deadline() {
+        let ctx = build_stray_context("abc", Flags::default(), None);
+        assert_eq!(
+            stray_verification_timeout(&ctx).expect("timeout"),
+            STRAY_VERIFY_TIMEOUT_SECONDS
+        );
+        let expired = build_stray_context(
+            "abc",
+            Flags::default(),
+            Some(Instant::now() - std::time::Duration::from_secs(1)),
+        );
+        let error = stray_verification_timeout(&expired).expect_err("expired");
+        assert_eq!(
+            error.0,
+            "Pattern validation probe construction exceeded its deadline"
+        );
+    }
+}

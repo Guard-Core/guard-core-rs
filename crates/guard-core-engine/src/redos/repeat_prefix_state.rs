@@ -260,3 +260,247 @@ pub fn negative_assertion(
         ..state.clone()
     }]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redos::ast::{Flags, Op};
+
+    fn state(text: &str) -> RepeatPrefixState {
+        RepeatPrefixState {
+            text: text.to_owned(),
+            ..RepeatPrefixState::default()
+        }
+    }
+
+    #[test]
+    fn consume_piece_appends_text_and_tracks_the_last_atom() {
+        let consumed = consume_piece(&state("ab"), "cd").expect("no budget error");
+        let consumed = consumed.expect("piece consumed");
+        assert_eq!(consumed.text, "abcd");
+        assert_eq!(
+            consumed.last_atom,
+            Some(IntervalSet::single(u32::from('d')))
+        );
+    }
+
+    #[test]
+    fn consume_piece_empty_returns_the_state() {
+        let original = state("ab");
+        let consumed = consume_piece(&original, "").expect("no budget error");
+        assert_eq!(consumed, Some(original));
+    }
+
+    #[test]
+    fn consume_piece_rejects_an_excluded_first_character() {
+        let mut excluded = state("ab");
+        excluded.excluded = IntervalSet::single(u32::from('x'));
+        assert_eq!(
+            consume_piece(&excluded, "xy").expect("no budget error"),
+            None
+        );
+    }
+
+    #[test]
+    fn consume_piece_rejects_a_pending_mismatch() {
+        let mut pending = state("ab");
+        pending.pending = "xy".into();
+        assert_eq!(
+            consume_piece(&pending, "ax").expect("no budget error"),
+            None
+        );
+    }
+
+    #[test]
+    fn consume_piece_consumes_a_matching_pending_prefix() {
+        let mut pending = state("ab");
+        pending.pending = "cd".into();
+        let consumed = consume_piece(&pending, "c").expect("no budget error");
+        let consumed = consumed.expect("prefix consumed");
+        assert_eq!(consumed.text, "abc");
+        assert_eq!(consumed.pending, "d");
+    }
+
+    #[test]
+    fn consume_piece_forbidden_prefix_kills_the_state() {
+        // The kill condition is `piece.startswith(word)`: the consumed
+        // piece covers the whole forbidden word.
+        let mut forbidden = state("ab");
+        forbidden.forbidden = vec!["xyz".into()];
+        assert_eq!(
+            consume_piece(&forbidden, "xyz").expect("no budget error"),
+            None
+        );
+    }
+
+    #[test]
+    fn consume_piece_forbidden_word_survivors_drop_the_consumed_prefix() {
+        let mut forbidden = state("");
+        forbidden.forbidden = vec!["abcd".into()];
+        let consumed = consume_piece(&forbidden, "ab").expect("no budget error");
+        let consumed = consumed.expect("prefix consumed");
+        assert_eq!(consumed.forbidden, vec!["cd".to_owned()]);
+    }
+
+    #[test]
+    fn consume_piece_over_the_length_budget_is_an_error() {
+        let mut long = state("");
+        long.text = "a".repeat(REPEAT_PREFIX_BUDGET);
+        let error = consume_piece(&long, "b").expect_err("budget exceeded");
+        assert_eq!(
+            error.0,
+            "Pattern validation repeat-prefix length budget exceeded"
+        );
+    }
+
+    #[test]
+    fn consume_atom_picks_the_first_available_member() {
+        let intervals = IntervalSet::new(&[(u32::from('a'), u32::from('c'))]);
+        let consumed = consume_atom(&state(""), &intervals)
+            .expect("no budget error")
+            .expect("atom consumed");
+        assert_eq!(consumed.text, "a");
+        assert_eq!(consumed.last_atom, Some(intervals));
+    }
+
+    #[test]
+    fn consume_atom_honors_pending_before_availability() {
+        let intervals = IntervalSet::new(&[(u32::from('a'), u32::from('z'))]);
+        let mut pending = state("");
+        pending.pending = "q".into();
+        let consumed = consume_atom(&pending, &intervals)
+            .expect("no budget error")
+            .expect("atom consumed");
+        assert_eq!(consumed.text, "q");
+    }
+
+    #[test]
+    fn consume_atom_returns_none_when_everything_is_excluded() {
+        let intervals = IntervalSet::single(u32::from('a'));
+        let mut excluded = state("");
+        excluded.excluded = IntervalSet::single(u32::from('a'));
+        assert_eq!(
+            consume_atom(&excluded, &intervals).expect("no budget error"),
+            None
+        );
+    }
+
+    #[test]
+    fn consume_atom_filters_single_char_forbidden_words() {
+        let intervals = IntervalSet::new(&[(u32::from('a'), u32::from('b'))]);
+        let mut forbidden = state("");
+        forbidden.forbidden = vec!["a".into()];
+        let consumed = consume_atom(&forbidden, &intervals)
+            .expect("no budget error")
+            .expect("atom consumed");
+        assert_eq!(consumed.text, "b");
+    }
+
+    #[test]
+    fn capture_state_ignores_anonymous_groups() {
+        let original = state("ab");
+        assert_eq!(capture_state(&original, None, 0), original);
+    }
+
+    #[test]
+    fn capture_state_records_the_group_body() {
+        let captured = capture_state(&state("abcd"), Some(2), 1);
+        assert_eq!(captured.captures, vec![(2, "bcd".to_owned())]);
+    }
+
+    #[test]
+    fn capture_state_replaces_an_existing_group_number() {
+        let mut original = state("xyz");
+        original.captures = vec![(1, "old".into())];
+        let captured = capture_state(&original, Some(1), 1);
+        assert_eq!(captured.captures, vec![(1, "yz".to_owned())]);
+    }
+
+    #[test]
+    fn positive_assertion_lookahead_merges_pending() {
+        let witness = state("bc");
+        let mut base = state("a");
+        base.pending = "b".into();
+        let result = positive_assertion(false, &[witness], &base);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].pending, "bc");
+    }
+
+    #[test]
+    fn positive_assertion_lookahead_drops_a_disjoint_pending() {
+        let witness = state("bc");
+        let mut base = state("a");
+        base.pending = "z".into();
+        let result = positive_assertion(false, &[witness], &base);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn positive_assertion_lookahead_drops_incompatible_witnesses() {
+        let witness = state("bc");
+        let mut base = state("a");
+        base.pending = "x".into();
+        let result = positive_assertion(false, &[witness], &base);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn positive_assertion_lookbehind_swaps_the_witness_text() {
+        // The reference keeps the prefix before the witness span.
+        let witness = state("bc");
+        let result = positive_assertion(true, &[witness], &state("abc"));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].text, "abc");
+    }
+
+    #[test]
+    fn positive_assertion_merges_witness_captures() {
+        let mut witness = state("b");
+        witness.captures = vec![(3, "b".into())];
+        let result = positive_assertion(false, &[witness], &state("a"));
+        assert_eq!(result[0].captures, vec![(3, "b".to_owned())]);
+    }
+
+    #[test]
+    fn negative_assertion_empty_body_dies() {
+        let result = negative_assertion(&[], Flags::default(), &[], &state("a"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn negative_assertion_pairing_body_excludes_the_intervals() {
+        let mut base = state("a");
+        base.excluded = IntervalSet::single(1);
+        let result = negative_assertion(
+            &[Op::Literal(u32::from('x'))],
+            Flags::default(),
+            &[],
+            &base,
+        );
+        assert_eq!(result.len(), 1);
+        assert!(result[0].excluded.contains(u32::from('x')));
+    }
+
+    #[test]
+    fn negative_assertion_non_pairing_body_forbids_witness_words() {
+        let witness = state("xy");
+        let mut base = state("a");
+        base.forbidden = vec!["old".into()];
+        let result = negative_assertion(
+            &[Op::GroupRef(1)],
+            Flags::default(),
+            std::slice::from_ref(&witness),
+            &base,
+        );
+        assert_eq!(result[0].forbidden, vec!["old".to_owned(), "xy".to_owned()]);
+    }
+
+    #[test]
+    fn state_text_size_sums_every_text_field() {
+        let mut sized = state("abc");
+        sized.pending = "de".into();
+        sized.forbidden = vec!["fgh".into(), "i".into()];
+        sized.captures = vec![(1, "jk".into())];
+        assert_eq!(state_text_size(&sized), 3 + 2 + 4 + 2);
+    }
+}

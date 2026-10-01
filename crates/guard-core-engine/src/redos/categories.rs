@@ -863,3 +863,59 @@ pub const CATEGORY_SPACE_INTERVALS: &[(u32, u32)] = &[
     (0x205F, 0x205F),
     (0x3000, 0x3000),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn covers(table: &[(u32, u32)], code_point: u32) -> bool {
+        table
+            .iter()
+            .any(|(low, high)| *low <= code_point && code_point <= *high)
+    }
+
+    #[test]
+    fn digit_intervals_start_with_ascii_and_cover_wide_unicode() {
+        assert_eq!(CATEGORY_DIGIT_INTERVALS.first(), Some(&(0x30, 0x39)));
+        assert!(covers(CATEGORY_DIGIT_INTERVALS, 0x660));
+        assert!(covers(CATEGORY_DIGIT_INTERVALS, 0x104A0));
+        assert!(CATEGORY_DIGIT_INTERVALS.len() > 60);
+        assert!(!covers(CATEGORY_DIGIT_INTERVALS, u32::from('x')));
+    }
+
+    #[test]
+    fn word_intervals_cover_letters_digits_and_underscore() {
+        assert_eq!(CATEGORY_WORD_INTERVALS.first(), Some(&(0x30, 0x39)));
+        assert!(covers(CATEGORY_WORD_INTERVALS, u32::from('a')));
+        assert!(covers(CATEGORY_WORD_INTERVALS, u32::from('_')));
+        assert!(covers(CATEGORY_WORD_INTERVALS, 0x0430));
+        assert!(covers(CATEGORY_WORD_INTERVALS, 0x104A0));
+        assert!(!covers(CATEGORY_WORD_INTERVALS, u32::from('-')));
+        assert!(!covers(CATEGORY_WORD_INTERVALS, 0x0300));
+    }
+
+    #[test]
+    fn space_intervals_cover_the_reference_whitespace() {
+        assert!(covers(CATEGORY_SPACE_INTERVALS, 0x09));
+        assert!(covers(CATEGORY_SPACE_INTERVALS, 0x20));
+        assert!(covers(CATEGORY_SPACE_INTERVALS, 0x85));
+        assert!(covers(CATEGORY_SPACE_INTERVALS, 0x2003));
+        assert!(!covers(CATEGORY_SPACE_INTERVALS, u32::from('a')));
+    }
+
+    #[test]
+    fn interval_tables_are_sorted_and_disjoint() {
+        for table in [
+            CATEGORY_DIGIT_INTERVALS,
+            CATEGORY_WORD_INTERVALS,
+            CATEGORY_SPACE_INTERVALS,
+        ] {
+            for (low, high) in table {
+                assert!(low <= high, "ordered span: ({low}, {high})");
+            }
+            for pair in table.windows(2) {
+                assert!(pair[0].1 < pair[1].0, "disjoint: {pair:?}");
+            }
+        }
+    }
+}

@@ -287,3 +287,202 @@ fn group_unit_builders(
     }
     Ok(builders)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redos::ast::Flags;
+
+    fn ctx_for(pattern: &str) -> StrayContext {
+        build_stray_context(pattern, Flags::default(), None)
+    }
+
+    #[test]
+    fn prefixed_repeat_probe_shapes() {
+        // Body repeats to the full body length; the stray ends the tail.
+        assert_eq!(
+            prefixed_repeat_probe("'--", "ab", "\0", false, 8),
+            "'--abab\0"
+        );
+        assert_eq!(
+            prefixed_repeat_probe("'--", "ab", "\0", true, 8),
+            "'--aba\0\0"
+        );
+        assert_eq!(prefixed_repeat_probe("'--", "ab", "\0", false, 2), "'-");
+    }
+
+    #[test]
+    fn prefixed_unit_builders_emit_flood_variants() {
+        let builders = prefixed_unit_builders(
+            &["".to_owned()],
+            &[("ab".to_owned(), "\0".to_owned())],
+        )
+        .expect("builders");
+        assert_eq!(builders.len(), 2);
+        assert_eq!(builders[0](4), "aba\0");
+        assert_eq!(builders[1](4), "ab\0\0");
+    }
+
+    #[test]
+    fn prefixed_unit_builders_empty_prefixes_is_empty() {
+        let builders =
+            prefixed_unit_builders(&[], &[("ab".to_owned(), "\0".to_owned())])
+                .expect("builders");
+        assert!(builders.is_empty());
+    }
+
+    #[test]
+    fn prefixed_unit_budget_is_enforced() {
+        let units: Vec<(String, String)> = (0..2100)
+            .map(|index| (format!("u{index}"), "\0".to_owned()))
+            .collect();
+        let error = prefixed_unit_builders(&["".to_owned()], &units)
+            .err()
+            .expect("budget exceeded");
+        assert_eq!(
+            error.0,
+            "Pattern validation prefixed-probe candidate budget exceeded"
+        );
+    }
+
+    #[test]
+    fn group_probe_candidates_cover_prefixed_and_bare_units() {
+        let pairs = vec![("".to_owned(), "ab".to_owned())];
+        let strays = vec!["z".to_owned()];
+        let choose = |_unit: &str| -> Result<String, BuilderTimeout> {
+            Ok("\0".to_owned())
+        };
+        let candidates = group_probe_candidates(&pairs, &strays, &choose).expect("candidates");
+        assert_eq!(
+            candidates,
+            vec![
+                ("".to_owned(), "ab".to_owned(), "\0".to_owned()),
+                ("".to_owned(), "ab".to_owned(), "z".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn group_probe_budget_is_enforced() {
+        let pairs: Vec<(String, String)> = (0..9000)
+            .map(|index| (format!("p{index}"), "ab".to_owned()))
+            .collect();
+        let choose =
+            |_unit: &str| -> Result<String, BuilderTimeout> { Ok("\0".to_owned()) };
+        let error = group_probe_candidates(&pairs, &[], &choose)
+            .expect_err("budget exceeded");
+        assert_eq!(
+            error.0,
+            "Pattern validation group-probe candidate budget exceeded"
+        );
+    }
+
+    #[test]
+    fn group_unit_builders_emit_flood_variants() {
+        let pairs = vec![("".to_owned(), "ab".to_owned())];
+        let choose =
+            |_unit: &str| -> Result<String, BuilderTimeout> { Ok("\0".to_owned()) };
+        let builders = group_unit_builders(&pairs, &[], &choose).expect("builders");
+        assert_eq!(builders.len(), 2);
+    }
+
+    #[test]
+    fn event_handler_builders_produce_full_length_probes() {
+        let pattern = r"(?:<[^<>]*[\s/]+on\w+\s*=)";
+        let builders = reach_probe_candidate_builders(
+            pattern,
+            Flags::ignorecase_multiline(),
+            None,
+        )
+        .expect("builders");
+        assert!(!builders.is_empty());
+        for builder in &builders {
+            assert_eq!(builder(4000).chars().count(), 4000);
+        }
+    }
+
+    #[test]
+    fn ambiguous_group_fill_unit_rules() {
+        assert_eq!(ambiguous_group_fill_unit("a|b"), None);
+        assert_eq!(ambiguous_group_fill_unit(r"\1"), None);
+        assert_eq!(ambiguous_group_fill_unit("a?"), Some("a".to_owned()));
+    }
+
+    #[test]
+    fn ambiguous_group_fill_builders_append_for_ambiguous_groups() {
+        let ctx = ctx_for(r"(a?)+");
+        let builders =
+            ambiguous_group_fill_builders(r"(a?)+", &ctx).expect("builders");
+        assert_eq!(builders.len(), 1);
+        assert!(builders[0](10).starts_with('a'));
+    }
+
+    #[test]
+    fn ambiguous_group_fill_builders_skip_non_ambiguous_and_deep_groups() {
+        let ctx = ctx_for("(abc)+");
+        assert!(
+            ambiguous_group_fill_builders("(abc)+", &ctx)
+                .expect("builders")
+                .is_empty()
+        );
+        let deep = format!("{}a{}", "(".repeat(25), ")".repeat(25));
+        let ctx = ctx_for(&deep);
+        assert!(
+            ambiguous_group_fill_builders(&deep, &ctx)
+                .expect("builders")
+                .is_empty()
+        );
+        let ctx = ctx_for(r"(\1{2,5})+");
+        assert!(
+            ambiguous_group_fill_builders(r"(\1{2,5})+", &ctx)
+                .expect("builders")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn prefix_builders_require_a_reaching_probe() {
+        let pattern = r"[^\x00-\U0010FFFF]+";
+        let ctx = ctx_for(pattern);
+        assert!(
+            reach_probe_prefix_builders(pattern, &ctx)
+                .expect("builders")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn literal_run_builders_are_capped_and_repeat_to_length() {
+        let ctx = ctx_for(r"a\.b-prefix\dsuffix");
+        let builders = literal_run_builders(r"a\.b-prefix\dsuffix", &ctx).expect("builders");
+        assert!(!builders.is_empty());
+        assert!(builders.len() <= REACH_PROBE_MAX_RUN_VARIANTS);
+        for builder in &builders {
+            assert_eq!(builder(50).chars().count(), 50);
+        }
+    }
+
+    #[test]
+    fn class_intersection_builders_fill_to_length() {
+        let pattern = r"'\s*[\);]*\s*--";
+        let ctx = ctx_for(pattern);
+        let builders =
+            class_intersection_builders(pattern, Flags::default(), &ctx).expect("builders");
+        assert!(!builders.is_empty());
+        for builder in &builders {
+            assert_eq!(builder(64).chars().count(), 64);
+        }
+    }
+
+    #[test]
+    fn reach_probe_prefix_builders_cut_at_the_reference_lengths() {
+        // A pattern whose reaching body is long enough for all three cuts.
+        let pattern = r"(?:abcdefabcdefabcdefabcdef)+(x)?y";
+        let ctx = ctx_for(pattern);
+        let builders = reach_probe_prefix_builders(pattern, &ctx).expect("builders");
+        assert!(!builders.is_empty());
+        for builder in &builders {
+            assert_eq!(builder(40).chars().count(), 40);
+        }
+    }
+}

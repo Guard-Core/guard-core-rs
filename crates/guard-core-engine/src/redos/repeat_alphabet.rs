@@ -155,3 +155,74 @@ pub fn has_large_bounded_repeat(pattern: &str, flags: super::ast::Flags) -> bool
     };
     slots_have_large_bounded_repeat(&slots)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redos::ast::Flags;
+    use std::time::Duration;
+
+    #[test]
+    fn repeated_characters_drive_the_fills() {
+        let fills = repeat_alphabet_fills(r"'(\w+)\1", Flags::default(), None, false)
+            .expect("fills");
+        // The repeated word characters contribute their first member.
+        assert!(!fills.is_empty());
+        assert!(fills.iter().any(|fill| fill == "0"));
+    }
+
+    #[test]
+    fn patterns_without_repeats_have_no_fills() {
+        let fills =
+            repeat_alphabet_fills("abc", Flags::default(), None, false).expect("fills");
+        assert!(fills.is_empty());
+    }
+
+    #[test]
+    fn parse_failures_yield_no_fills() {
+        let fills =
+            repeat_alphabet_fills("[oops", Flags::default(), None, false).expect("fills");
+        assert!(fills.is_empty());
+    }
+
+    #[test]
+    fn include_prefix_collects_unrepeated_atoms_too() {
+        let without =
+            repeat_alphabet_fills(r"a\d", Flags::default(), None, false).expect("fills");
+        assert!(without.is_empty());
+        let with =
+            repeat_alphabet_fills(r"a\d", Flags::default(), None, true).expect("fills");
+        assert!(!with.is_empty());
+    }
+
+    #[test]
+    fn expired_deadlines_error() {
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let error = repeat_alphabet_fills(r"(\w+)+", Flags::default(), Some(deadline), false)
+            .expect_err("deadline exceeded");
+        assert_eq!(error.0, "Pattern validation alphabet exceeded its deadline");
+    }
+
+    #[test]
+    fn large_bounded_repeat_detection() {
+        // Only variable bounds (low < high) count, exactly like the
+        // reference's `variable_bounded` flag.
+        assert!(!has_large_bounded_repeat(r"\d{4096}", Flags::default()));
+        assert!(has_large_bounded_repeat(
+            r"(?:x{5000,6000}y)+",
+            Flags::default()
+        ));
+        assert!(has_large_bounded_repeat(r"\d{4096,5000}", Flags::default()));
+        assert!(!has_large_bounded_repeat(r"\d{4095}", Flags::default()));
+        assert!(!has_large_bounded_repeat(r"\d+", Flags::default()));
+        assert!(!has_large_bounded_repeat("[oops", Flags::default()));
+    }
+
+    #[test]
+    fn can_repeat_covers_both_slot_kinds() {
+        // Exercised through fills: unbounded and max>1 atoms split regions.
+        let fills = repeat_alphabet_fills(r"\d\w", Flags::default(), None, true)
+            .expect("fills");
+        assert!(fills.contains(&"0".to_owned()));
+    }
+}

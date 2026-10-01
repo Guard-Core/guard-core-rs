@@ -172,3 +172,104 @@ pub fn adversarial_literal_runs(pattern: &str) -> Vec<String> {
     flush_run(&mut runs, &mut current);
     runs.into_iter().filter(|run| !run.is_empty()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brace_quantifier_span_allows_zero_branches() {
+        let cases: Vec<(&str, usize, (usize, bool))> = vec![
+            ("a{3", 1, (1, false)),
+            ("a{x,3}b", 1, (1, false)),
+            ("a{3}b", 1, (4, false)),
+            ("a{0,3}b", 1, (6, true)),
+            ("a{,3}b", 1, (5, true)),
+            ("a{3}?b", 1, (5, false)),
+        ];
+        for (text, k, expected) in cases {
+            assert_eq!(
+                brace_quantifier_span_allows_zero(&text.chars().collect::<Vec<char>>(), k),
+                expected,
+                "text {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn quantifier_span_allows_zero_shapes() {
+        let allows = |text: &str, k: usize| {
+            quantifier_span_allows_zero(&text.chars().collect::<Vec<char>>(), k)
+        };
+        assert_eq!(allows("a*b", 1), (2, true));
+        assert_eq!(allows("a+b", 1), (2, false));
+        assert_eq!(allows("ab", 1), (1, false));
+    }
+
+    #[test]
+    fn escaped_non_alnum_characters_join_the_run() {
+        assert_eq!(adversarial_literal_runs(r"\."), vec![".".to_owned()]);
+    }
+
+    #[test]
+    fn required_classes_separate_words() {
+        assert_eq!(
+            adversarial_literal_runs(r"prefix\dsuffix"),
+            vec!["prefix".to_owned(), "suffix".to_owned()]
+        );
+    }
+
+    #[test]
+    fn zero_width_quantified_escapes_keep_the_run_going() {
+        assert_eq!(
+            adversarial_literal_runs(r"ab\dc"),
+            vec!["ab".to_owned(), "c".to_owned()]
+        );
+    }
+
+    #[test]
+    fn groups_and_hard_resets_flush_runs() {
+        assert_eq!(
+            adversarial_literal_runs("ab|cd"),
+            vec!["ab".to_owned(), "cd".to_owned()]
+        );
+        // Closing a capturing group flushes; a transparent group does not.
+        assert_eq!(
+            adversarial_literal_runs("(ab)cd"),
+            vec!["ab".to_owned(), "cd".to_owned()]
+        );
+        assert_eq!(
+            adversarial_literal_runs("(?:ab)cd"),
+            vec!["abcd".to_owned()]
+        );
+        assert_eq!(
+            adversarial_literal_runs(r"a\.b"),
+            vec!["a.b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn quantifier_markers_are_skipped_without_flushing() {
+        assert_eq!(adversarial_literal_runs("ab*cd"), vec!["abcd"]);
+        assert_eq!(adversarial_literal_runs("ab{2}cd"), vec!["abcd"]);
+        // An unterminated brace still skips only the brace itself.
+        assert_eq!(adversarial_literal_runs("ab{2"), vec!["ab2"]);
+    }
+
+    #[test]
+    fn narrow_char_classes_contribute_their_first_char() {
+        assert_eq!(
+            adversarial_literal_runs("[ab]x"),
+            vec!["ax".to_owned()]
+        );
+        // Wide or negated classes flush instead.
+        assert_eq!(adversarial_literal_runs("[a-z]x"), vec!["x".to_owned()]);
+    }
+
+    #[test]
+    fn skip_lazy_marker_only_consumes_a_question_mark() {
+        let text: Vec<char> = "a?b".chars().collect();
+        assert_eq!(skip_lazy_marker(&text, 1), 2);
+        assert_eq!(skip_lazy_marker(&text, 0), 0);
+    }
+}

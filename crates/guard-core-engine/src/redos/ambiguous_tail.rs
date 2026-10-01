@@ -195,3 +195,116 @@ pub fn detect_ambiguous_optional_tail_in_quantified_group(pattern: &str) -> Opti
         Err(NestingTooDeep) => Some(nesting_depth_rejection_reason()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atom_char_sets_come_from_the_parsed_intervals() {
+        assert_eq!(atom_char_set(r"[a-c]"), vec!['a', 'b', 'c']);
+        assert_eq!(atom_char_set("a"), vec!['a']);
+        assert!(atom_char_set(r"\d").iter().all(|c| c.is_ascii_digit()));
+        assert_eq!(atom_char_set(r"\1"), Vec::<char>::new());
+        assert_eq!(atom_char_set("[oops"), Vec::<char>::new());
+        // Dotall semantics: `.` matches every printable character.
+        assert_eq!(atom_char_set(".").len(), PRINTABLE.len());
+    }
+
+    #[test]
+    fn atoms_overlap_on_any_shared_printable() {
+        assert!(atoms_overlap("[a-c]", "[b-d]"));
+        assert!(!atoms_overlap("[a-c]", "[x-z]"));
+        assert!(!atoms_overlap(r"\1", "a"));
+    }
+
+    #[test]
+    fn representative_char_prefers_the_printable_scan() {
+        assert_eq!(representative_char_for_atom(r"[a-c]"), Some('a'));
+        assert_eq!(representative_char_for_atom(r"\d"), Some('0'));
+        assert_eq!(representative_char_for_atom("a"), Some('a'));
+        // Past the printable alphabet the interval endpoints step in.
+        assert_eq!(representative_char_for_atom(r"\x00"), Some('\0'));
+        assert_eq!(representative_char_for_atom(r"\1"), None);
+        assert_eq!(representative_char_for_atom("[oops"), None);
+        assert_eq!(representative_char_for_atom(r"\p"), None);
+    }
+
+    #[test]
+    fn symbol_quantifier_parsing_covers_lazy_markers() {
+        let chars: Vec<char> = "a*?b".chars().collect();
+        assert_eq!(parse_symbol_quantifier(&chars, 1), (true, true, 3));
+        let chars: Vec<char> = "a+b".chars().collect();
+        assert_eq!(parse_symbol_quantifier(&chars, 1), (false, true, 2));
+        let chars: Vec<char> = "a?b".chars().collect();
+        assert_eq!(parse_symbol_quantifier(&chars, 1), (true, false, 2));
+    }
+
+    #[test]
+    fn brace_quantifier_with_variability() {
+        let chars: Vec<char> = "a{2,5}b".chars().collect();
+        assert_eq!(
+            parse_brace_quantifier_with_variability(&chars, 1),
+            Some((false, false, true, 6))
+        );
+        let chars: Vec<char> = "a{0,}b".chars().collect();
+        assert_eq!(
+            parse_brace_quantifier_with_variability(&chars, 1),
+            Some((true, true, true, 5))
+        );
+        let chars: Vec<char> = "a{2}b".chars().collect();
+        assert_eq!(
+            parse_brace_quantifier_with_variability(&chars, 1),
+            Some((false, false, false, 4))
+        );
+        let chars: Vec<char> = "a{x}b".chars().collect();
+        assert_eq!(parse_brace_quantifier_with_variability(&chars, 1), None);
+        let chars: Vec<char> = "a{2".chars().collect();
+        assert_eq!(parse_brace_quantifier_with_variability(&chars, 1), None);
+    }
+
+    #[test]
+    fn flat_atom_scan_rejects_groups_and_alternations() {
+        assert!(parse_flat_quantified_atoms_with_text("a|b").is_none());
+        assert!(parse_flat_quantified_atoms_with_text("(a)").is_none());
+        assert!(parse_flat_quantified_atoms_with_text("ab?").is_some());
+    }
+
+    #[test]
+    fn group_inner_ambiguity_rules() {
+        // A single variable non-unbounded atom is ambiguous.
+        assert!(group_inner_is_ambiguous("a?"));
+        assert!(!group_inner_is_ambiguous("a*"));
+        assert!(!group_inner_is_ambiguous("a"));
+        // Unbounded atom followed by an optional atom is an ambiguous pair.
+        assert!(group_inner_is_ambiguous(r"\w+\s?"));
+        assert!(!group_inner_is_ambiguous(r"\w+\s"));
+        // Cyclic overlap between variable neighbors.
+        assert!(group_inner_is_ambiguous("[a-c]*[b-d]*"));
+    }
+
+    #[test]
+    fn detector_reports_the_quantified_group_span() {
+        assert_eq!(
+            detect_ambiguous_optional_tail_in_quantified_group(r"(a?)+$"),
+            Some("(a?)+".to_owned())
+        );
+        assert_eq!(
+            detect_ambiguous_optional_tail_in_quantified_group("(abc)+"),
+            None
+        );
+        let deep = format!("{}a?{}", "(".repeat(25), ")".repeat(25));
+        assert_eq!(
+            detect_ambiguous_optional_tail_in_quantified_group(&deep),
+            Some(nesting_depth_rejection_reason())
+        );
+    }
+
+    #[test]
+    fn nested_ambiguous_group_is_found_by_the_outer_scan() {
+        assert_eq!(
+            detect_ambiguous_optional_tail_in_quantified_group(r"((\d{1,3}))+$"),
+            Some(r"((\d{1,3}))+".to_owned())
+        );
+    }
+}

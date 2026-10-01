@@ -245,3 +245,109 @@ pub fn detect_unreachable_terminator_scan(pattern: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminator_chars_returns_positive_char_classes() {
+        let set = terminator_chars_at("[abc]", 0).expect("positive class");
+        assert_eq!(set, BTreeSet::from(['a', 'b', 'c']));
+    }
+
+    #[test]
+    fn terminator_chars_none_for_negated_and_empty_classes() {
+        assert_eq!(terminator_chars_at("[^abc]", 0), None);
+        assert_eq!(terminator_chars_at("[]", 0), None);
+    }
+
+    #[test]
+    fn terminator_chars_none_past_the_end() {
+        assert_eq!(terminator_chars_at("[abc]", 5), None);
+    }
+
+    #[test]
+    fn terminator_chars_singleton_for_a_literal() {
+        assert_eq!(
+            terminator_chars_at("x", 0),
+            Some(BTreeSet::from(['x']))
+        );
+    }
+
+    #[test]
+    fn terminator_chars_none_for_non_literal_leaders() {
+        for leader in ["(", ")", "|", "^", "$", ".", "*", "+", "?", "{"] {
+            assert_eq!(terminator_chars_at(leader, 0), None, "{leader}");
+        }
+    }
+
+    #[test]
+    fn terminator_chars_escaped_non_alnum_is_a_singleton() {
+        assert_eq!(terminator_chars_at(r"\-", 0), Some(BTreeSet::from(['-'])));
+        assert_eq!(terminator_chars_at(r"\d", 0), None);
+    }
+
+    #[test]
+    fn detector_flags_a_scan_whose_terminator_the_prefix_cannot_reach() {
+        assert_eq!(
+            detect_unreachable_terminator_scan("a[^b]*c"),
+            Some("[^b] preceded by a".to_owned())
+        );
+        // The dot span names the bare atom; the prefix set is sorted.
+        assert_eq!(
+            detect_unreachable_terminator_scan("foo.*bar"),
+            Some(". preceded by fo".to_owned())
+        );
+        // Escaped non-alnum characters accumulate into the prefix.
+        assert_eq!(
+            detect_unreachable_terminator_scan(r"\$\([^)]+\)"),
+            Some("[^)] preceded by $(".to_owned())
+        );
+    }
+
+    #[test]
+    fn detector_passes_when_the_terminator_is_reachable() {
+        // The prefix itself is excluded, so the scan can absorb it.
+        assert_eq!(detect_unreachable_terminator_scan("b[^b]*b"), None);
+        assert_eq!(detect_unreachable_terminator_scan("[^a]*b"), None);
+        assert_eq!(detect_unreachable_terminator_scan("a[^b]*$"), None);
+        // The group close, not the tail literal, terminates the scan.
+        assert_eq!(detect_unreachable_terminator_scan("a(?:x[^b]*)c"), None);
+    }
+
+    #[test]
+    fn detector_tracks_prefixes_across_alternations() {
+        // The first alternative already carries the finding.
+        assert_eq!(
+            detect_unreachable_terminator_scan("a[^b]*c|x[^b]*b"),
+            Some("[^b] preceded by a".to_owned())
+        );
+    }
+
+    #[test]
+    fn quantifier_helpers_cover_the_brace_shapes() {
+        let text: Vec<char> = "a{2,3}?b".chars().collect();
+        assert_eq!(skip_brace_quantifier_at(&text, 1), 6);
+        let text: Vec<char> = "a{2,x}b".chars().collect();
+        assert_eq!(skip_brace_quantifier_at(&text, 1), 0);
+        let text: Vec<char> = "a{,}b".chars().collect();
+        assert_eq!(skip_brace_quantifier_at(&text, 1), 0);
+        let text: Vec<char> = "a*?b".chars().collect();
+        assert_eq!(skip_symbol_quantifier_at(&text, 1), 2);
+    }
+
+    #[test]
+    fn quantifier_allows_zero_covers_star_question_and_braces() {
+        let allows = |text: &str, k: usize| {
+            quantifier_at_allows_zero(&text.chars().collect::<Vec<char>>(), k)
+        };
+        assert!(allows("a*b", 1));
+        assert!(allows("a?b", 1));
+        assert!(allows("a{0,3}b", 1));
+        assert!(allows("a{,3}b", 1));
+        assert!(!allows("a+b", 1));
+        assert!(!allows("a{2,3}b", 1));
+        assert!(!allows("ab", 1));
+    }
+}

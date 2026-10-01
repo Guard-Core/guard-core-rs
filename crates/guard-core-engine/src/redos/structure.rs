@@ -419,3 +419,210 @@ pub fn detect_adjacent_broad_unbounded_quantifiers(pattern: &str) -> Option<Stri
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chars(text: &str) -> Vec<char> {
+        text.chars().collect()
+    }
+
+    #[test]
+    fn skip_char_class_walks_escapes_and_stops_at_the_bracket() {
+        let text = chars(r"[a\]b]c");
+        assert_eq!(skip_char_class(&text, 0), text.len() - 1);
+        let unterminated = chars("[ab");
+        assert_eq!(skip_char_class(&unterminated, 0), unterminated.len());
+    }
+
+    #[test]
+    fn strip_escapes_and_char_classes_placeholders() {
+        let stripped = strip_escapes_and_char_classes(&chars(r"a[\d]\w"));
+        assert_eq!(stripped, "aXX");
+    }
+
+    #[test]
+    fn branch_is_unbounded_single_covers_the_three_shapes() {
+        assert!(branch_is_unbounded_single(".*"));
+        assert!(branch_is_unbounded_single(".+"));
+        assert!(branch_is_unbounded_single(".{3,}"));
+        assert!(!branch_is_unbounded_single(".{3}"));
+        assert!(!branch_is_unbounded_single(".{3,4}"));
+        // The reference regex `.[*+]` accepts any leading character.
+        assert!(branch_is_unbounded_single("a*"));
+        assert!(!branch_is_unbounded_single(".?"));
+        assert!(!branch_is_unbounded_single("."));
+    }
+
+    #[test]
+    fn advance_skips_escapes_and_classes() {
+        let text = chars(r"\d[abc]x");
+        assert_eq!(advance_past_escape_or_char_class(&text, 0), Some(2));
+        assert_eq!(advance_past_escape_or_char_class(&text, 2), Some(7));
+        assert_eq!(advance_past_escape_or_char_class(&text, 7), None);
+    }
+
+    #[test]
+    fn find_group_end_tracks_nesting_and_escapes() {
+        let text = chars(r"(a(b)[c]\))d");
+        assert_eq!(find_group_end(&text, 0), Some(11));
+        let unbalanced = chars("(abc");
+        assert_eq!(find_group_end(&unbalanced, 0), None);
+    }
+
+    #[test]
+    fn normalize_group_inner_variants() {
+        assert_eq!(normalize_group_inner(&chars("?:ab")), Some("ab".to_owned()));
+        assert_eq!(normalize_group_inner(&chars("?P<name>x")), Some("x".to_owned()));
+        assert_eq!(normalize_group_inner(&chars("?P=name")), None);
+        assert_eq!(normalize_group_inner(&chars("plain")), Some("plain".to_owned()));
+        let unterminated = chars("?P<name");
+        assert_eq!(normalize_group_inner(&unterminated), None);
+    }
+
+    #[test]
+    fn unwrap_transparent_wrapper_peels_only_full_spans() {
+        assert_eq!(unwrap_transparent_wrapper("(?:(?:ab))"), "ab");
+        assert_eq!(unwrap_transparent_wrapper("(?:ab)c"), "(?:ab)c");
+        assert_eq!(unwrap_transparent_wrapper("(?P=x)"), "(?P=x)");
+        assert_eq!(unwrap_transparent_wrapper("(ab"), "(ab");
+    }
+
+    #[test]
+    fn outer_quantifier_len_detects_symbol_and_brace_forms() {
+        let text = chars("a*bc+d{2,}e{2}f{,}");
+        assert_eq!(outer_quantifier_len(&text, 1), 1);
+        assert_eq!(outer_quantifier_len(&text, 4), 1);
+        assert_eq!(outer_quantifier_len(&text, 6), 4);
+        assert_eq!(outer_quantifier_len(&text, 11), 0);
+        // `{,}` reads as the unbounded `{0,}` form.
+        assert_eq!(outer_quantifier_len(&text, 15), 3);
+        assert_eq!(outer_quantifier_len(&text, text.len()), 0);
+    }
+
+    #[test]
+    fn branches_overlap_on_prefix_shares() {
+        assert!(branches_overlap(&["ab".into(), "abc".into()]));
+        assert!(branches_overlap(&["ab".into(), "ab".into()]));
+        assert!(!branches_overlap(&["ab".into(), "cd".into()]));
+    }
+
+    #[test]
+    fn pure_literal_branches_reject_meta_characters() {
+        assert!(is_pure_literal_branch("abc"));
+        assert!(!is_pure_literal_branch("a.c"));
+        assert!(!is_pure_literal_branch(""));
+    }
+
+    #[test]
+    fn split_top_level_alternations_respects_nesting_and_escapes() {
+        let branches = split_top_level_alternations(&chars(r"a(b|c)|d\|e"));
+        assert_eq!(branches, vec!["a(b|c)", "d\\|e"]);
+    }
+
+    #[test]
+    fn overlapping_literal_branches_needs_two_literal_shares() {
+        assert!(overlapping_literal_branches("ab|abc"));
+        assert!(!overlapping_literal_branches("ab|cd"));
+        assert!(!overlapping_literal_branches("ab|a."));
+    }
+
+    #[test]
+    fn nested_unbounded_quantifier_finds_the_span() {
+        assert_eq!(
+            detect_nested_unbounded_quantifier(r"(\w+)*$"),
+            // The finding span covers the group and its quantifier only.
+            Some(r"(\w+)*".to_owned())
+        );
+        assert_eq!(
+            detect_nested_unbounded_quantifier(r"(?:a*)*"),
+            Some(r"(?:a*)*".to_owned())
+        );
+        assert_eq!(detect_nested_unbounded_quantifier(r"a*b"), None);
+    }
+
+    #[test]
+    fn nested_unbounded_detects_overlapping_literal_branches() {
+        assert_eq!(
+            detect_nested_unbounded_quantifier(r"(?:ab|abc)+"),
+            Some(r"(?:ab|abc)+".to_owned())
+        );
+    }
+
+    #[test]
+    fn nesting_depth_rejection_for_deep_groups() {
+        let deep = format!("{}a*{}", "(".repeat(25), ")".repeat(25));
+        assert_eq!(
+            detect_nested_unbounded_quantifier(&deep),
+            Some(nesting_depth_rejection_reason())
+        );
+        assert_eq!(
+            detect_adjacent_broad_unbounded_quantifiers(&deep),
+            Some(nesting_depth_rejection_reason())
+        );
+    }
+
+    #[test]
+    fn adjacent_broad_unbounded_quantifiers_finds_two_broad_atoms() {
+        assert_eq!(
+            detect_adjacent_broad_unbounded_quantifiers(".*x.*"),
+            Some(". and .".to_owned())
+        );
+        assert_eq!(
+            detect_adjacent_broad_unbounded_quantifiers(r"\S*\W*"),
+            Some(r"\S and \W".to_owned())
+        );
+        assert_eq!(detect_adjacent_broad_unbounded_quantifiers(".*x"), None);
+    }
+
+    #[test]
+    fn broad_class_semantics_cover_negated_and_shorthand_inner() {
+        // [\s\S] and its negated-broad shapes read as broad; [^ab] without
+        // an S/W/D shorthand inside is also broad.
+        assert_eq!(
+            detect_adjacent_broad_unbounded_quantifiers(r"[\s\S]*[\s\S]+"),
+            Some("[\\s\\S] and [\\s\\S]".to_owned())
+        );
+        assert_eq!(
+            detect_adjacent_broad_unbounded_quantifiers(r"[^ab]*[^ab]+"),
+            Some("[^ab] and [^ab]".to_owned())
+        );
+    }
+
+    #[test]
+    fn broad_runs_descend_into_groups_and_pick_the_best_branch() {
+        // The finding names the broad atoms themselves (the `.`), not
+        // their quantifiers, exactly like the reference span slice.
+        assert_eq!(
+            detect_adjacent_broad_unbounded_quantifiers("(?:a|.*x.*)"),
+            Some(". and .".to_owned())
+        );
+        // Two broad atoms in separate groups accumulate.
+        assert!(detect_adjacent_broad_unbounded_quantifiers("(?:.*)(?:.*)").is_some());
+    }
+
+    #[test]
+    fn quantified_group_bodies_walk_with_absolute_positions() {
+        let bodies = iter_quantified_group_bodies("(a(b))+").expect("parses");
+        // Only the quantified outer group yields; the unquantified nested
+        // `(b)` is not a quantified group body.
+        assert_eq!(bodies.len(), 1);
+        let (start, end, inner_outer) = &bodies[0];
+        assert_eq!(*start, 0);
+        assert_eq!(*end, 7);
+        assert_eq!(inner_outer, "a(b)");
+        let bodies =
+            iter_quantified_group_bodies("(a(b)*)+").expect("parses");
+        assert_eq!(bodies.len(), 2);
+        // The body text is the normalized inner source (no quantifier).
+        assert_eq!(bodies[0].2, "b");
+        assert_eq!(bodies[1].2, "a(b)*");
+    }
+
+    #[test]
+    fn quantified_group_bodies_skip_unbalanced_groups() {
+        let bodies = iter_quantified_group_bodies("(unclosed+x").expect("parses");
+        assert!(bodies.is_empty());
+    }
+}

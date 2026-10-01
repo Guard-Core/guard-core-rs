@@ -186,3 +186,154 @@ impl IntervalSet {
         self.intersection(&other.complement())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_set_has_no_members() {
+        let empty = IntervalSet::empty();
+        assert!(empty.is_empty());
+        assert_eq!(empty.first_member(), None);
+        assert!(!empty.contains(0));
+    }
+
+    #[test]
+    fn full_set_contains_the_entire_range() {
+        let full = IntervalSet::full();
+        assert!(!full.is_empty());
+        assert!(full.contains(MIN_CODE_POINT));
+        assert!(full.contains(MAX_CODE_POINT));
+        assert_eq!(full.first_member(), Some(MIN_CODE_POINT));
+    }
+
+    #[test]
+    fn single_builds_a_one_code_point_set() {
+        let single = IntervalSet::single(65);
+        assert!(single.contains(65));
+        assert!(!single.contains(64));
+        assert!(!single.contains(66));
+        assert_eq!(single.first_member(), Some(65));
+    }
+
+    #[test]
+    fn from_range_builds_an_inclusive_range() {
+        let interval = IntervalSet::from_range(10, 20);
+        assert!(interval.contains(10));
+        assert!(interval.contains(20));
+        assert!(!interval.contains(9));
+        assert!(!interval.contains(21));
+    }
+
+    #[test]
+    fn from_range_returns_empty_when_low_exceeds_high() {
+        assert!(IntervalSet::from_range(20, 10).is_empty());
+    }
+
+    #[test]
+    fn from_range_clips_to_the_valid_code_point_span() {
+        let interval = IntervalSet::from_range(0, u32::MAX);
+        assert!(interval.contains(MIN_CODE_POINT));
+        assert!(interval.contains(MAX_CODE_POINT));
+        assert_eq!(interval.intervals().last().copied(), Some((0, MAX_CODE_POINT)));
+    }
+
+    #[test]
+    fn union_merges_adjacent_and_overlapping_intervals() {
+        let adjacent = IntervalSet::from_range(0, 10).union(&IntervalSet::from_range(11, 20));
+        assert!(adjacent.contains(10));
+        assert!(adjacent.contains(11));
+        assert_eq!(adjacent.first_member(), Some(0));
+
+        let overlapping = IntervalSet::from_range(0, 10).union(&IntervalSet::from_range(5, 15));
+        assert!(overlapping.contains(15));
+    }
+
+    #[test]
+    fn union_keeps_disjoint_intervals_sorted() {
+        let disjoint =
+            IntervalSet::from_range(50, 60).union(&IntervalSet::from_range(1, 5));
+        assert_eq!(disjoint.first_member(), Some(1));
+        assert_eq!(disjoint.intervals(), &[(1, 5), (50, 60)]);
+    }
+
+    #[test]
+    fn intersection_overlaps_swept_intervals() {
+        let left = IntervalSet::new(&[(0, 10), (20, 30)]);
+        let right = IntervalSet::new(&[(5, 25), (28, 40)]);
+        let both = left.intersection(&right);
+        assert_eq!(both.intervals(), &[(5, 10), (20, 25), (28, 30)]);
+    }
+
+    #[test]
+    fn intersection_of_disjoint_sets_is_empty() {
+        let left = IntervalSet::from_range(0, 5);
+        let right = IntervalSet::from_range(6, 9);
+        assert!(left.intersection(&right).is_empty());
+    }
+
+    #[test]
+    fn complement_splits_around_members() {
+        let set = IntervalSet::new(&[(5, 10), (20, 30)]);
+        let complement = set.complement();
+        assert_eq!(complement.intervals(), &[(0, 4), (11, 19), (31, MAX_CODE_POINT)]);
+        assert!(complement.contains(0));
+        assert!(!complement.contains(5));
+        assert!(complement.contains(MAX_CODE_POINT));
+    }
+
+    #[test]
+    fn complement_of_the_full_range_is_empty() {
+        assert!(IntervalSet::full().complement().is_empty());
+    }
+
+    #[test]
+    fn complement_of_empty_is_full() {
+        assert_eq!(
+            IntervalSet::empty().complement().intervals(),
+            &[(MIN_CODE_POINT, MAX_CODE_POINT)]
+        );
+    }
+
+    #[test]
+    fn difference_is_intersection_with_complement() {
+        let left = IntervalSet::from_range(0, 20);
+        let right = IntervalSet::from_range(10, 30);
+        assert_eq!(left.difference(&right).intervals(), &[(0, 9)]);
+    }
+
+    #[test]
+    fn contains_binary_searches_sorted_components() {
+        let set = IntervalSet::new(&[(10, 12), (100, 200), (1000, 1000)]);
+        assert!(set.contains(11));
+        assert!(set.contains(150));
+        assert!(set.contains(1000));
+        assert!(!set.contains(13));
+        assert!(!set.contains(999));
+    }
+
+    #[test]
+    fn component_first_members_lists_every_component_start() {
+        let set = IntervalSet::new(&[(10, 12), (100, 200)]);
+        assert_eq!(set.component_first_members(), vec![10, 100]);
+    }
+
+    #[test]
+    fn member_count_sums_inclusive_spans() {
+        let set = IntervalSet::new(&[(0, 9), (100, 104)]);
+        assert_eq!(set.member_count(), 15);
+    }
+
+    #[test]
+    fn new_normalizes_unordered_overlapping_input() {
+        let set = IntervalSet::new(&[(30, 40), (0, 5), (6, 10), (35, 50)]);
+        assert_eq!(set.intervals(), &[(0, 10), (30, 50)]);
+    }
+
+    #[test]
+    fn complement_at_the_top_boundary_does_not_overflow() {
+        let set = IntervalSet::from_range(MAX_CODE_POINT, MAX_CODE_POINT);
+        assert_eq!(set.complement().intervals(), &[(0, MAX_CODE_POINT - 1)]);
+    }
+}

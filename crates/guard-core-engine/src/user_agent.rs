@@ -116,7 +116,15 @@ impl UserAgentFilter {
         let mut compiled = Vec::new();
         for pattern in patterns {
             let pattern = pattern.as_ref();
-            let (is_safe, reason) = compiler::validate_pattern_safety(pattern);
+            let verdict = crate::redos::validate_pattern_safety(
+                pattern,
+                &crate::redos::SafetyMode::CostVerdict {
+                    // The reference validates UA rules against the max
+                    // user-agent match length (512).
+                    max_content_length: Some(MAX_USER_AGENT_MATCH_LENGTH),
+                },
+            );
+            let (is_safe, reason) = (verdict.safe, verdict.reason.to_string());
             if !is_safe {
                 return Err(UserAgentConfigError {
                     entry: pattern.to_owned(),

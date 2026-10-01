@@ -337,3 +337,209 @@ pub fn candidate_chars_for_atom_text(atom_text: &str, flags: Flags) -> Vec<char>
         .filter_map(|cp| char::from_u32(*cp))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_chars_for_a_single_class_are_component_starts() {
+        // Every Nd block start is a component start, exactly like the
+        // reference's `component_first_members`.
+        let digit_starts = candidate_chars_for_atom_text(r"\d", Flags::default());
+        assert_eq!(digit_starts.first().copied(), Some('0'));
+        assert_eq!(digit_starts.len(), 71);
+        assert_eq!(
+            candidate_chars_for_atom_text("[a-c]", Flags::default()),
+            vec!['a']
+        );
+    }
+
+    #[test]
+    fn candidate_chars_empty_for_parse_failures_and_multi_node_texts() {
+        assert!(candidate_chars_for_atom_text("[oops", Flags::default()).is_empty());
+        assert!(candidate_chars_for_atom_text("ab", Flags::default()).is_empty());
+    }
+
+    #[test]
+    fn candidate_chars_reflect_inline_dotall() {
+        // Inline (?s) makes the ANY node cover the newline; without it the
+        // two components start at NUL and VT.
+        let chars = candidate_chars_for_atom_text("(?s).", Flags::default());
+        assert_eq!(chars, vec!['\0']);
+        let chars = candidate_chars_for_atom_text(".", Flags::default());
+        assert_eq!(chars, vec!['\0', '\u{b}']);
+    }
+
+    #[test]
+    fn pattern_slots_none_on_a_parse_failure() {
+        assert!(pattern_slots("[unterminated", Flags::default()).is_none());
+    }
+
+    #[test]
+    fn negated_class_is_a_pairing_atom_with_the_complement() {
+        let slots = pattern_slots("[^a]", Flags::default()).expect("parses");
+        assert_eq!(slots.len(), 1);
+        let Slot::Pairing(atom) = &slots[0] else {
+            panic!("expected pairing");
+        };
+        assert!(!atom.allows_zero);
+        assert!(!atom.unbounded);
+        let expected = IntervalSet::full().difference(&IntervalSet::single(u32::from('a')));
+        assert_eq!(atom.intervals, expected);
+    }
+
+    #[test]
+    fn dotall_widens_any_to_the_full_alphabet() {
+        let dotted = pattern_slots("(?s).", Flags::default()).expect("parses");
+        let plain = pattern_slots(".", Flags::default()).expect("parses");
+        let Slot::Pairing(dotted_atom) = &dotted[0] else {
+            panic!("expected pairing");
+        };
+        let Slot::Pairing(plain_atom) = &plain[0] else {
+            panic!("expected pairing");
+        };
+        assert_eq!(dotted_atom.intervals, IntervalSet::full());
+        assert_eq!(
+            plain_atom.intervals,
+            IntervalSet::full().difference(&IntervalSet::single(u32::from('\n')))
+        );
+    }
+
+    #[test]
+    fn backreference_is_a_hard_boundary_slot() {
+        let slots = pattern_slots(r"(a)\1", Flags::default()).expect("parses");
+        assert_eq!(slots.len(), 2);
+        let Slot::NonPairing(non) = &slots[1] else {
+            panic!("expected non-pairing");
+        };
+        assert!(non.is_boundary);
+        assert!(non.inner.is_none());
+    }
+
+    #[test]
+    fn quantified_wrapped_group_keeps_its_inner_slots() {
+        let slots = pattern_slots(r"(\s)+", Flags::default()).expect("parses");
+        let Slot::NonPairing(non) = &slots[0] else {
+            panic!("expected group slot");
+        };
+        assert!(non.unbounded);
+        // A mandatory (low=1) group repeat is a boundary slot, exactly like
+        // the reference's `not allows_zero`.
+        assert!(non.is_boundary);
+        let inner = non.inner.as_ref().expect("group body");
+        assert_eq!(inner.len(), 1);
+    }
+
+    #[test]
+    fn bounded_repeat_carries_max_repeat_and_variability() {
+        let slots = pattern_slots(r"a{2,5}", Flags::default()).expect("parses");
+        let Slot::Pairing(atom) = &slots[0] else {
+            panic!("expected pairing");
+        };
+        assert_eq!(atom.max_repeat, Some(5));
+        assert!(atom.variable_bounded);
+        assert!(!atom.unbounded);
+    }
+
+    #[test]
+    fn zero_low_repeat_allows_zero() {
+        let slots = pattern_slots(r"a*", Flags::default()).expect("parses");
+        let Slot::Pairing(atom) = &slots[0] else {
+            panic!("expected pairing");
+        };
+        assert!(atom.allows_zero);
+        assert!(atom.unbounded);
+    }
+
+    #[test]
+    fn assertions_are_non_boundary_slots() {
+        let slots = pattern_slots(r"(?=a)", Flags::default()).expect("parses");
+        let Slot::NonPairing(non) = &slots[0] else {
+            panic!("expected non-pairing");
+        };
+        assert!(!non.is_boundary);
+        assert!(non.inner.is_some());
+    }
+
+    #[test]
+    fn anchors_and_failure_slots() {
+        let slots = pattern_slots(r"\b", Flags::default()).expect("parses");
+        let Slot::NonPairing(non) = &slots[0] else {
+            panic!("expected non-pairing");
+        };
+        assert!(!non.is_boundary);
+        assert!(non.inner.is_none());
+        let slots = pattern_slots(r"(?!)", Flags::default()).expect("parses");
+        let Slot::NonPairing(non) = &slots[0] else {
+            panic!("expected non-pairing");
+        };
+        assert!(non.is_boundary);
+    }
+
+    #[test]
+    fn sequence_to_alternatives_splits_top_level_branches() {
+        let (ops, _) = crate::redos::ast::parse("a|b", Flags::default()).expect("parses");
+        let alternatives = sequence_to_alternatives(&ops, Flags::default());
+        assert_eq!(alternatives.len(), 2);
+        let (ops, _) = crate::redos::ast::parse("ab", Flags::default()).expect("parses");
+        let alternatives = sequence_to_alternatives(&ops, Flags::default());
+        assert_eq!(alternatives.len(), 1);
+    }
+
+    #[test]
+    fn printable_alphabet_matches_the_reference_layout() {
+        // Digits, then letters, then punctuation, then the whitespace run.
+        assert_eq!(PRINTABLE.first(), Some(&'0'));
+        assert_eq!(PRINTABLE[10], 'a');
+        assert_eq!(PRINTABLE[36], 'A');
+        assert_eq!(PRINTABLE[62], '!');
+        assert_eq!(PRINTABLE.last(), Some(&'\x0c'));
+        assert_eq!(PRINTABLE.len(), 100);
+    }
+
+    #[test]
+    fn node_intervals_handles_category_nodes_directly() {
+        let intervals = node_intervals(&Op::Category(Category::Digit), Flags::default());
+        assert!(intervals.contains(u32::from('5')));
+        assert!(!intervals.contains(u32::from('x')));
+    }
+
+    #[test]
+    fn node_intervals_folds_not_literal_under_ignorecase() {
+        let mut flags = Flags::default();
+        flags.ignorecase = true;
+        let intervals =
+            node_intervals(&Op::NotLiteral(u32::from('a')), flags);
+        assert!(!intervals.contains(u32::from('a')));
+        assert!(!intervals.contains(u32::from('A')));
+    }
+
+    #[test]
+    fn node_intervals_literal_folds_under_ignorecase() {
+        let mut flags = Flags::default();
+        flags.ignorecase = true;
+        let intervals = node_intervals(&Op::Literal(u32::from('a')), flags);
+        assert!(intervals.contains(u32::from('A')));
+    }
+
+    #[test]
+    fn ascii_flag_narrows_the_digit_category() {
+        let mut flags = Flags::default();
+        flags.ascii = true;
+        let intervals = node_intervals(&Op::Category(Category::Digit), flags);
+        assert!(intervals.contains(u32::from('5')));
+        assert!(!intervals.contains(0x0660));
+    }
+
+    #[test]
+    fn in_intervals_negates_after_the_member_union() {
+        let items = vec![
+            ClassItem::Negate,
+            ClassItem::Literal(u32::from('a')),
+        ];
+        let intervals = in_intervals(&items, Flags::default());
+        assert!(intervals.contains(u32::from('b')));
+        assert!(!intervals.contains(u32::from('a')));
+    }
+}

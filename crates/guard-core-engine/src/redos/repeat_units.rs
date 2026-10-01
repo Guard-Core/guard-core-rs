@@ -89,3 +89,41 @@ pub fn repeat_group_units(
     }
     Ok(pairs.into_keys().collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redos::ast::Flags;
+
+    #[test]
+    fn repeat_sites_yield_prefix_unit_pairs() {
+        let pairs =
+            repeat_group_units(r"(ab)+x", Flags::default(), None).expect("units");
+        assert_eq!(pairs, vec![("".to_owned(), "ab".to_owned())]);
+    }
+
+    #[test]
+    fn inner_repeats_alone_do_not_yield_units() {
+        // The reference filters single-character states, so a repeated
+        // single-char atom contributes nothing.
+        assert_eq!(
+            repeat_group_units(r"(\w{2,})x", Flags::default(), None).expect("units"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn parse_failures_yield_no_pairs() {
+        let pairs =
+            repeat_group_units("[oops", Flags::default(), None).expect("units");
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn single_char_units_are_filtered() {
+        // \d repeats produce single-char states, filtered by the len > 1
+        // rule.
+        let pairs = repeat_group_units(r"(\d)*x", Flags::default(), None).expect("units");
+        assert!(pairs.iter().all(|(_prefix, unit)| unit.chars().count() > 1));
+    }
+}

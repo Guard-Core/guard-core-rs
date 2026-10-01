@@ -393,3 +393,198 @@ pub fn validate_pattern_safety_compat(pattern: &str) -> (bool, String) {
     });
     (verdict.safe, verdict.reason.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cost(max: Option<usize>) -> SafetyMode {
+        SafetyMode::CostVerdict {
+            max_content_length: max,
+        }
+    }
+
+    #[test]
+    fn dangerous_constructs_are_rejected_first() {
+        for pattern in [r"(.*)+", r"(.+)+", r"([a-z]*)+", r"([a-z]+)+", r".*.*", r".+.+"] {
+            let verdict = validate_pattern_safety(pattern, &cost(None));
+            assert!(!verdict.safe, "{pattern}");
+            assert_eq!(verdict.reason_class(), "dangerous_construct");
+            assert!(
+                verdict
+                    .reason
+                    .to_string()
+                    .starts_with("Pattern contains dangerous construct: "),
+                "{}",
+                verdict.reason
+            );
+        }
+    }
+
+    #[test]
+    fn compile_failures_name_the_reference_prefix() {
+        for pattern in ["(unclosed", "[invalid", "*leading"] {
+            let verdict = validate_pattern_safety(pattern, &cost(None));
+            assert!(!verdict.safe, "{pattern}");
+            assert_eq!(verdict.reason_class(), "compile_failed");
+            assert!(
+                verdict
+                    .reason
+                    .to_string()
+                    .starts_with("Pattern validation failed: "),
+                "{}",
+                verdict.reason
+            );
+        }
+    }
+
+    #[test]
+    fn the_python_floor_rejects_lookalike_syntax() {
+        // Atomic groups and possessive quantifiers are compile failures at
+        // the reference floor the oracle pins.
+        for pattern in ["(?>a)+", "(?P<1bad>x)", "(?P=n)", "(?:\\1)", "a*+"] {
+            let verdict = validate_pattern_safety(pattern, &cost(None));
+            assert!(!verdict.safe, "{pattern}");
+            assert_eq!(verdict.reason_class(), "compile_failed", "{pattern}");
+        }
+    }
+
+    #[test]
+    fn structural_rules_carry_pinned_reason_classes() {
+        let cases = [
+            (r"(\w+)*$", "structural_nested_unbounded"),
+            (".*x.*", "structural_adjacent_broad"),
+            ("a[^b]*c", "structural_unreachable_terminator"),
+            ("[a-z]+abc", "structural_literal_absorb"),
+            (r"(a?)+$", "structural_ambiguous_tail"),
+        ];
+        for (pattern, class) in cases {
+            let verdict = validate_pattern_safety(pattern, &SafetyMode::TestStrings(vec![]));
+            assert!(!verdict.safe, "{pattern}");
+            assert_eq!(verdict.reason_class(), class, "{pattern}: {}", verdict.reason);
+            match verdict.reason {
+                SafetyReason::Structural(rule) => {
+                    assert_eq!(rule.reason_class(), class);
+                }
+                other => panic!("expected structural, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn structural_display_prefixes_match_the_reference() {
+        let checks = [
+            (
+                r"(\w+)*$",
+                "Pattern contains nested unbounded quantifier: ",
+            ),
+            (
+                ".*x.*",
+                "Pattern contains adjacent broad unbounded quantifiers: ",
+            ),
+            (
+                "a[^b]*c",
+                "Pattern contains a broad scan whose terminator cannot be \
+                 reached by repeating its own prefix: ",
+            ),
+            (
+                "[a-z]+abc",
+                "Pattern contains a quantified class that can absorb the \
+                 mandatory literal immediately following it: ",
+            ),
+            (
+                r"(a?)+$",
+                "Pattern contains an ambiguous optional tail inside an \
+                 unbounded quantified group: ",
+            ),
+        ];
+        for (pattern, prefix) in checks {
+            let verdict = validate_pattern_safety(pattern, &SafetyMode::TestStrings(vec![]));
+            let text = verdict.reason.to_string();
+            assert!(
+                text.starts_with(prefix),
+                "{pattern}: {text} does not start with {prefix:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_strings_mode_certifies_clean_patterns() {
+        let verdict = validate_pattern_safety(
+            "abc",
+            &SafetyMode::TestStrings(vec!["abc".to_owned(), "x".to_owned()]),
+        );
+        assert!(verdict.safe);
+        assert_eq!(verdict.reason_class(), "safe");
+        assert_eq!(verdict.reason.to_string(), "Pattern appears safe");
+    }
+
+    #[test]
+    fn unreachable_probes_reject_rather_than_certify() {
+        let verdict = validate_pattern_safety(
+            r"[^\x00-\U0010FFFF]+",
+            &cost(None),
+        );
+        assert!(!verdict.safe);
+        assert_eq!(verdict.reason_class(), "unreachable_probe");
+        assert!(verdict
+            .reason
+            .to_string()
+            .starts_with("Pattern validation probe could not construct"));
+    }
+
+    #[test]
+    fn safe_cost_verdicts_certify_linear_patterns() {
+        for pattern in ["hello world", r"(?i)union\s+select", r"^\s*$"] {
+            let verdict = validate_pattern_safety(pattern, &cost(Some(10000)));
+            assert!(verdict.safe, "{pattern}: {}", verdict.reason);
+        }
+    }
+
+    #[test]
+    fn default_flags_are_ignorecase_and_multiline() {
+        let flags = default_flags();
+        assert!(flags.ignorecase);
+        assert!(flags.multiline);
+        assert!(!flags.dotall);
+        assert!(!flags.ascii);
+    }
+
+    #[test]
+    fn compat_shape_carries_the_same_decisions() {
+        let (safe, reason) = validate_pattern_safety_compat(r"(.*)+");
+        assert!(!safe);
+        assert!(reason.starts_with("Pattern contains dangerous construct: "));
+        let (safe, reason) = validate_pattern_safety_compat("hello world");
+        assert!(safe);
+        assert_eq!(reason, "Pattern appears safe");
+    }
+
+    #[test]
+    fn structural_rule_reason_classes_are_stable() {
+        assert_eq!(
+            StructuralRule::NestingDepthExceeded.reason_class(),
+            "structural_nesting_depth"
+        );
+        assert_eq!(
+            structural_rule_text(&StructuralRule::NestingDepthExceeded),
+            super::super::structure::nesting_depth_rejection_reason()
+        );
+    }
+
+    #[test]
+    fn probe_subprocess_reason_shapes() {
+        let reason = SafetyReason::ProbeStringTimeout(42).to_string();
+        assert_eq!(reason, "Pattern timed out on test string of length 42");
+        assert_eq!(
+            SafetyReason::ProbeSubprocessTimeout.reason_class(),
+            "probe_subprocess_timeout"
+        );
+        let spawn = SafetyReason::ProbeSpawnFailed("no child".into()).to_string();
+        assert!(spawn.starts_with("Pattern validation probe failed to run: "));
+        assert_eq!(
+            SafetyReason::BuilderDeadline("deadline hit".into()).to_string(),
+            "deadline hit"
+        );
+    }
+}

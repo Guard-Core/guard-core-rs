@@ -145,6 +145,7 @@ pub enum Op {
     Branch(Vec<Vec<Op>>),
     Assert {
         behind: bool,
+        negated: bool,
         body: Vec<Op>,
     },
     /// Negative assertion with an empty body (the reference `FAILURE`).
@@ -268,9 +269,12 @@ impl Parser {
     }
 
     fn check_group_name(&self, name: &str) -> Result<(), ParseError> {
-        let invalid = name
-            .chars()
-            .any(|c| !(c.is_ascii_alphanumeric() || c == '_'))
+        // The reference uses `name.isidentifier()`: nonempty word
+        // characters, not starting with a digit.
+        let invalid = name.is_empty()
+            || name
+                .chars()
+                .any(|c| !(c.is_ascii_alphanumeric() || c == '_'))
             || name
                 .chars()
                 .next()
@@ -522,6 +526,11 @@ impl Parser {
             if this == ']' && !set.is_empty() {
                 break;
             }
+            let this_text = if this == '\\' {
+                format!("\\{}", self.peek().map(String::from).unwrap_or_default())
+            } else {
+                this.to_string()
+            };
             let code1 = if this == '\\' {
                 self.class_escape()?
             } else {
@@ -536,6 +545,11 @@ impl Parser {
                     set.push(ClassItem::Literal(u32::from('-')));
                     break;
                 }
+                let that_text = if that == '\\' {
+                    format!("\\{}", self.peek().map(String::from).unwrap_or_default())
+                } else {
+                    that.to_string()
+                };
                 let code2 = if that == '\\' {
                     self.class_escape()?
                 } else {
@@ -543,12 +557,12 @@ impl Parser {
                 };
                 let (ClassItem::Literal(lo), ClassItem::Literal(hi)) = (&code1, &code2) else {
                     return Err(ParseError(format!(
-                        "bad character range {this}-{that}"
+                        "bad character range {this_text}-{that_text}"
                     )));
                 };
                 if hi < lo {
                     return Err(ParseError(format!(
-                        "bad character range {this}-{that}"
+                        "bad character range {this_text}-{that_text}"
                     )));
                 }
                 set.push(ClassItem::Range(*lo, *hi));
@@ -782,7 +796,11 @@ impl Parser {
                             }
                             '=' => {
                                 let body = self.parse_group_body(depth)?;
-                                ops.push(Op::Assert { behind: false, body });
+                                ops.push(Op::Assert {
+                                    behind: false,
+                                    negated: false,
+                                    body,
+                                });
                             }
                             '!' => {
                                 let body = self.parse_group_body(depth)?;
@@ -791,6 +809,7 @@ impl Parser {
                                 } else {
                                     ops.push(Op::Assert {
                                         behind: false,
+                                        negated: true,
                                         body,
                                     });
                                 }
@@ -808,12 +827,17 @@ impl Parser {
                                 }
                                 let body = self.parse_group_body(depth)?;
                                 if marker == '=' {
-                                    ops.push(Op::Assert { behind: true, body });
+                                    ops.push(Op::Assert {
+                                        behind: true,
+                                        negated: false,
+                                        body,
+                                    });
                                 } else if body.is_empty() {
                                     ops.push(Op::Failure);
                                 } else {
                                     ops.push(Op::Assert {
                                         behind: true,
+                                        negated: true,
                                         body,
                                     });
                                 }
@@ -841,9 +865,12 @@ impl Parser {
                                     };
                                     gid
                                 };
-                                let yes = self.parse_sequence(depth + 1)?;
+                                // The reference parses exactly one branch
+                                // per conditional arm; the explicit `|`
+                                // between them is consumed here.
+                                let yes = self.parse_branch(depth + 1)?;
                                 let no = if self.match_char('|') {
-                                    let no = self.parse_sequence(depth + 1)?;
+                                    let no = self.parse_branch(depth + 1)?;
                                     if self.peek() == Some('|') {
                                         return Err(ParseError(
                                             "conditional backref with more than two branches"
@@ -984,4 +1011,597 @@ pub fn parse(pattern: &str, flags: Flags) -> Result<(Vec<Op>, Flags), ParseError
         return Err(ParseError("unbalanced parenthesis".into()));
     }
     Ok((ops, parser.flags))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_ok(pattern: &str, flags: Flags) -> (Vec<Op>, Flags) {
+        parse(pattern, flags).expect("pattern must parse")
+    }
+
+    #[test]
+    fn literals_and_anchors() {
+        let (ops, _) = parse_ok(r"a^$", Flags::default());
+        assert_eq!(
+            ops,
+            vec![
+                Op::Literal(u32::from('a')),
+                Op::At(At::Beginning),
+                Op::At(At::End),
+            ]
+        );
+    }
+
+    #[test]
+    fn any_node_and_dotall_inline_flag() {
+        let (plain, _) = parse_ok(".", Flags::default());
+        assert_eq!(plain, vec![Op::Any]);
+        let (dotted, flags) = parse_ok("(?s).", Flags::default());
+        assert_eq!(dotted, vec![Op::Any]);
+        assert!(flags.dotall);
+    }
+
+    #[test]
+    fn char_class_with_range_negation_and_escapes() {
+        let (ops, _) = parse_ok(r"[a-c\d]", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::In(vec![
+                ClassItem::Range(u32::from('a'), u32::from('c')),
+                ClassItem::Category(Category::Digit),
+            ])]
+        );
+    }
+
+    #[test]
+    fn negated_single_literal_becomes_not_literal() {
+        let (ops, _) = parse_ok(r"[^a]", Flags::default());
+        assert_eq!(ops, vec![Op::NotLiteral(u32::from('a'))]);
+    }
+
+    #[test]
+    fn negated_multi_item_class_inserts_negate() {
+        let (ops, _) = parse_ok(r"[^ab]", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::In(vec![
+                ClassItem::Negate,
+                ClassItem::Literal(u32::from('a')),
+                ClassItem::Literal(u32::from('b')),
+            ])]
+        );
+    }
+
+    #[test]
+    fn leading_bracket_and_dash_are_literal_inside_a_class() {
+        let (ops, _) = parse_ok(r"[]-]", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::In(vec![
+                ClassItem::Literal(u32::from(']')),
+                ClassItem::Literal(u32::from('-')),
+            ])]
+        );
+    }
+
+    #[test]
+    fn backslash_b_inside_a_class_is_backspace() {
+        // The single-literal class optimization unwraps the IN node.
+        let (ops, _) = parse_ok(r"[\b]", Flags::default());
+        assert_eq!(ops, vec![Op::Literal(0x08)]);
+    }
+
+    #[test]
+    fn class_dedupes_preserving_order() {
+        let (ops, _) = parse_ok(r"[aab]", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::In(vec![
+                ClassItem::Literal(u32::from('a')),
+                ClassItem::Literal(u32::from('b')),
+            ])]
+        );
+    }
+
+    #[test]
+    fn alternation_builds_a_branch_node() {
+        let (ops, _) = parse_ok("a|bc", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::Branch(vec![
+                vec![Op::Literal(u32::from('a'))],
+                vec![
+                    Op::Literal(u32::from('b')),
+                    Op::Literal(u32::from('c')),
+                ],
+            ])]
+        );
+    }
+
+    #[test]
+    fn empty_alternation_branch_is_allowed() {
+        let (ops, _) = parse_ok("(a|)", Flags::default());
+        let Some(Op::SubPattern { body, .. }) = ops.into_iter().next() else {
+            panic!("expected subpattern");
+        };
+        assert_eq!(
+            body,
+            vec![Op::Branch(vec![
+                vec![Op::Literal(u32::from('a'))],
+                vec![],
+            ])]
+        );
+    }
+
+    #[test]
+    fn non_capturing_groups_are_unpacked() {
+        let (ops, _) = parse_ok("(?:a)(?:b)", Flags::default());
+        assert_eq!(
+            ops,
+            vec![
+                Op::Literal(u32::from('a')),
+                Op::Literal(u32::from('b')),
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_non_capturing_wrappers_unpack_completely() {
+        let (ops, _) = parse_ok("(?:(?:ab))", Flags::default());
+        assert_eq!(
+            ops,
+            vec![
+                Op::Literal(u32::from('a')),
+                Op::Literal(u32::from('b')),
+            ]
+        );
+    }
+
+    #[test]
+    fn capturing_groups_are_numbered_in_order() {
+        let (ops, _) = parse_ok("(a)(b)", Flags::default());
+        let groups: Vec<Option<u32>> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::SubPattern { group, .. } => Some(*group),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(groups, vec![Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn named_groups_register_a_backreference_target() {
+        let (ops, _) = parse_ok(r"(?P<word>x)(?P=word)", Flags::default());
+        assert!(matches!(ops[1], Op::GroupRef(1)));
+    }
+
+    #[test]
+    fn comment_groups_disappear() {
+        let (ops, _) = parse_ok("(?#note)a", Flags::default());
+        assert_eq!(ops, vec![Op::Literal(u32::from('a'))]);
+    }
+
+    #[test]
+    fn lookahead_and_lookbehind_become_asserts() {
+        let (ops, _) = parse_ok(r"(?=a)(?!b)(?<=c)(?<!d)", Flags::default());
+        assert!(matches!(
+            ops[0],
+            Op::Assert {
+                behind: false,
+                negated: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ops[1],
+            Op::Assert {
+                behind: false,
+                negated: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ops[2],
+            Op::Assert {
+                behind: true,
+                negated: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ops[3],
+            Op::Assert {
+                behind: true,
+                negated: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_negative_assertions_become_failure() {
+        let (ops, _) = parse_ok("(?!)", Flags::default());
+        assert_eq!(ops, vec![Op::Failure]);
+        let (ops, _) = parse_ok("(?<!)", Flags::default());
+        assert_eq!(ops, vec![Op::Failure]);
+    }
+
+    #[test]
+    fn conditional_groups_parse_both_branches() {
+        let (ops, _) = parse_ok("(a)(?(1)b|c)", Flags::default());
+        assert!(matches!(
+            ops[1],
+            Op::GroupRefExists {
+                group: 1,
+                yes: _,
+                no: Some(_),
+            }
+        ));
+    }
+
+    #[test]
+    fn conditional_group_by_name_resolves_the_number() {
+        let (ops, _) = parse_ok("(?P<x>a)(?(x)b)", Flags::default());
+        assert!(matches!(
+            ops[1],
+            Op::GroupRefExists { group: 1, no: None, .. }
+        ));
+    }
+
+    #[test]
+    fn repeats_apply_to_the_previous_item() {
+        let (ops, _) = parse_ok("a*b+c?d{2}e{3,}f{1,4}", Flags::default());
+        let kinds: Vec<(u32, Option<u32>)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Repeat { low, high, .. } => Some((*low, *high)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![(0, None), (1, None), (0, Some(1)), (2, Some(2)), (3, None), (1, Some(4))]
+        );
+    }
+
+    #[test]
+    fn open_brace_counts_are_unbounded_and_lazy_marker_is_consumed() {
+        let (ops, _) = parse_ok("a{2,}?", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::Repeat {
+                kind: RepeatKind::Lazy,
+                low: 2,
+                high: None,
+                body: vec![Op::Literal(u32::from('a'))],
+            }]
+        );
+    }
+
+    #[test]
+    fn empty_brace_bounds_mean_zero_to_unbounded() {
+        let (ops, _) = parse_ok("a{,}", Flags::default());
+        assert!(matches!(
+            ops[0],
+            Op::Repeat {
+                low: 0,
+                high: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_brace_becomes_a_literal_and_reparse_follows() {
+        let (ops, _) = parse_ok("a{x}", Flags::default());
+        assert_eq!(
+            ops,
+            vec![
+                Op::Literal(u32::from('a')),
+                Op::Literal(u32::from('{')),
+                Op::Literal(u32::from('x')),
+                Op::Literal(u32::from('}')),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeats_unwrap_a_transparent_group_body() {
+        let (ops, _) = parse_ok("(?:ab)+", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::Repeat {
+                kind: RepeatKind::Greedy,
+                low: 1,
+                high: None,
+                body: vec![
+                    Op::Literal(u32::from('a')),
+                    Op::Literal(u32::from('b')),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn flagged_groups_keep_their_flag_deltas() {
+        let (ops, _) = parse_ok("(?i:x)", Flags::default());
+        match ops.first() {
+            Some(Op::SubPattern { add, del, .. }) => {
+                assert!(add.ignorecase);
+                assert_eq!(*del, Flags::default());
+            }
+            other => panic!("expected scoped-flag subpattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negated_scoped_flags_are_recorded() {
+        let (ops, _) = parse_ok("(?-i:x)", Flags::ignorecase_multiline());
+        match ops.first() {
+            Some(Op::SubPattern { del, .. }) => assert!(del.ignorecase),
+            other => panic!("expected negated scoped flags, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_inline_flags_update_the_final_flags() {
+        let (_, flags) = parse_ok("(?i)a", Flags::default());
+        assert!(flags.ignorecase);
+        let (_, flags) = parse_ok("(?is)a", Flags::default());
+        assert!(flags.ignorecase && flags.dotall);
+    }
+
+    #[test]
+    fn global_flags_must_precede_any_pattern_item() {
+        assert_eq!(
+            parse("a(?i)", Flags::default()).err(),
+            Some(ParseError(
+                "global flags not at the start of the expression".into()
+            ))
+        );
+        assert_eq!(
+            parse("(a)(?i)", Flags::default()).err(),
+            Some(ParseError(
+                "global flags not at the start of the expression".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn consecutive_global_flag_groups_are_allowed_at_the_start() {
+        let (_, flags) = parse_ok("(?i)(?m)a", Flags::default());
+        assert!(flags.ignorecase && flags.multiline);
+    }
+
+    #[test]
+    fn negated_global_flag_group_is_an_error() {
+        assert_eq!(
+            parse("(?-i)", Flags::default()).err(),
+            Some(ParseError("missing :".into()))
+        );
+    }
+
+    #[test]
+    fn turned_on_and_off_flag_is_an_error() {
+        assert_eq!(
+            parse("(?i-i:x)", Flags::default()).err(),
+            Some(ParseError("bad inline flags: flag turned on and off".into()))
+        );
+    }
+
+    #[test]
+    fn locale_flag_is_rejected_for_str_patterns() {
+        assert_eq!(
+            parse("(?L:x)", Flags::default()).err(),
+            Some(ParseError(
+                "bad inline flags: cannot use 'L' flag with a str pattern".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn unknown_flag_is_an_error() {
+        // The reference reports an unknown extension for non-flag letters.
+        assert_eq!(
+            parse("(?q:x)", Flags::default()).err(),
+            Some(ParseError("unknown extension ?q".into()))
+        );
+    }
+
+    #[test]
+    fn escapes_and_octal_forms() {
+        let (ops, _) = parse_ok(r"\a\f\n\r\t\v\\\x41\101\0", Flags::default());
+        let literals: Vec<u32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::Literal(cp) => Some(*cp),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            literals,
+            vec![0x07, 0x0C, 0x0A, 0x0D, 0x09, 0x0B, 0x5C, 0x41, 0o101, 0x0]
+        );
+    }
+
+    #[test]
+    fn unicode_escapes() {
+        let (ops, _) = parse_ok(r"\u00e9\U0001F600", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::Literal(0xE9), Op::Literal(0x1F600)]
+        );
+    }
+
+    #[test]
+    fn zero_width_escapes() {
+        let (ops, _) = parse_ok(r"\A\Z\b\B", Flags::default());
+        assert_eq!(
+            ops,
+            vec![
+                Op::At(At::BeginningString),
+                Op::At(At::EndString),
+                Op::At(At::Boundary),
+                Op::At(At::NonBoundary),
+            ]
+        );
+    }
+
+    #[test]
+    fn escaped_punctuation_is_literal() {
+        let (ops, _) = parse_ok(r"\.\*\+\?", Flags::default());
+        assert_eq!(
+            ops,
+            vec![
+                Op::Literal(u32::from('.')),
+                Op::Literal(u32::from('*')),
+                Op::Literal(u32::from('+')),
+                Op::Literal(u32::from('?')),
+            ]
+        );
+    }
+
+    #[test]
+    fn backreference_to_a_closed_group_parses() {
+        let (ops, _) = parse_ok(r"(a)\1", Flags::default());
+        assert!(matches!(ops[1], Op::GroupRef(1)));
+        let (ops, _) = parse_ok(r"(a)\1\1", Flags::default());
+        assert!(matches!(ops[1], Op::GroupRef(1)));
+        assert!(matches!(ops[2], Op::GroupRef(1)));
+    }
+
+    #[test]
+    fn errors_mirror_the_reference_messages() {
+        let cases = [
+            (
+                "(unclosed",
+                ParseError("missing ), unterminated subpattern".into()),
+            ),
+            (")", ParseError("unbalanced parenthesis".into())),
+            ("[invalid", ParseError("unterminated character set".into())),
+            ("*leading", ParseError("nothing to repeat".into())),
+            ("^*", ParseError("nothing to repeat".into())),
+            ("a**", ParseError("multiple repeat".into())),
+            ("a{3,2}", ParseError("min repeat greater than max repeat".into())),
+            ("a{99999999999999999999}", ParseError("the repetition number is too large".into())),
+            (r"[z-a]", ParseError("bad character range z-a".into())),
+            (r"[\d-a]", ParseError("bad character range \\d-a".into())),
+            (r"\q", ParseError("bad escape \\q".into())),
+            (r"\x2", ParseError("incomplete escape \\x2".into())),
+            (r"\u12", ParseError("incomplete escape \\u12".into())),
+            (r"\N{DASH}", ParseError(
+                "bad escape \\N: named escapes are not supported by the safety chain".into(),
+            )),
+            (r"\1", ParseError("invalid group reference 1".into())),
+            (r"(a)\2", ParseError("invalid group reference 2".into())),
+            (r"(a\1)", ParseError("cannot refer to an open group".into())),
+            (
+                "(?P<1bad>x)",
+                ParseError("bad character in group name \"1bad\"".into()),
+            ),
+            ("(?P=n)", ParseError("unknown group name \"n\"".into())),
+            ("(?(0)a)", ParseError("bad group number".into())),
+            ("(?(n)a)", ParseError("unknown group name \"n\"".into())),
+            ("(?P<x", ParseError("missing >, unterminated group name".into())),
+            ("(?P", ParseError("unexpected end of pattern".into())),
+            ("(?P!x)", ParseError("unknown extension ?P!".into())),
+            ("(?<x>a)", ParseError("unknown extension ?<x".into())),
+            ("(?", ParseError("unexpected end of pattern".into())),
+            ("(?#open", ParseError("missing ), unterminated comment".into())),
+            ("(?(1)a|b|c)", ParseError(
+                "conditional backref with more than two branches".into(),
+            )),
+            ("(?P<>x)", ParseError("bad character in group name \"\"".into())),
+        ];
+        for (pattern, expected) in cases {
+            assert_eq!(
+                parse(pattern, Flags::default()).err(),
+                Some(expected),
+                "pattern {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn possessive_quantifiers_are_rejected_at_the_reference_floor() {
+        assert_eq!(
+            parse("a*+", Flags::default()).err(),
+            Some(ParseError("multiple repeat".into()))
+        );
+    }
+
+    #[test]
+    fn atomic_groups_are_rejected_at_the_reference_floor() {
+        assert_eq!(
+            parse("(?>a)+", Flags::default()).err(),
+            Some(ParseError("unknown extension ?>".into()))
+        );
+    }
+
+    #[test]
+    fn an_open_group_reference_is_an_error() {
+        assert_eq!(
+            parse(r"(a\1)", Flags::default()).err(),
+            Some(ParseError("cannot refer to an open group".into()))
+        );
+    }
+
+    #[test]
+    fn two_digit_group_references_prefer_octal_when_it_fits() {
+        // \101 is three octal digits (0o101 = 'A').
+        let (ops, _) = parse_ok(r"\101", Flags::default());
+        assert_eq!(ops, vec![Op::Literal(0o101)]);
+    }
+
+    #[test]
+    fn two_digit_reference_to_a_defined_group_parses() {
+        // \12 with only two groups defined is an invalid reference; a
+        // twelve-group pattern can address group 12 with two digits.
+        assert_eq!(
+            parse(r"()()\12", Flags::default()).err(),
+            Some(ParseError("invalid group reference 12".into()))
+        );
+        let groups = "()".repeat(12);
+        let (ops, _) = parse_ok(&format!("{groups}\\12"), Flags::default());
+        assert!(matches!(ops[12], Op::GroupRef(12)));
+    }
+
+    #[test]
+    fn deep_nesting_is_an_error() {
+        let pattern = format!("{}a{}", "(".repeat(300), ")".repeat(300));
+        assert!(parse(&pattern, Flags::default()).is_err());
+    }
+
+    #[test]
+    fn scoped_flag_group_body_is_parsed() {
+        let (ops, _) = parse_ok("(?i:a|b)", Flags::default());
+        match ops.first() {
+            Some(Op::SubPattern { body, .. }) => assert_eq!(body.len(), 1),
+            other => panic!("expected scoped subpattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conditional_without_else_uses_none() {
+        let (ops, _) = parse_ok("(a)(?(1)b)", Flags::default());
+        match &ops[1] {
+            Op::GroupRefExists { no: None, .. } => {}
+            other => panic!("expected no else branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_pairing_covers_the_reference_pairing_ops() {
+        assert!(Op::Literal(97).is_pairing());
+        assert!(Op::NotLiteral(97).is_pairing());
+        assert!(Op::Any.is_pairing());
+        assert!(Op::Category(Category::Digit).is_pairing());
+        assert!(Op::In(vec![]).is_pairing());
+        assert!(!Op::At(At::Boundary).is_pairing());
+        assert!(!Op::Failure.is_pairing());
+        assert!(!Op::GroupRef(1).is_pairing());
+    }
 }

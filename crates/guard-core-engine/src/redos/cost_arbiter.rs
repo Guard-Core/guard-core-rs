@@ -578,3 +578,364 @@ pub(crate) fn run_pattern_safety_probe(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redos::ast::Flags;
+
+    fn timing(rows: Vec<Vec<f64>>, load: f64) -> ReachProbeTiming {
+        ReachProbeTiming {
+            samples_by_size: rows,
+            load_factor: load,
+        }
+    }
+
+    #[test]
+    fn load_factor_is_one_on_the_reference_host() {
+        // The recalibrated constant is the measured reference scan, so a
+        // measurement equal to it reads as load 1.0.
+        let reference = reference_scan_seconds();
+        assert!((load_factor(reference) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn load_factor_clamps_to_floor_and_ceiling() {
+        assert!((load_factor(0.0) - LOAD_FACTOR_FLOOR).abs() < 1e-9);
+        assert!((load_factor(f64::INFINITY) - LOAD_FACTOR_CEILING).abs() < 1e-9);
+        assert!((load_factor(0.00229 * 1000.0) - LOAD_FACTOR_CEILING).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reference_scan_constant_is_sane() {
+        // The recalibrated constant must sit in a plausible band for a
+        // single 32K reference scan.
+        let reference = reference_scan_seconds();
+        assert!(
+            reference > 0.0 && reference < 1.0,
+            "reference scan seconds out of band: {reference}"
+        );
+    }
+
+    #[test]
+    fn scaled_deadline_scales_with_load_and_respects_the_ceiling() {
+        let combined = reach_probe_combined_timeout_seconds();
+        assert_eq!(
+            scaled_probe_deadline_seconds(LOAD_FACTOR_FLOOR),
+            combined
+        );
+        assert!((scaled_probe_deadline_seconds(1.0) - combined).abs() < 1e-9);
+        assert!((scaled_probe_deadline_seconds(2.0) - 2.0 * combined).abs() < 1e-9);
+        assert_eq!(
+            scaled_probe_deadline_seconds(LOAD_FACTOR_CEILING),
+            REACH_PROBE_DEADLINE_SCALE_CEILING_SECONDS
+        );
+        assert_eq!(
+            reach_verdict_probe_sizes(),
+            vec![16000, 32000]
+        );
+    }
+
+    #[test]
+    fn verdict_math_extrapolates_down_for_a_small_cap() {
+        let linear = vec![
+            vec![0.001; 5],
+            vec![0.002; 5],
+            vec![0.004; 5],
+            vec![0.008; 5],
+        ];
+        let (over, over_budget) =
+            reach_probe_verdict_from_samples(&linear, 512, 1.0);
+        assert!(!over);
+        assert!((over_budget.ratio - 2.0).abs() < 1e-9);
+        assert!(over_budget.extrapolated < 0.008);
+        assert!((over_budget.min_32 - 0.008).abs() < 1e-9);
+        assert!((over_budget.median_32 - 0.008).abs() < 1e-9);
+    }
+
+    #[test]
+    fn verdict_math_rejects_when_extrapolated_cost_exceeds_budget() {
+        let quadratic = vec![
+            vec![0.001; 5],
+            vec![0.004; 5],
+            vec![0.016; 5],
+            vec![0.064; 5],
+        ];
+        let (over, over_budget) = reach_probe_verdict_from_samples(
+            &quadratic,
+            PATTERN_SAFETY_DEFAULT_CAP,
+            1.0,
+        );
+        assert!(over);
+        assert!((over_budget.ratio - 4.0).abs() < 1e-9);
+        assert!(over_budget.extrapolated > REACH_PROBE_BUDGET_SECONDS);
+    }
+
+    #[test]
+    fn verdict_math_clamps_noisy_non_monotonic_ratios() {
+        let non_monotonic = vec![
+            vec![0.001; 5],
+            vec![0.002; 5],
+            vec![0.010; 5],
+            vec![0.006; 5],
+        ];
+        let (over, over_budget) =
+            reach_probe_verdict_from_samples(&non_monotonic, 512, 1.0);
+        assert!((over_budget.ratio - 1.0).abs() < 1e-9);
+        assert!(!over);
+        assert!((over_budget.extrapolated - over_budget.min_32).abs() < 1e-12);
+        assert!((over_budget.min_32 - 0.006).abs() < 1e-9);
+    }
+
+    #[test]
+    fn verdict_math_treats_tiny_times_as_inconclusive() {
+        let noisy = vec![vec![0.0; 5], vec![0.0; 5], vec![0.0; 5], vec![0.0002; 5]];
+        let (over, over_budget) =
+            reach_probe_verdict_from_samples(&noisy, PATTERN_SAFETY_DEFAULT_CAP, 1.0);
+        assert!((over_budget.ratio - 1.0).abs() < 1e-9);
+        assert!(!over);
+    }
+
+    #[test]
+    fn verdict_divides_measurements_by_the_load_factor() {
+        let samples = vec![vec![0.008; 5], vec![0.016; 5]];
+        let (over_reference, _) =
+            reach_probe_verdict_from_samples(&samples, PATTERN_SAFETY_DEFAULT_CAP, 1.0);
+        let (over_loaded, loaded) =
+            reach_probe_verdict_from_samples(&samples, PATTERN_SAFETY_DEFAULT_CAP, 4.0);
+        assert!(over_reference);
+        assert!(!over_loaded);
+        assert!((loaded.min_32 * 4.0 - 0.016).abs() < 1e-9);
+        // doublings = log2(262144 / 32000) = 3.032, so the extrapolation
+        // multiplies by 8.192, not by 8.
+        assert!((loaded.extrapolated * 4.0 - 0.131072).abs() < 1e-4);
+    }
+
+    #[test]
+    fn cost_reason_reports_every_field() {
+        let reason = reach_probe_cost_reason(
+            None,
+            &OverBudget {
+                cap: 262144,
+                extrapolated: 0.2,
+                ratio: 2.0,
+                min_32: 0.025,
+                median_32: 0.026,
+                load_factor: 2.5,
+            },
+        );
+        assert!(reason.contains("at cap (262144 chars) is 0.200s"));
+        assert!(reason.contains("0.05s safety budget"));
+        assert!(reason.contains("growth ratio 2.00x"));
+        assert!(reason.contains("min 0.0250s"));
+        assert!(reason.contains("median 0.0260s"));
+        assert!(reason.contains("over 5 runs"));
+        assert!(reason.contains("normalized by host load factor 2.50"));
+    }
+
+    #[test]
+    fn cost_reason_echoes_a_structural_violation() {
+        assert_eq!(
+            reach_probe_cost_reason(
+                Some("nested quantifier"),
+                &OverBudget {
+                    cap: 262144,
+                    extrapolated: 0.2,
+                    ratio: 2.0,
+                    min_32: 0.02,
+                    median_32: 0.02,
+                    load_factor: 1.0,
+                },
+            ),
+            "nested quantifier"
+        );
+    }
+
+    #[test]
+    fn unreachable_reason_echoes_the_structural_violation() {
+        assert_eq!(
+            reach_probe_unreachable_reason(Some("some structural reason")),
+            "some structural reason"
+        );
+        assert!(reach_probe_unreachable_reason(None)
+            .starts_with("Pattern validation probe could not construct"));
+    }
+
+    #[test]
+    fn timing_strategy_selects_ascending_for_flagged_patterns() {
+        assert!(matches!(
+            timing_strategy(Some("ambiguous optional tail"), false),
+            TimingStrategy::Ascending
+        ));
+        assert!(matches!(
+            timing_strategy(None, true),
+            TimingStrategy::Ascending
+        ));
+        assert!(matches!(timing_strategy(None, false), TimingStrategy::Combined));
+        // Sizes widen for flagged patterns.
+        assert_eq!(
+            reach_probe_sizes_for_strategy(Some("x"), false),
+            REACH_PROBE_SIZES.to_vec()
+        );
+        assert_eq!(reach_probe_sizes_for_strategy(None, false), vec![16000, 32000]);
+    }
+
+    #[test]
+    fn timing_children_return_sorted_samples_per_probe() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let result = time_reach_probes_subprocess(
+            "abc",
+            vec!["abc".to_owned(), "abcabc".to_owned()],
+            deadline,
+            Flags::default(),
+        );
+        let timing = result.expect("timing");
+        assert_eq!(timing.samples_by_size.len(), 2);
+        for samples in &timing.samples_by_size {
+            assert!((1..=REACH_PROBE_SAMPLE_COUNT).contains(&samples.len()));
+            let mut sorted = samples.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            assert_eq!(samples, &sorted);
+        }
+        assert!((LOAD_FACTOR_FLOOR..=LOAD_FACTOR_CEILING).contains(&timing.load_factor));
+    }
+
+    #[test]
+    fn single_probe_timing_returns_one_row() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let timing = time_single_reach_probe_subprocess(
+            "abc",
+            "abcabc".to_owned(),
+            deadline,
+            Flags::default(),
+        )
+        .expect("timing");
+        assert_eq!(timing.samples_by_size.len(), 1);
+    }
+
+    #[test]
+    fn ascending_timing_walks_each_probe_individually() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let timing = time_reach_probes_ascending(
+            "abc",
+            vec!["abc".to_owned(), "abcabc".to_owned()],
+            deadline,
+            Flags::default(),
+        )
+        .expect("timing");
+        assert_eq!(timing.samples_by_size.len(), 2);
+    }
+
+    #[test]
+    fn timing_returns_none_when_the_budget_is_exhausted() {
+        let deadline = Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            time_reach_probes_subprocess("abc", vec!["a".to_owned()], deadline, Flags::default()),
+            None
+        );
+        assert_eq!(
+            time_single_reach_probe_subprocess("abc", "a".to_owned(), deadline, Flags::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn timing_children_return_none_on_compile_errors() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        assert_eq!(
+            time_reach_probes_subprocess(
+                "[invalid",
+                vec!["a".to_owned()],
+                deadline,
+                Flags::default()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ascending_timing_returns_none_when_the_budget_is_exhausted() {
+        let deadline = Instant::now() - std::time::Duration::from_secs(1);
+        assert_eq!(
+            time_reach_probes_ascending("abc", vec!["a".to_owned()], deadline, Flags::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_strings_probe_certifies_safe_patterns() {
+        let outcome = run_pattern_safety_probe(
+            "abc",
+            vec!["abc".to_owned(), "x".to_owned()],
+            Flags::default(),
+        );
+        assert_eq!(outcome, TestStringsOutcome::Safe);
+    }
+
+    #[test]
+    fn test_strings_probe_reports_compile_failures() {
+        let outcome =
+            run_pattern_safety_probe("[invalid", vec!["a".to_owned()], Flags::default());
+        assert!(matches!(outcome, TestStringsOutcome::CompileFailed(_)));
+    }
+
+    #[test]
+    fn stride_sampling_bounds_timed_probe_sets() {
+        let probe_sets: Vec<Vec<String>> = (0..1200)
+            .map(|index| vec![format!("p{index}"), format!("p{index}!")])
+            .collect();
+        let sampled = stride_sampled_probe_sets(probe_sets.clone(), 512);
+        let expected: Vec<Vec<String>> =
+            probe_sets.iter().step_by(3).cloned().collect();
+        assert_eq!(sampled, expected);
+        assert_eq!(
+            stride_sampled_probe_sets(probe_sets[..512].to_vec(), 512).len(),
+            512
+        );
+        assert_eq!(
+            stride_sampled_probe_sets(probe_sets[..513].to_vec(), 512).len(),
+            257
+        );
+    }
+
+    #[test]
+    fn unique_probe_sets_dedupe_by_digest() {
+        let builders: Vec<super::super::probe_fill::ProbeBuilder> = vec![
+            Box::new(|size: usize| "a".repeat(size)),
+            Box::new(|size: usize| "a".repeat(size)),
+            Box::new(|size: usize| "b".repeat(size)),
+        ];
+        let sets = unique_probe_sets(&builders, &[4, 8]);
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[0], vec!["aaaa".to_owned(), "aaaaaaaa".to_owned()]);
+        assert_eq!(sets[1], vec!["bbbb".to_owned(), "bbbbbbbb".to_owned()]);
+    }
+
+    #[test]
+    fn cost_verdict_accepts_when_no_candidate_units_exist() {
+        let outcome = reach_probe_cost_verdict(r"[a-z]", None, Flags::default());
+        assert_eq!(outcome, CostOutcome::Safe);
+    }
+
+    #[test]
+    fn cost_verdict_reports_unreachable_probes() {
+        let outcome =
+            reach_probe_cost_verdict(r"[^\x00-\U0010FFFF]+", None, Flags::default());
+        assert_eq!(outcome, CostOutcome::Unreachable);
+    }
+
+    #[test]
+    fn cost_verdict_echoes_structural_violations_when_builders_time_out() {
+        // "a?" synthesizes but has no budget... use a builder-deadline
+        // pattern: an unquantified optional tail has builders that never
+        // trigger, so this stays safe.
+        let outcome = reach_probe_cost_verdict("abc", None, Flags::default());
+        assert_eq!(outcome, CostOutcome::Safe);
+    }
+
+    #[test]
+    fn combined_timeout_is_the_budget_ladder_product() {
+        assert!((reach_probe_combined_timeout_seconds() - 40.0).abs() < 1e-9);
+        assert!((REACH_PROBE_CHILD_TIMEOUT_SECONDS - 2.5).abs() < 1e-9);
+    }
+}

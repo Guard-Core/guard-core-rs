@@ -137,3 +137,175 @@ fn measure_probe_batch(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probes(pairs: &[&str]) -> Vec<String> {
+        pairs.iter().map(|p| (*p).to_owned()).collect()
+    }
+
+    #[test]
+    fn digest_preserves_probe_set_boundaries() {
+        assert_ne!(
+            probe_set_digest(&probes(&["a", "bc"])),
+            probe_set_digest(&probes(&["ab", "c"]))
+        );
+        assert_eq!(
+            probe_set_digest(&probes(&["a", "bc"])),
+            probe_set_digest(&probes(&["a", "bc"]))
+        );
+    }
+
+    #[test]
+    fn valid_timing_rows_reject_shape_and_value_drift() {
+        let timing = ReachProbeTiming {
+            samples_by_size: vec![vec![0.1, 0.2]],
+            load_factor: 1.0,
+        };
+        assert_eq!(
+            valid_timing_rows(Some(&timing), 2),
+            None,
+            "row count must match"
+        );
+        let mut nan = timing.clone();
+        nan.samples_by_size = vec![vec![f64::NAN]];
+        assert_eq!(valid_timing_rows(Some(&nan), 1), None);
+        let mut negative = timing.clone();
+        negative.samples_by_size = vec![vec![-1.0]];
+        assert_eq!(valid_timing_rows(Some(&negative), 1), None);
+        let mut empty_row = timing.clone();
+        empty_row.samples_by_size = vec![vec![]];
+        assert_eq!(valid_timing_rows(Some(&empty_row), 1), None);
+        let mut load = timing;
+        load.load_factor = 0.0;
+        assert_eq!(valid_timing_rows(Some(&load), 1), None);
+        assert_eq!(valid_timing_rows(None, 1), None);
+    }
+
+    #[test]
+    fn valid_timing_rows_accepts_clean_rows() {
+        let timing = ReachProbeTiming {
+            samples_by_size: vec![vec![0.1, 0.2], vec![0.3]],
+            load_factor: 2.5,
+        };
+        let (rows, load) = valid_timing_rows(Some(&timing), 2).expect("valid");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(load, 2.5);
+    }
+
+    #[test]
+    fn decode_reach_timing_sorts_each_row() {
+        let outcome = ChildOutcome::Timing {
+            results: vec![vec![0.3, 0.1, 0.2]],
+            reference: 0.002,
+        };
+        let (rows, reference) = decode_reach_timing(Some(&outcome)).expect("decoded");
+        assert_eq!(rows, vec![vec![0.1, 0.2, 0.3]]);
+        assert_eq!(reference, 0.002);
+    }
+
+    #[test]
+    fn decode_reach_timing_rejects_other_outcomes_and_bad_rows() {
+        assert_eq!(
+            decode_reach_timing(Some(&ChildOutcome::Failed("x".into()))),
+            None
+        );
+        assert_eq!(decode_reach_timing(None), None);
+        let empty = ChildOutcome::Timing {
+            results: vec![],
+            reference: 0.1,
+        };
+        assert_eq!(decode_reach_timing(Some(&empty)), None);
+        let bad_reference = ChildOutcome::Timing {
+            results: vec![vec![0.1]],
+            reference: -1.0,
+        };
+        assert_eq!(decode_reach_timing(Some(&bad_reference)), None);
+        let not_finite = ChildOutcome::Timing {
+            results: vec![vec![f64::INFINITY]],
+            reference: 0.1,
+        };
+        assert_eq!(decode_reach_timing(Some(&not_finite)), None);
+    }
+
+    #[test]
+    fn batched_timings_preserve_probe_order_and_all_rows() {
+        let probe_sets: Vec<Vec<String>> = (0..(REACH_PROBE_BATCH_SIZE + 1))
+            .map(|index| probes(&[&format!("p{index}")]))
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let calls: std::sync::Mutex<Vec<Vec<String>>> =
+            std::sync::Mutex::new(Vec::new());
+        let time_probes = |pattern: &str,
+                           batch: Vec<String>,
+                           _deadline: std::time::Instant,
+                           _flags: super::super::ast::Flags|
+         -> Option<ReachProbeTiming> {
+            assert_eq!(pattern, "test");
+            calls.lock().expect("mutex").push(batch.clone());
+            Some(ReachProbeTiming {
+                samples_by_size: batch.iter().map(|_probe| vec![0.0]).collect(),
+                load_factor: 1.0,
+            })
+        };
+        let result = batched_reach_probe_timings(
+            "test",
+            probe_sets.clone(),
+            deadline,
+            super::super::ast::Flags::default(),
+            &time_probes,
+        );
+        let calls = calls.into_inner().expect("mutex");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].len(), REACH_PROBE_BATCH_SIZE);
+        assert_eq!(calls[1], probe_sets[REACH_PROBE_BATCH_SIZE]);
+        let sets: Vec<Vec<String>> = result
+            .iter()
+            .map(|(probes, _rows, _load)| probes.clone())
+            .collect();
+        assert_eq!(sets, probe_sets);
+        assert_eq!(result[0].1, Some(vec![vec![0.0]]));
+        assert_eq!(
+            result
+                .last()
+                .expect("nonempty")
+                .1
+                .clone()
+                .expect("rows"),
+            vec![vec![0.0]]
+        );
+    }
+
+    #[test]
+    fn batched_timings_fail_closed_for_malformed_child_results() {
+        let probe_sets = vec![probes(&["a", "b"])];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let time_probes = |_pattern: &str,
+                           _batch: Vec<String>,
+                           _deadline: std::time::Instant,
+                           _flags: super::super::ast::Flags|
+         -> Option<ReachProbeTiming> { None };
+        let result = batched_reach_probe_timings(
+            "test",
+            probe_sets,
+            deadline,
+            super::super::ast::Flags::default(),
+            &time_probes,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].1, None);
+        assert_eq!(result[0].2, 1.0);
+    }
+
+    #[test]
+    fn reach_probe_timing_holds_rows_and_load() {
+        let timing = ReachProbeTiming {
+            samples_by_size: vec![vec![1.0]],
+            load_factor: 2.0,
+        };
+        let clone = timing.clone();
+        assert_eq!(clone, timing);
+    }
+}

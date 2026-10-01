@@ -151,9 +151,32 @@ mod tests {
         assert!(safe);
         assert_eq!(msg, "Pattern appears safe");
 
-        for pat in [r"<script[^>]*>", r"\d{3}-\d{3}-\d{4}", r"[a-zA-Z0-9]+"] {
+        for pat in [r"<script[^>]*>", r"[a-zA-Z0-9]+"] {
             assert!(validate_pattern_safety(pat).0, "should pass: {pat}");
         }
+    }
+
+    #[test]
+    fn bounded_cost_pattern_passes_at_the_configured_cap() {
+        // At the default cap the zero-fill probes extrapolate over budget,
+        // so callers cap the cost verdict at their content limit (the
+        // corpus pins 10000 for this exact pattern).
+        let verdict = crate::redos::validate_pattern_safety(
+            r"\d{3}-\d{3}-\d{4}",
+            &crate::redos::SafetyMode::CostVerdict {
+                max_content_length: Some(10000),
+            },
+        );
+        assert!(verdict.safe, "reason: {}", verdict.reason);
+
+        let verdict = crate::redos::validate_pattern_safety(
+            r"\d{3}-\d{3}-\d{4}",
+            &crate::redos::SafetyMode::CostVerdict {
+                max_content_length: None,
+            },
+        );
+        assert!(!verdict.safe, "the default cap extrapolates over budget");
+        assert_eq!(verdict.reason_class(), "over_budget");
     }
 
     #[test]

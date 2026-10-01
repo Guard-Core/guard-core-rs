@@ -230,3 +230,72 @@ pub fn expand_ignorecase(interval_set: &IntervalSet, ascii_only: bool) -> Interv
     }
     expand_by_group_scan(interval_set, ascii_only)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group_of(cp: u32) -> u32 {
+        *FOLD_TABLE
+            .by_code_point
+            .get(&cp)
+            .unwrap_or_else(|| panic!("{cp} should have fold partners"))
+    }
+
+    #[test]
+    fn ascii_letters_fold_to_each_other() {
+        let group = group_of(u32::from('a'));
+        let partners = fold_partners(group, false);
+        assert!(partners.contains(&u32::from('a')));
+        assert!(partners.contains(&u32::from('A')));
+    }
+
+    #[test]
+    fn fold_partners_respect_the_ascii_filter() {
+        let group = group_of(u32::from('a'));
+        let partners = fold_partners(group, true);
+        assert!(partners.contains(&u32::from('A')));
+        assert!(partners.iter().all(|cp| *cp < 128));
+    }
+
+    #[test]
+    fn kelvin_sign_shares_a_group_with_k() {
+        let group = group_of(0x212A);
+        let partners = fold_partners(group, false);
+        assert!(partners.contains(&u32::from('k')));
+        assert!(partners.contains(&0x212A));
+    }
+
+    #[test]
+    fn expand_ignorecase_adds_case_partners() {
+        let set = IntervalSet::single(u32::from('a'));
+        let expanded = expand_ignorecase(&set, false);
+        assert!(expanded.contains(u32::from('a')));
+        assert!(expanded.contains(u32::from('A')));
+    }
+
+    #[test]
+    fn expand_ignorecase_ascii_only_stays_ascii() {
+        let set = IntervalSet::single(0x212A); // KELVIN SIGN
+        let expanded = expand_ignorecase(&set, true);
+        // ASCII-only expansion finds no partners for an astral member.
+        assert_eq!(expanded.intervals(), set.intervals());
+    }
+
+    #[test]
+    fn expand_ignorecase_wide_sets_use_the_group_scan() {
+        let set = IntervalSet::new(&[(0, 255), (0x2000, 0x20FF)]);
+        let expanded = expand_ignorecase(&set, false);
+        assert!(expanded.contains(u32::from('A')));
+        assert!(expanded.contains(u32::from('\u{212A}')));
+    }
+
+    #[test]
+    fn expand_ignorecase_member_scan_walks_interval_members() {
+        // Below the member-scan ceiling the member walk runs.
+        let set = IntervalSet::new(&[(u32::from('x'), u32::from('z'))]);
+        let expanded = expand_ignorecase(&set, false);
+        assert!(expanded.contains(u32::from('X')));
+        assert!(expanded.contains(u32::from('Z')));
+    }
+}

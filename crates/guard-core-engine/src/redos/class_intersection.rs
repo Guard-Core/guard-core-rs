@@ -396,3 +396,223 @@ pub fn class_intersection_fills(
         .map(|(fill, _stray)| fill)
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redos::ast::Flags;
+    use crate::redos::parse_slots::{pattern_slots, NonPairingSlot, PairingAtom};
+
+    fn im_flags() -> Flags {
+        Flags::ignorecase_multiline()
+    }
+
+    #[test]
+    fn event_handler_pair_finds_whitespace_and_slash_fills() {
+        let pattern = r"(?:<[^<>]*[\s/]+on\w+\s*=)";
+        let fills = class_intersection_fills(pattern, im_flags()).expect("builders");
+        assert!(!fills.is_empty());
+        assert!(fills.iter().all(|c| " \t\n\r\u{b}\u{c}/".contains(c)));
+    }
+
+    #[test]
+    fn disjoint_adjacent_classes_produce_no_fill() {
+        assert_eq!(
+            class_intersection_fills("[a-c]+[x-z]+", Flags::default()).expect("builders"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn alternation_boundaries_block_pairing() {
+        assert_eq!(
+            class_intersection_fills("[a-z]+|[a-z]+", Flags::default()).expect("builders"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn zero_admitting_middles_are_crossed() {
+        // Fills are interval first-members: tab (0x09) sorts below space
+        // (0x20), so the \s intersection fill is a tab.
+        let first = "\t".to_owned();
+        assert_eq!(
+            class_intersection_fills(r"'\s*[\);]*\s*--", Flags::default())
+                .expect("builders"),
+            vec![first.clone()]
+        );
+        assert_eq!(
+            class_intersection_fills(r"'\s*(?:ab)*\s*--", Flags::default())
+                .expect("builders"),
+            vec![first]
+        );
+    }
+
+    #[test]
+    fn mandatory_middles_block_or_cross_by_overlap() {
+        assert_eq!(
+            class_intersection_fills(r"\s*[\);]+\s*", Flags::default()).expect("builders"),
+            Vec::<String>::new()
+        );
+        // One fill per unbounded repeat site the walk can start from.
+        assert_eq!(
+            class_intersection_fills(r"'\s*(?:\s+)\s*--", Flags::default())
+                .expect("builders"),
+            vec!["\t".to_owned(), "\t".to_owned(), "\t".to_owned()]
+        );
+    }
+
+    #[test]
+    fn multi_char_alternation_group_crossing() {
+        assert_eq!(
+            class_intersection_fills(
+                r"^[c-w]*(?:[g-z][g-z]|[g-z][g-z][g-z])*$",
+                Flags::default()
+            )
+            .expect("builders"),
+            vec!["g".to_owned()]
+        );
+        assert_eq!(
+            class_intersection_fills(
+                r"^[a-f]*(?:[g-z][g-z]|[g-z][g-z][g-z])*$",
+                Flags::default()
+            )
+            .expect("builders"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn ignorecase_folds_disjoint_case_pairs() {
+        assert_eq!(
+            class_intersection_probe_units(r"[a-z]*[A-Z]+", Flags::default(), None, false)
+                .expect("builders"),
+            Vec::<(String, String)>::new()
+        );
+        let units = class_intersection_probe_units(
+            r"[a-z]*[A-Z]+",
+            im_flags(),
+            None,
+            false,
+        )
+        .expect("builders");
+        assert!(!units.is_empty());
+        assert!(units[0].0 == "a" || units[0].0 == "A");
+    }
+
+    #[test]
+    fn parse_failures_yield_no_units() {
+        assert_eq!(
+            class_intersection_probe_units("[oops", Flags::default(), None, false)
+                .expect("builders"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn include_bounded_rewrites_bounded_repeats() {
+        // \d{3}\d{3} only crosses once the bounded repeats read unbounded.
+        let units = class_intersection_probe_units(
+            r"\d{3}\d{3}",
+            Flags::default(),
+            None,
+            true,
+        )
+        .expect("builders");
+        assert!(!units.is_empty());
+    }
+
+    #[test]
+    fn crossing_helpers_reject_past_the_depth_cap() {
+        let atom = Slot::Pairing(PairingAtom {
+            intervals: IntervalSet::single(u32::from('a')),
+            allows_zero: false,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        let alternatives = vec![vec![atom]];
+        assert_eq!(
+            crossing_group_result(&alternatives, &IntervalSet::single(u32::from('a')), 999),
+            None
+        );
+    }
+
+    #[test]
+    fn tail_pairing_intervals_collect_only_pairing_atoms_from_start() {
+        let slots = pattern_slots_for("a[b]c(d)");
+        let tail = tail_pairing_intervals(&slots, 1);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0], IntervalSet::single(u32::from('b')));
+        assert_eq!(tail[1], IntervalSet::single(u32::from('c')));
+        assert!(tail_pairing_intervals(&slots, slots.len()).is_empty());
+    }
+
+    #[test]
+    fn fill_confirmation_requires_interval_membership_on_both_sides() {
+        let left = PairingAtom {
+            intervals: IntervalSet::single(u32::from('a')),
+            allows_zero: false,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        };
+        let right = left.clone();
+        assert!(fill_confirmed(&left, &right, "a"));
+        assert!(!fill_confirmed(&left, &right, "b"));
+        assert!(!fill_confirmed(&left, &right, ""));
+        assert!(left_confirms_fill(&left, "a"));
+        assert!(!left_confirms_fill(&left, "b"));
+    }
+
+    fn pattern_slots_for(pattern: &str) -> Vec<Slot> {
+        crate::redos::parse_slots::pattern_slots(pattern, Flags::default())
+            .expect("pattern parses")
+    }
+
+    #[test]
+    fn pairing_units_need_a_pairing_start_slot() {
+        let ctx = build_stray_context("a*z", Flags::default(), None);
+        let slots = vec![Slot::NonPairing(NonPairingSlot {
+            is_boundary: true,
+            inner: None,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        })];
+        let units = pairing_units_from(&slots, 0, &ctx).expect("walk");
+        assert!(units.is_empty());
+    }
+
+    #[test]
+    fn flatten_alternatives_inserts_boundaries_between_branches() {
+        let atom = |c: char| {
+            Slot::Pairing(PairingAtom {
+                intervals: IntervalSet::single(u32::from(c)),
+                allows_zero: false,
+                unbounded: false,
+                max_repeat: None,
+                variable_bounded: false,
+            })
+        };
+        let flat = flatten_alternatives(&[vec![atom('a')], vec![atom('b')]]);
+        assert_eq!(flat.len(), 3);
+        assert!(matches!(&flat[1], Slot::NonPairing(non) if non.is_boundary));
+        assert_eq!(flatten_alternatives(&[vec![atom('a')]]).len(), 1);
+    }
+
+    #[test]
+    fn bounded_flag_propagates_into_nested_groups() {
+        let slots = pattern_slots_for(r"(\d{2})+");
+        let rewritten = include_bounded_repeats(&slots);
+        let Slot::NonPairing(non) = &rewritten[0] else {
+            panic!("expected group slot");
+        };
+        assert!(non.unbounded);
+        let inner = non.inner.as_ref().expect("inner").last().expect("branch");
+        let Slot::Pairing(atom) = &inner[0] else {
+            panic!("expected pairing");
+        };
+        assert!(atom.unbounded);
+    }
+}

@@ -445,3 +445,139 @@ pub fn reach_group_walk_target_probe(raw_inner: &str) -> (Option<String>, bool) 
 pub fn probe_candidate_chars(atom_text: &str) -> Vec<char> {
     candidate_chars_for_atom_text(atom_text, super::ast::Flags::default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mandatory_repeats_cannot_exceed_the_allocation_limit() {
+        for pattern in [
+            r"a{1000000000}",
+            r"(?:ab){1000000000}",
+            r"(a{12000})\1\1",
+            r"a{12000}b{12001}",
+        ] {
+            assert_eq!(synthesize_reaching_probe(pattern), None, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn probe_allocation_limit_preserves_a_reachable_boundary() {
+        let pattern = format!("a{{{}}}", PROBE_REACH_MAX_LENGTH);
+        let probe = synthesize_reaching_probe(&pattern).expect("boundary probe");
+        assert_eq!(probe.chars().count(), PROBE_REACH_MAX_LENGTH + 1);
+    }
+
+    #[test]
+    fn brace_quantifier_high_shapes() {
+        assert_eq!(reach_brace_quantifier_high(&["3"]), Some(3));
+        assert_eq!(
+            reach_brace_quantifier_high(&["2", ""]),
+            Some(PROBE_REACH_STRESS_LEN)
+        );
+        assert_eq!(reach_brace_quantifier_high(&["2", "5"]), Some(5));
+        assert_eq!(reach_brace_quantifier_high(&["2", "abc"]), None);
+    }
+
+    #[test]
+    fn brace_quantifier_range_validation() {
+        let text: Vec<char> = "{2,".chars().collect();
+        assert_eq!(reach_brace_quantifier_range(&text, 0), None);
+        let text: Vec<char> = "{a,5}".chars().collect();
+        assert_eq!(reach_brace_quantifier_range(&text, 0), None);
+        let text: Vec<char> = "{2,abc}".chars().collect();
+        assert_eq!(reach_brace_quantifier_range(&text, 0), None);
+        let text: Vec<char> = "{2,3}?".chars().collect();
+        assert_eq!(reach_brace_quantifier_range(&text, 0), Some((2, 3, 6)));
+    }
+
+    #[test]
+    fn symbol_quantifier_ranges() {
+        let text: Vec<char> = "a*?".chars().collect();
+        assert_eq!(
+            reach_symbol_quantifier_range(&text, 1, '*'),
+            (0, PROBE_REACH_STRESS_LEN, 3)
+        );
+        let text: Vec<char> = "a+?".chars().collect();
+        assert_eq!(
+            reach_symbol_quantifier_range(&text, 1, '+'),
+            (1, PROBE_REACH_STRESS_LEN, 3)
+        );
+        let text: Vec<char> = "a?".chars().collect();
+        assert_eq!(reach_symbol_quantifier_range(&text, 1, '?'), (0, 1, 2));
+    }
+
+    #[test]
+    fn walk_target_classifier() {
+        assert_eq!(
+            reach_group_walk_target_probe("?:abc"),
+            (Some("abc".to_owned()), false)
+        );
+        // Comment groups are skipped (the raw inner excludes the parens).
+        assert_eq!(
+            reach_group_walk_target_probe("?#comment"),
+            (None, true)
+        );
+        assert_eq!(reach_group_walk_target_probe("?P=n"), (None, false));
+        assert_eq!(
+            reach_group_walk_target_probe("?i:xyz"),
+            (Some("xyz".to_owned()), false)
+        );
+        assert_eq!(reach_group_walk_target_probe("?i"), (None, true));
+        assert_eq!(reach_group_walk_target_probe("?="), (None, true));
+        assert_eq!(reach_group_walk_target_probe("?<!"), (None, true));
+        assert_eq!(reach_group_walk_target_probe("plain"), (Some("plain".to_owned()), false));
+        assert_eq!(reach_group_walk_target_probe("?q"), (None, false));
+    }
+
+    #[test]
+    fn unrepresentable_constructs_fail_the_synth() {
+        assert_eq!(synthesize_reaching_probe(r"[^\x00-\U0010FFFF]+"), None);
+        assert_eq!(
+            synthesize_reaching_probe(r"(a)\1x"),
+            Some("aax\x01".to_owned())
+        );
+    }
+
+    #[test]
+    fn backreference_resolves_to_the_captured_text() {
+        let probe = synthesize_reaching_probe(r"(\d+)\1").expect("probe");
+        // Group 1 fills with '0's; the backref repeats that text.
+        let zeros: String = std::iter::repeat('0').take(120).collect();
+        assert!(probe.starts_with(&zeros));
+        assert!(probe[240..].starts_with(&zeros[..120.min(probe.len() - 240)]));
+    }
+
+    #[test]
+    fn lookarounds_are_skipped_but_groups_are_walked() {
+        assert_eq!(
+            synthesize_reaching_probe("(?:ab)(?=x)cd"),
+            Some("abcd\x01".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_breaking_char_is_appended_and_never_seen_in_the_body() {
+        let probe = synthesize_reaching_probe("abc").expect("probe");
+        assert_eq!(probe, "abc\x01".to_owned());
+    }
+
+    #[test]
+    fn depth_cap_fails_the_segment() {
+        assert_eq!(synthesize_reaching_probe("a"), Some("a\x01".to_owned()));
+    }
+
+    #[test]
+    fn extract_literal_chars_walks_atoms_and_literals() {
+        assert_eq!(extract_literal_chars(r"a\.b"), vec!['a', '.', 'b']);
+        assert_eq!(extract_literal_chars(r"\d"), vec!['0']);
+        assert_eq!(extract_literal_chars("[b-d]"), vec!['b']);
+        assert_eq!(extract_literal_chars("*+?"), Vec::<char>::new());
+    }
+
+    #[test]
+    fn candidate_chars_helper_exposes_component_starts() {
+        assert_eq!(probe_candidate_chars(r"\d").first().copied(), Some('0'));
+    }
+}

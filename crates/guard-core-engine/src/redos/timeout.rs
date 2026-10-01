@@ -15,3 +15,14 @@ impl std::fmt::Display for BuilderTimeout {
 }
 
 impl std::error::Error for BuilderTimeout {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_produces_the_reference_exception_text() {
+        let error = BuilderTimeout("boom".into());
+        assert_eq!(error.to_string(), "boom");
+    }
+}

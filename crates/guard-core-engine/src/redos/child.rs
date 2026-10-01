@@ -63,7 +63,7 @@ pub enum ChildRequest {
 }
 
 /// Decoded child output.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChildOutcome {
     /// `{"safe": bool, "reason": str}` from the pattern-safety probe.
     Safety { safe: bool, reason: String },
@@ -315,22 +315,24 @@ pub fn run_child_request(
 }
 
 fn flag_prefix(flags: &Flags) -> String {
-    let mut prefix = String::new();
-    prefix.push_str("(?");
+    let mut letters = String::new();
     if flags.ignorecase {
-        prefix.push('i');
+        letters.push('i');
     }
     if flags.multiline {
-        prefix.push('m');
+        letters.push('m');
     }
     if flags.dotall {
-        prefix.push('s');
+        letters.push('s');
     }
     if flags.ascii {
-        prefix.push('a');
+        letters.push('a');
     }
-    prefix.push(')');
-    prefix
+    if letters.is_empty() {
+        String::new()
+    } else {
+        format!("(?{letters})")
+    }
 }
 
 /// The compiled engine the child times with: `regex` where the pattern
@@ -511,4 +513,128 @@ pub fn child_main(args: &[String]) -> Option<i32> {
     let _ = stdout.write_all(b"\n");
     let _ = stdout.flush();
     Some(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redos::cost_arbiter::REFERENCE_LOAD_PROBE_TIMEOUT_SECONDS;
+
+    #[test]
+    fn child_path_resolves_inside_the_workspace_target_dir() {
+        // Under cargo test the sibling binary sits in target/debug.
+        let path = child_path().expect("child binary resolvable");
+        assert!(path.exists(), "{}", path.display());
+    }
+
+    #[test]
+    fn flags_round_trip_through_json() {
+        let flags = Flags {
+            ignorecase: true,
+            multiline: false,
+            dotall: true,
+            ascii: false,
+        };
+        let decoded = flags_from_value(&flags_value(&flags));
+        assert_eq!(decoded, flags);
+        assert_eq!(flags_from_value(&json!({})), Flags::default());
+    }
+
+    #[test]
+    fn flag_prefix_omits_an_empty_group() {
+        assert_eq!(flag_prefix(&Flags::default()), "");
+        assert_eq!(flag_prefix(&Flags::ignorecase_multiline()), "(?im)");
+        let dotall = Flags {
+            dotall: true,
+            ..Flags::default()
+        };
+        assert_eq!(flag_prefix(&dotall), "(?s)");
+    }
+
+    #[test]
+    fn parse_outcome_maps_every_child_shape() {
+        let safety = parse_outcome(r#"{"safe": true, "reason": "Pattern appears safe"}"#)
+            .expect("outcome");
+        assert!(matches!(
+            safety,
+            ChildOutcome::Safety {
+                safe: true,
+                reason: _
+            }
+        ));
+        let error = parse_outcome(r#"{"error": "bad pattern"}"#).expect("outcome");
+        assert_eq!(error, ChildOutcome::Failed("bad pattern".to_owned()));
+        let reference = parse_outcome(r#"{"reference": 0.5}"#).expect("outcome");
+        assert_eq!(reference, ChildOutcome::Reference { reference: 0.5 });
+        let timing =
+            parse_outcome(r#"{"results": [[0.2, 0.1]], "reference": 0.01}"#).expect("outcome");
+        assert_eq!(
+            timing,
+            ChildOutcome::Timing {
+                results: vec![vec![0.2, 0.1]],
+                reference: 0.01,
+            }
+        );
+        let stray = parse_outcome(r#""\u0000""#).expect("outcome");
+        assert!(matches!(stray, ChildOutcome::Stray(Some(_))));
+        let none = parse_outcome("null").expect("outcome");
+        assert_eq!(none, ChildOutcome::Stray(None));
+        assert!(parse_outcome("not json").is_err());
+        assert!(parse_outcome("{}").is_err());
+    }
+
+    #[test]
+    fn timed_search_falls_back_to_fancy_regex() {
+        // Lookarounds only compile under fancy-regex.
+        let compiled = CompiledProbe::compile("(?!x)a", &Flags::default())
+            .expect("fancy compile");
+        assert!(matches!(compiled, CompiledProbe::Fancy(_)));
+        assert!(compiled.timed_search("ab") > 0.0);
+    }
+
+    #[test]
+    fn compile_reports_the_engine_error_text() {
+        let error = CompiledProbe::compile("[invalid", &Flags::default())
+            .err()
+            .expect("compile error");
+        assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn run_child_request_kills_a_runaway_child() {
+        // A deadline under the process-spawn floor deterministically
+        // exercises the kill path: the parent polls, kills, waits, and
+        // reports a timeout instead of blocking forever on a child that
+        // cannot be interrupted in-process.
+        let start = Instant::now();
+        let outcome = run_child_request(
+            &ChildRequest::ReferenceLoad,
+            0.0005,
+        );
+        assert!(
+            matches!(outcome, Err(ChildSpawnError::Timeout)),
+            "expected a killed child, got {outcome:?}"
+        );
+        assert!(start.elapsed().as_secs_f64() < 5.0, "the kill must be prompt");
+    }
+
+    #[test]
+    fn reference_load_child_reports_a_positive_scan() {
+        let outcome = run_child_request(
+            &ChildRequest::ReferenceLoad,
+            REFERENCE_LOAD_PROBE_TIMEOUT_SECONDS,
+        )
+        .expect("reference load");
+        let ChildOutcome::Reference { reference } = outcome else {
+            panic!("expected a reference measurement");
+        };
+        assert!(reference > 0.0);
+    }
+
+    #[test]
+    fn compiled_probe_uses_the_regex_crate_first() {
+        let compiled =
+            CompiledProbe::compile("abc", &Flags::default()).expect("compile");
+        assert!(matches!(compiled, CompiledProbe::Re(_)));
+    }
 }

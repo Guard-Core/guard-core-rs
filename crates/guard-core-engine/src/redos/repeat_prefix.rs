@@ -363,9 +363,11 @@ impl PrefixWalk<'_> {
             Op::GroupRefExists { group, yes, no } => {
                 self.conditional(*group, yes, no.as_deref(), states, history_observable)
             }
-            Op::Assert { behind, body } => {
-                self.assertion(*behind, false, body, states)
-            }
+            Op::Assert {
+                behind,
+                negated,
+                body,
+            } => self.assertion(*behind, *negated, body, states),
             Op::At(_) => Ok(states),
             Op::Failure => Ok(Vec::new()),
         }
@@ -443,4 +445,186 @@ pub fn repeat_reaching_prefixes(
         }
     }
     Ok(unique)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn walk(
+        pattern: &str,
+        collect: bool,
+        require_reachable: bool,
+    ) -> Result<(Vec<String>, Vec<RepeatPrefixState>), BuilderTimeout> {
+        let (ops, flags) = crate::redos::ast::parse(pattern, Flags::default())
+            .map_err(|_| BuilderTimeout("parse error".into()))?;
+        let mut prefixes = Vec::new();
+        let mut walker = PrefixWalk {
+            flags,
+            prefixes: &mut prefixes,
+            deadline: None,
+            collect,
+            alphabet: vec!["x".to_owned(), "y".to_owned()],
+            repeat_collector: None,
+            canonical_optionals: true,
+            require_reachable,
+        };
+        let states = walker.walk(&ops, vec![RepeatPrefixState::default()], false)?;
+        Ok((prefixes, states))
+    }
+
+    #[test]
+    fn literals_consume_their_first_member() {
+        let (_prefixes, states) = walk("ab", false, false).expect("walk");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text, "ab");
+    }
+
+    #[test]
+    fn classes_consume_the_interval_start() {
+        let (_prefixes, states) = walk(r"\d", false, false).expect("walk");
+        assert_eq!(states[0].text, "0");
+    }
+
+    #[test]
+    fn optional_atoms_branch_the_states() {
+        // Canonical optional collapse: `a?` followed by `b` has the same
+        // prefix language as `b`, so the states merge.
+        let (_prefixes, states) = walk("a?b", false, false).expect("walk");
+        let texts: Vec<String> = states.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(texts, vec!["b".to_owned()]);
+    }
+
+    #[test]
+    fn unbounded_repeats_record_prefixes_when_collecting() {
+        // Prefixes record the states before the repeat site.
+        let (prefixes, _states) = walk(r"xa*", true, false).expect("walk");
+        assert!(prefixes.contains(&"x".to_owned()));
+        let (prefixes, _states) = walk(r"a", false, false).expect("walk");
+        assert!(prefixes.is_empty());
+    }
+
+    #[test]
+    fn mandatory_repeats_unroll_into_the_text() {
+        let (_prefixes, states) = walk("a{2}", false, false).expect("walk");
+        assert_eq!(states[0].text, "aa");
+    }
+
+    #[test]
+    fn failure_nodes_kill_the_walk() {
+        let (_prefixes, states) = walk(r"(?!)x", false, false).expect("walk");
+        assert!(states.is_empty());
+    }
+
+    #[test]
+    fn branches_union_the_alternative_states() {
+        let (_prefixes, states) = walk("x|y", false, false).expect("walk");
+        let texts: Vec<String> = states.iter().map(|s| s.text.clone()).collect();
+        assert!(texts.contains(&"x".to_owned()));
+        assert!(texts.contains(&"y".to_owned()));
+    }
+
+    #[test]
+    fn negative_lookahead_excludes_the_member() {
+        let (_prefixes, states) = walk(r"(?!x)\S", false, false).expect("walk");
+        // The single-char forbidden word drops 'x' from the available set.
+        for state in &states {
+            assert_ne!(state.text, "x");
+        }
+    }
+
+    #[test]
+    fn positive_lookahead_pends_the_witness() {
+        let (_prefixes, states) = walk(r"(?=xy)\S", false, false).expect("walk");
+        // The witness pends, the anchor consumes its first char.
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text, "x");
+        assert_eq!(states[0].pending, "y");
+    }
+
+    #[test]
+    fn capturing_groups_record_captures() {
+        let (_prefixes, states) = walk("(x)", false, false).expect("walk");
+        assert_eq!(states[0].text, "x");
+        assert_eq!(states[0].captures, vec![(1, "x".to_owned())]);
+    }
+
+    #[test]
+    fn backreferences_consume_the_captured_text() {
+        let (_prefixes, states) = walk(r"(xy)\1", false, false).expect("walk");
+        assert_eq!(states[0].text, "xyxy");
+    }
+
+    #[test]
+    fn conditional_groups_take_the_live_branch() {
+        let (_prefixes, states) = walk("(x)(?(1)y|z)", false, false).expect("walk");
+        assert_eq!(states[0].text, "xy");
+    }
+
+    #[test]
+    fn require_reachable_rejects_unresolved_repeat_sites() {
+        // "a*" dies before the unstarted `b*` site when the walk cannot
+        // produce states.
+        let error = walk(r"(?!)b*", false, true).expect_err("unresolved");
+        assert_eq!(
+            error.0,
+            "Pattern validation cannot resolve repeat-site prefixes"
+        );
+    }
+
+    #[test]
+    fn assertion_witness_budget_is_enforced() {
+        // A negative lookbehind whose prefix ends on the forbidden char
+        // cannot be resolved once captures are in play.
+        let error = walk(r"(x)(?<!x)a", false, false).expect_err("capture lookbehind");
+        assert_eq!(
+            error.0,
+            "Pattern validation cannot resolve capture-dependent lookbehind"
+        );
+    }
+
+    #[test]
+    fn unique_states_budget_is_enforced() {
+        // The state limit and text budget guards live in unique_states.
+        let many: Vec<RepeatPrefixState> = (0..=PREFIX_WALK_STATE_LIMIT)
+            .map(|index| RepeatPrefixState {
+                text: format!("s{index}"),
+                ..RepeatPrefixState::default()
+            })
+            .collect();
+        let error = unique_states(many).err().expect("state budget exceeded");
+        assert_eq!(
+            error.0,
+            "Pattern validation repeat-prefix state budget exceeded"
+        );
+        let long: Vec<RepeatPrefixState> = vec![RepeatPrefixState {
+            text: "a".repeat(PREFIX_WALK_TEXT_BUDGET + 1),
+            ..RepeatPrefixState::default()
+        }];
+        let error = unique_states(long).err().expect("text budget exceeded");
+        assert_eq!(
+            error.0,
+            "Pattern validation repeat-prefix text budget exceeded"
+        );
+    }
+
+    #[test]
+    fn repeat_reaching_prefixes_returns_deduped_prefixes() {
+        // Prefixes are the states recorded before each repeated site.
+        let prefixes = repeat_reaching_prefixes("xa*b", Flags::default(), None, false)
+            .expect("prefixes");
+        assert!(prefixes.contains(&"x".to_owned()));
+        assert!(prefixes.iter().all(|prefix| !prefix.is_empty()));
+        let mut sorted = prefixes.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(prefixes.len(), sorted.len(), "deduped");
+    }
+
+    #[test]
+    fn repeat_reaching_prefixes_parse_failures_are_empty() {
+        let prefixes =
+            repeat_reaching_prefixes("[oops", Flags::default(), None, false).expect("empty");
+        assert!(prefixes.is_empty());
+    }
 }
