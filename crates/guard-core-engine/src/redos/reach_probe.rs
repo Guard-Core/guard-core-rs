@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use super::ambiguous_tail::representative_char_for_atom;
 use super::parse_slots::candidate_chars_for_atom_text;
 use super::structure::{
-    find_group_end, skip_char_class, split_top_level_alternations, MAX_GROUP_NESTING_DEPTH,
+    MAX_GROUP_NESTING_DEPTH, find_group_end, skip_char_class, split_top_level_alternations,
 };
 
 const PROBE_REACH_STRESS_LEN: usize = 4000;
@@ -16,8 +16,9 @@ const PROBE_REACH_BOUNDED_CAP: usize = 4000;
 const PROBE_REACH_TOTAL_BUDGET: usize = 12000;
 const PROBE_REACH_MAX_LENGTH: usize = 2 * PROBE_REACH_TOTAL_BUDGET;
 const PROBE_REACH_GROUP_REPEAT_CAP: usize = 3;
-const PROBE_REACH_BREAK_CHAR_CANDIDATES: &[char] =
-    &['\u{1}', '\u{2}', '\u{3}', '\u{4}', '\u{5}', '\u{6}', '\u{7}', '\u{8}'];
+const PROBE_REACH_BREAK_CHAR_CANDIDATES: &[char] = &[
+    '\u{1}', '\u{2}', '\u{3}', '\u{4}', '\u{5}', '\u{6}', '\u{7}', '\u{8}',
+];
 const PROBE_REACH_ZERO_WIDTH_ESCAPES: &str = "AZbB";
 const PROBE_REACH_LOOKAROUND_PREFIXES: &[&str] = &["?=", "?!", "?<=", "?<!"];
 
@@ -144,8 +145,8 @@ fn reach_group_walk_target(raw_inner: &str) -> (Option<String>, bool) {
     if !raw_inner.starts_with('?') {
         return (Some(raw_inner.to_owned()), false);
     }
-    if raw_inner.starts_with("?:") {
-        return (Some(raw_inner[2..].to_owned()), false);
+    if let Some(body) = raw_inner.strip_prefix("?:") {
+        return (Some(body.to_owned()), false);
     }
     if raw_inner.starts_with("?P<") {
         return match chars.iter().position(|c| *c == '>') {
@@ -228,8 +229,7 @@ fn synth_escape_atom(
         let Some(backref) = backref else {
             return Ok(None);
         };
-        return reach_stress_fill(text, token_end, &backref, ctx.chars_seen, ctx.budget)
-            .map(Some);
+        return reach_stress_fill(text, token_end, &backref, ctx.chars_seen, ctx.budget).map(Some);
     }
     let rep = if is_hex_escape {
         let hex: String = text[i + 2..i + 4].iter().collect();
@@ -291,16 +291,11 @@ fn synth_group_atom(
         return Ok(None);
     };
     let walk_chars: Vec<char> = walk_inner.chars().collect();
-    let Some(first_branch) = split_top_level_alternations(&walk_chars).into_iter().next()
-    else {
+    let Some(first_branch) = split_top_level_alternations(&walk_chars).into_iter().next() else {
         return Ok(None);
     };
     let first_branch_chars: Vec<char> = first_branch.chars().collect();
-    let (sub_text, sub_ok) = synthesize_segment(
-        &first_branch_chars,
-        depth + 1,
-        ctx,
-    )?;
+    let (sub_text, sub_ok) = synthesize_segment(&first_branch_chars, depth + 1, ctx)?;
     if !sub_ok {
         return Ok(None);
     }
@@ -325,8 +320,7 @@ fn synth_next_atom(
         '[' => synth_char_class_atom(text, i, ctx),
         '.' => synth_dot_atom(text, i, ctx).map(Some),
         '(' => synth_group_atom(text, i, depth, ctx),
-        c => reach_stress_fill(text, i + 1, &c.to_string(), ctx.chars_seen, ctx.budget)
-            .map(Some),
+        c => reach_stress_fill(text, i + 1, &c.to_string(), ctx.chars_seen, ctx.budget).map(Some),
     }
 }
 
@@ -515,10 +509,7 @@ mod tests {
             (Some("abc".to_owned()), false)
         );
         // Comment groups are skipped (the raw inner excludes the parens).
-        assert_eq!(
-            reach_group_walk_target_probe("?#comment"),
-            (None, true)
-        );
+        assert_eq!(reach_group_walk_target_probe("?#comment"), (None, true));
         assert_eq!(reach_group_walk_target_probe("?P=n"), (None, false));
         assert_eq!(
             reach_group_walk_target_probe("?i:xyz"),
@@ -527,7 +518,10 @@ mod tests {
         assert_eq!(reach_group_walk_target_probe("?i"), (None, true));
         assert_eq!(reach_group_walk_target_probe("?="), (None, true));
         assert_eq!(reach_group_walk_target_probe("?<!"), (None, true));
-        assert_eq!(reach_group_walk_target_probe("plain"), (Some("plain".to_owned()), false));
+        assert_eq!(
+            reach_group_walk_target_probe("plain"),
+            (Some("plain".to_owned()), false)
+        );
         assert_eq!(reach_group_walk_target_probe("?q"), (None, false));
     }
 
@@ -544,7 +538,7 @@ mod tests {
     fn backreference_resolves_to_the_captured_text() {
         let probe = synthesize_reaching_probe(r"(\d+)\1").expect("probe");
         // Group 1 fills with '0's; the backref repeats that text.
-        let zeros: String = std::iter::repeat('0').take(120).collect();
+        let zeros = "0".repeat(120);
         assert!(probe.starts_with(&zeros));
         assert!(probe[240..].starts_with(&zeros[..120.min(probe.len() - 240)]));
     }

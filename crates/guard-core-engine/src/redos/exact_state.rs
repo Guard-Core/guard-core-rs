@@ -23,10 +23,8 @@ pub(super) fn exact_overlap_fill_raw(
     char::from_u32(member)
 }
 
-fn isolated_alternative_exact_state(
-    alt_slots: &[Slot],
-    depth: usize,
-) -> Option<IntervalSet> {
+#[allow(clippy::question_mark)] // `state?` yields T, not Option<T>
+fn isolated_alternative_exact_state(alt_slots: &[Slot], depth: usize) -> Option<IntervalSet> {
     let mut state: Option<IntervalSet> = Some(IntervalSet::full());
     for slot in alt_slots {
         match slot {
@@ -57,10 +55,7 @@ fn isolated_alternative_exact_state(
 
 /// Reference `_isolated_group_exact_state`.
 #[must_use]
-pub fn isolated_group_exact_state(
-    alternatives: &[Vec<Slot>],
-    depth: usize,
-) -> Option<IntervalSet> {
+pub fn isolated_group_exact_state(alternatives: &[Vec<Slot>], depth: usize) -> Option<IntervalSet> {
     if depth > MAX_GROUP_CROSSING_DEPTH {
         return None;
     }
@@ -81,9 +76,9 @@ pub fn isolated_group_exact_state(
 mod tests {
     use super::*;
     use crate::redos::ast::Flags;
+    use crate::redos::parse_slots::{NonPairingSlot, pattern_slots};
     use exact_overlap_fill_raw as exact_overlap_fill;
     use narrow_exact_state_raw as narrow_exact_state;
-    use crate::redos::parse_slots::{pattern_slots, NonPairingSlot};
 
     fn slots(pattern: &str) -> Vec<Slot> {
         pattern_slots(pattern, Flags::default()).expect("pattern parses")
@@ -142,10 +137,7 @@ mod tests {
             allows_zero: true,
             ..atom.clone()
         };
-        let state = isolated_alternative_exact_state(
-            &[Slot::Pairing(zero_atom)],
-            0,
-        );
+        let state = isolated_alternative_exact_state(&[Slot::Pairing(zero_atom)], 0);
         assert_eq!(state, Some(IntervalSet::full()));
     }
 
@@ -221,7 +213,7 @@ mod tests {
     fn isolated_group_rejects_past_the_max_depth() {
         let pattern_slots_vec = slots("z");
         assert_eq!(
-            isolated_group_exact_state(&[pattern_slots_vec.clone()], 999),
+            isolated_group_exact_state(std::slice::from_ref(&pattern_slots_vec), 999),
             None
         );
     }
@@ -236,10 +228,7 @@ mod tests {
             max_repeat: None,
             variable_bounded: false,
         });
-        let state = isolated_group_exact_state(
-            &[vec![hard], pattern_slots_vec.clone()],
-            0,
-        );
+        let state = isolated_group_exact_state(&[vec![hard], pattern_slots_vec.clone()], 0);
         assert_eq!(state, Some(IntervalSet::single(u32::from('z'))));
     }
 
@@ -249,9 +238,7 @@ mod tests {
         let b = slots("b");
         let state = isolated_group_exact_state(&[a.clone(), b.clone()], 0);
         let expected = match (a[0].clone(), b[0].clone()) {
-            (Slot::Pairing(left), Slot::Pairing(right)) => {
-                left.intervals.union(&right.intervals)
-            }
+            (Slot::Pairing(left), Slot::Pairing(right)) => left.intervals.union(&right.intervals),
             _ => panic!("expected pairing atoms"),
         };
         assert_eq!(state, Some(expected));
@@ -266,6 +253,9 @@ mod tests {
             max_repeat: None,
             variable_bounded: false,
         });
-        assert_eq!(isolated_group_exact_state(&[vec![hard.clone()], vec![hard]], 0), None);
+        assert_eq!(
+            isolated_group_exact_state(&[vec![hard.clone()], vec![hard]], 0),
+            None
+        );
     }
 }

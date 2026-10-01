@@ -23,8 +23,7 @@ fn corpus_path() -> PathBuf {
 
 fn load_corpus() -> Value {
     let path = corpus_path();
-    let raw = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&raw).expect("safety_gates.json parses")
 }
 
@@ -34,11 +33,11 @@ fn load_corpus() -> Value {
 ///
 /// All six are cost-verdict cases the reference rejects because Python's
 /// `re` backtracks catastrophically on them (`_REACH_PROBE_TIMING_CHILD_SCRIPT`
-/// in guard-core/detection_engine/_redos_cost_arbiter.py measures `re`).
+/// in `guard-core/detection_engine/_redos_cost_arbiter.py` measures `re`).
 /// The Rust engine executes the linear-time `regex` crate, so the same
 /// probes cannot exceed the budget: the measured verdict is genuinely safe
 /// for this engine. The deterministic layers agree with the oracle on
-/// every one (each case's test_strings twin passes: the structural finding
+/// every one (each case's `test_strings` twin passes: the structural finding
 /// is detected identically); only the empirical timing verdict diverges.
 const DOCUMENTED_DIVERGENCES: &[(&str, &str)] = &[
     (
@@ -114,7 +113,9 @@ fn safety_gates_verdicts_match_the_oracle() {
         let mode = mode_for(&case["input"]);
         let verdict = guard_core_engine::redos::validate_pattern_safety(pattern, &mode);
         let want_safe = case["expected"]["safe"].as_bool().expect("safe flag");
-        let want_class = case["expected"]["reason_class"].as_str().expect("reason class");
+        let want_class = case["expected"]["reason_class"]
+            .as_str()
+            .expect("reason class");
         let got_class = verdict.reason_class();
         if verdict.safe == want_safe && got_class == want_class {
             passed += 1;

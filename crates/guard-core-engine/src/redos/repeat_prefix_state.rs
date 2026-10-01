@@ -242,9 +242,7 @@ pub fn negative_assertion(
     }
     if body.len() == 1 && body[0].is_pairing() {
         return vec![RepeatPrefixState {
-            excluded: state
-                .excluded
-                .union(&node_intervals(&body[0], flags)),
+            excluded: state.excluded.union(&node_intervals(&body[0], flags)),
             ..state.clone()
         }];
     }
@@ -471,12 +469,8 @@ mod tests {
     fn negative_assertion_pairing_body_excludes_the_intervals() {
         let mut base = state("a");
         base.excluded = IntervalSet::single(1);
-        let result = negative_assertion(
-            &[Op::Literal(u32::from('x'))],
-            Flags::default(),
-            &[],
-            &base,
-        );
+        let result =
+            negative_assertion(&[Op::Literal(u32::from('x'))], Flags::default(), &[], &base);
         assert_eq!(result.len(), 1);
         assert!(result[0].excluded.contains(u32::from('x')));
     }

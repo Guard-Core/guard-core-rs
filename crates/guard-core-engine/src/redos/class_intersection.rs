@@ -10,21 +10,13 @@ use super::exact_state::{
     narrow_exact_state_raw as narrow_exact_state,
 };
 use super::intervals::IntervalSet;
-use super::parse_slots::{
-    pattern_slots, PairingAtom, Slot, NonPairingSlot,
-};
-use super::stray_chooser::{
-    build_stray_context, choose_class_intersection_stray, StrayContext,
-};
+use super::parse_slots::{NonPairingSlot, PairingAtom, Slot, pattern_slots};
+use super::stray_chooser::{StrayContext, build_stray_context, choose_class_intersection_stray};
 use super::timeout::BuilderTimeout;
 
 const MAX_GROUP_CROSSING_DEPTH: usize = super::exact_state::MAX_GROUP_CROSSING_DEPTH;
 
-fn crossing_slot_narrows(
-    slot: &Slot,
-    shared: &IntervalSet,
-    depth: usize,
-) -> Option<IntervalSet> {
+fn crossing_slot_narrows(slot: &Slot, shared: &IntervalSet, depth: usize) -> Option<IntervalSet> {
     match slot {
         Slot::Pairing(atom) => {
             if atom.allows_zero {
@@ -42,8 +34,7 @@ fn crossing_slot_narrows(
                 return Some(shared.clone());
             }
             let inner = non.inner.as_ref()?;
-            crossing_group_result(inner, shared, depth + 1)
-                .map(|_| shared.clone())
+            crossing_group_result(inner, shared, depth + 1).map(|_| shared.clone())
         }
     }
 }
@@ -160,8 +151,7 @@ fn fill_confirmed(left: &PairingAtom, right: &PairingAtom, fill: &str) -> bool {
     let Some(first) = fill.chars().next() else {
         return false;
     };
-    left.intervals.contains(u32::from(first))
-        && right.intervals.contains(u32::from(first))
+    left.intervals.contains(u32::from(first)) && right.intervals.contains(u32::from(first))
 }
 
 fn left_confirms_fill(left: &PairingAtom, fill: &str) -> bool {
@@ -184,13 +174,8 @@ fn append_pairing_unit(
     ctx: &StrayContext,
 ) -> Result<(), BuilderTimeout> {
     if fill_confirmed(left, right, fill) {
-        let stray = choose_class_intersection_stray(
-            ctx,
-            fill,
-            &left.intervals,
-            &right.intervals,
-            tail,
-        )?;
+        let stray =
+            choose_class_intersection_stray(ctx, fill, &left.intervals, &right.intervals, tail)?;
         units.push(ChainUnit {
             fill: fill.to_owned(),
             stray,
@@ -253,8 +238,7 @@ fn pairing_units_from(
         let slot = &slots[index];
         let tail = tail_pairing_intervals(slots, index + 1);
         if let Slot::NonPairing(non) = slot {
-            let Some(crossed) = cross_non_pairing_slot(non, &shared, exact_state.as_ref())
-            else {
+            let Some(crossed) = cross_non_pairing_slot(non, &shared, exact_state.as_ref()) else {
                 break;
             };
             shared = crossed.shared;
@@ -265,13 +249,8 @@ fn pairing_units_from(
             if let Some(fill) = crossed.fill
                 && left_confirms_fill(left, &fill)
             {
-                let stray = choose_class_intersection_stray(
-                    ctx,
-                    &fill,
-                    &left.intervals,
-                    &shared,
-                    &tail,
-                )?;
+                let stray =
+                    choose_class_intersection_stray(ctx, &fill, &left.intervals, &shared, &tail)?;
                 units.push(ChainUnit { fill, stray });
             }
             continue;
@@ -279,15 +258,8 @@ fn pairing_units_from(
         let Slot::Pairing(pairing) = slot else {
             continue;
         };
-        let (new_shared, new_exact, should_stop) = advance_pairing_chain(
-            &mut units,
-            left,
-            &shared,
-            pairing,
-            &exact_state,
-            &tail,
-            ctx,
-        )?;
+        let (new_shared, new_exact, should_stop) =
+            advance_pairing_chain(&mut units, left, &shared, pairing, &exact_state, &tail, ctx)?;
         shared = new_shared;
         exact_state = new_exact;
         if should_stop {
@@ -346,10 +318,12 @@ fn include_bounded_repeats(slots: &[Slot]) -> Vec<Slot> {
                 ..atom.clone()
             }),
             Slot::NonPairing(non) => Slot::NonPairing(NonPairingSlot {
-                inner: non
-                    .inner
-                    .as_ref()
-                    .map(|inner| inner.iter().map(|alt| include_bounded_repeats(alt)).collect()),
+                inner: non.inner.as_ref().map(|inner| {
+                    inner
+                        .iter()
+                        .map(|alt| include_bounded_repeats(alt))
+                        .collect()
+                }),
                 unbounded: non.unbounded || non.max_repeat.is_some_and(|max| max > 1),
                 ..non.clone()
             }),
@@ -401,7 +375,7 @@ pub fn class_intersection_fills(
 mod tests {
     use super::*;
     use crate::redos::ast::Flags;
-    use crate::redos::parse_slots::{pattern_slots, NonPairingSlot, PairingAtom};
+    use crate::redos::parse_slots::{NonPairingSlot, PairingAtom};
 
     fn im_flags() -> Flags {
         Flags::ignorecase_multiline()
@@ -437,13 +411,11 @@ mod tests {
         // (0x20), so the \s intersection fill is a tab.
         let first = "\t".to_owned();
         assert_eq!(
-            class_intersection_fills(r"'\s*[\);]*\s*--", Flags::default())
-                .expect("builders"),
+            class_intersection_fills(r"'\s*[\);]*\s*--", Flags::default()).expect("builders"),
             vec![first.clone()]
         );
         assert_eq!(
-            class_intersection_fills(r"'\s*(?:ab)*\s*--", Flags::default())
-                .expect("builders"),
+            class_intersection_fills(r"'\s*(?:ab)*\s*--", Flags::default()).expect("builders"),
             vec![first]
         );
     }
@@ -456,8 +428,7 @@ mod tests {
         );
         // One fill per unbounded repeat site the walk can start from.
         assert_eq!(
-            class_intersection_fills(r"'\s*(?:\s+)\s*--", Flags::default())
-                .expect("builders"),
+            class_intersection_fills(r"'\s*(?:\s+)\s*--", Flags::default()).expect("builders"),
             vec!["\t".to_owned(), "\t".to_owned(), "\t".to_owned()]
         );
     }
@@ -465,19 +436,13 @@ mod tests {
     #[test]
     fn multi_char_alternation_group_crossing() {
         assert_eq!(
-            class_intersection_fills(
-                r"^[c-w]*(?:[g-z][g-z]|[g-z][g-z][g-z])*$",
-                Flags::default()
-            )
-            .expect("builders"),
+            class_intersection_fills(r"^[c-w]*(?:[g-z][g-z]|[g-z][g-z][g-z])*$", Flags::default())
+                .expect("builders"),
             vec!["g".to_owned()]
         );
         assert_eq!(
-            class_intersection_fills(
-                r"^[a-f]*(?:[g-z][g-z]|[g-z][g-z][g-z])*$",
-                Flags::default()
-            )
-            .expect("builders"),
+            class_intersection_fills(r"^[a-f]*(?:[g-z][g-z]|[g-z][g-z][g-z])*$", Flags::default())
+                .expect("builders"),
             Vec::<String>::new()
         );
     }
@@ -489,13 +454,8 @@ mod tests {
                 .expect("builders"),
             Vec::<(String, String)>::new()
         );
-        let units = class_intersection_probe_units(
-            r"[a-z]*[A-Z]+",
-            im_flags(),
-            None,
-            false,
-        )
-        .expect("builders");
+        let units = class_intersection_probe_units(r"[a-z]*[A-Z]+", im_flags(), None, false)
+            .expect("builders");
         assert!(!units.is_empty());
         assert!(units[0].0 == "a" || units[0].0 == "A");
     }
@@ -512,13 +472,8 @@ mod tests {
     #[test]
     fn include_bounded_rewrites_bounded_repeats() {
         // \d{3}\d{3} only crosses once the bounded repeats read unbounded.
-        let units = class_intersection_probe_units(
-            r"\d{3}\d{3}",
-            Flags::default(),
-            None,
-            true,
-        )
-        .expect("builders");
+        let units = class_intersection_probe_units(r"\d{3}\d{3}", Flags::default(), None, true)
+            .expect("builders");
         assert!(!units.is_empty());
     }
 
@@ -566,8 +521,7 @@ mod tests {
     }
 
     fn pattern_slots_for(pattern: &str) -> Vec<Slot> {
-        crate::redos::parse_slots::pattern_slots(pattern, Flags::default())
-            .expect("pattern parses")
+        crate::redos::parse_slots::pattern_slots(pattern, Flags::default()).expect("pattern parses")
     }
 
     #[test]

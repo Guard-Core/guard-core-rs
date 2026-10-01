@@ -9,11 +9,7 @@ use super::repeat_prefix_state::RepeatPrefixState;
 #[must_use]
 pub fn node_observes_history(op: &Op) -> bool {
     match op {
-        Op::Literal(_)
-        | Op::NotLiteral(_)
-        | Op::In(_)
-        | Op::Any
-        | Op::Category(_) => false,
+        Op::Literal(_) | Op::NotLiteral(_) | Op::In(_) | Op::Any | Op::Category(_) => false,
         Op::At(at) => matches!(at, At::Boundary | At::NonBoundary),
         Op::Repeat { body, .. } => observes_history(body),
         Op::SubPattern {
@@ -21,8 +17,12 @@ pub fn node_observes_history(op: &Op) -> bool {
             add,
             del,
             body,
-        } => group.is_some() || *add != Flags::default() || *del != Flags::default()
-            || observes_history(body),
+        } => {
+            group.is_some()
+                || *add != Flags::default()
+                || *del != Flags::default()
+                || observes_history(body)
+        }
         Op::Branch(alternatives) => alternatives.iter().any(|alt| observes_history(alt)),
         _ => true,
     }
@@ -58,9 +58,7 @@ pub fn optional_states_are_equivalent(
     !history_observable
         && !observes_history(body)
         && !states.iter().any(|state| {
-            !state.pending.is_empty()
-                || !state.forbidden.is_empty()
-                || !state.excluded.is_empty()
+            !state.pending.is_empty() || !state.forbidden.is_empty() || !state.excluded.is_empty()
         })
 }
 
@@ -88,7 +86,7 @@ fn node_contains_repeat(op: &Op) -> bool {
 mod tests {
     use super::*;
     use crate::redos::ast::At;
-    use crate::redos::parse_slots::{pattern_slots, Slot};
+    use crate::redos::parse_slots::{Slot, pattern_slots};
 
     fn parse(pattern: &str) -> Vec<Op> {
         crate::redos::ast::parse(pattern, Flags::default())
@@ -137,11 +135,9 @@ mod tests {
     fn capturing_or_reflagged_groups_observe_history() {
         let (ops, _) = crate::redos::ast::parse("(a)", Flags::default()).expect("parses");
         assert!(node_observes_history(&ops[0]));
-        let (ops, _) =
-            crate::redos::ast::parse("(?i:a)", Flags::default()).expect("parses");
+        let (ops, _) = crate::redos::ast::parse("(?i:a)", Flags::default()).expect("parses");
         assert!(node_observes_history(&ops[0]));
-        let (ops, _) =
-            crate::redos::ast::parse("(?:a)", Flags::default()).expect("parses");
+        let (ops, _) = crate::redos::ast::parse("(?:a)", Flags::default()).expect("parses");
         // The transparent group was unpacked away entirely.
         assert!(matches!(ops[0], Op::Literal(_)));
     }
@@ -187,8 +183,10 @@ mod tests {
         let states = vec![RepeatPrefixState::default()];
         assert!(optional_states_are_equivalent(&body, &states, false));
         assert!(!optional_states_are_equivalent(&body, &states, true));
-        let mut pending = RepeatPrefixState::default();
-        pending.pending = "x".into();
+        let pending = RepeatPrefixState {
+            pending: "x".into(),
+            ..RepeatPrefixState::default()
+        };
         assert!(!optional_states_are_equivalent(&body, &[pending], false));
     }
 
@@ -223,8 +221,7 @@ mod tests {
 
     #[test]
     fn slots_walk_separates_pairing_and_non_pairing() {
-        let slots = pattern_slots(r"[^<>]*(x)[\s/]+", Flags::default())
-            .expect("pattern parses");
+        let slots = pattern_slots(r"[^<>]*(x)[\s/]+", Flags::default()).expect("pattern parses");
         assert_eq!(slots.len(), 3);
         assert!(matches!(slots[0], Slot::Pairing(_)));
         assert!(matches!(slots[1], Slot::NonPairing(_)));

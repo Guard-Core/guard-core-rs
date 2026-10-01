@@ -166,11 +166,7 @@ impl Op {
     pub fn is_pairing(&self) -> bool {
         matches!(
             self,
-            Self::Literal(_)
-                | Self::NotLiteral(_)
-                | Self::In(_)
-                | Self::Any
-                | Self::Category(_)
+            Self::Literal(_) | Self::NotLiteral(_) | Self::In(_) | Self::Any | Self::Category(_)
         )
     }
 }
@@ -275,10 +271,7 @@ impl Parser {
             || name
                 .chars()
                 .any(|c| !(c.is_ascii_alphanumeric() || c == '_'))
-            || name
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit());
+            || name.chars().next().is_some_and(|c| c.is_ascii_digit());
         if invalid {
             return Err(ParseError(format!("bad character in group name {name:?}")));
         }
@@ -361,7 +354,9 @@ impl Parser {
             || add.dotall && del.dotall
             || add.ascii && del.ascii
         {
-            return Err(ParseError("bad inline flags: flag turned on and off".into()));
+            return Err(ParseError(
+                "bad inline flags: flag turned on and off".into(),
+            ));
         }
         Ok(Some((add, del)))
     }
@@ -379,8 +374,7 @@ impl Parser {
             'v' => Ok(ClassItem::Literal(0x0B)),
             '\\' => Ok(ClassItem::Literal(0x5C)),
             'd' | 'D' | 's' | 'S' | 'w' | 'W' => Ok(ClassItem::Category(
-                Category::from_escape(escape)
-                    .expect("category letters guarded by the match arm"),
+                Category::from_escape(escape).expect("category letters guarded by the match arm"),
             )),
             'x' => {
                 let digits = self.get_while(is_hex_digit);
@@ -489,8 +483,8 @@ impl Parser {
                 digits.push(c);
                 if self.peek().is_some_and(is_digit) {
                     digits.push(self.get().expect("peeked digit"));
-                    let all_octal = digits.chars().all(is_oct_digit)
-                        && self.peek().is_some_and(is_oct_digit);
+                    let all_octal =
+                        digits.chars().all(is_oct_digit) && self.peek().is_some_and(is_oct_digit);
                     if all_octal {
                         digits.push(self.get().expect("peeked octal digit"));
                         let value = u32::from_str_radix(&digits, 8).expect("octal digits");
@@ -594,11 +588,7 @@ impl Parser {
         Ok(Op::In(items))
     }
 
-    fn parse_repeat(
-        &mut self,
-        ops: &mut Vec<Op>,
-        marker: char,
-    ) -> Result<(), ParseError> {
+    fn parse_repeat(&mut self, ops: &mut Vec<Op>, marker: char) -> Result<(), ParseError> {
         let (low, high) = match marker {
             '?' => (0u32, Some(1u32)),
             '*' => (0u32, None),
@@ -630,9 +620,7 @@ impl Parser {
                 }
                 if let Some(mx) = max {
                     if mx < min {
-                        return Err(ParseError(
-                            "min repeat greater than max repeat".into(),
-                        ));
+                        return Err(ParseError("min repeat greater than max repeat".into()));
                     }
                     max = Some(mx);
                 }
@@ -693,7 +681,7 @@ impl Parser {
         }
         let branches: Vec<Vec<Op>> = branches
             .into_iter()
-            .map(|ops| unpack_transparent_groups(ops))
+            .map(unpack_transparent_groups)
             .collect();
         if branches.len() == 1 {
             return Ok(branches.into_iter().next().expect("one branch"));
@@ -703,10 +691,7 @@ impl Parser {
 
     fn parse_branch(&mut self, depth: usize) -> Result<Vec<Op>, ParseError> {
         let mut ops: Vec<Op> = Vec::new();
-        loop {
-            let Some(this) = self.peek() else {
-                break;
-            };
+        while let Some(this) = self.peek() {
             if this == '|' || this == ')' {
                 break;
             }
@@ -762,14 +747,10 @@ impl Parser {
                                     }
                                     ops.push(Op::GroupRef(gid));
                                 } else {
-                                    let char = self
-                                        .get()
-                                        .ok_or_else(|| {
-                                            ParseError("unexpected end of pattern".into())
-                                        })?;
-                                    return Err(ParseError(format!(
-                                        "unknown extension ?P{char}"
-                                    )));
+                                    let char = self.get().ok_or_else(|| {
+                                        ParseError("unexpected end of pattern".into())
+                                    })?;
+                                    return Err(ParseError(format!("unknown extension ?P{char}")));
                                 }
                             }
                             ':' => {
@@ -781,19 +762,17 @@ impl Parser {
                                     body,
                                 });
                             }
-                            '#' => {
-                                loop {
-                                    match self.get() {
-                                        None => {
-                                            return Err(ParseError(
-                                                "missing ), unterminated comment".into(),
-                                            ));
-                                        }
-                                        Some(')') => break,
-                                        Some(_) => {}
+                            '#' => loop {
+                                match self.get() {
+                                    None => {
+                                        return Err(ParseError(
+                                            "missing ), unterminated comment".into(),
+                                        ));
                                     }
+                                    Some(')') => break,
+                                    Some(_) => {}
                                 }
-                            }
+                            },
                             '=' => {
                                 let body = self.parse_group_body(depth)?;
                                 ops.push(Op::Assert {
@@ -816,9 +795,7 @@ impl Parser {
                             }
                             '<' => {
                                 let Some(marker) = self.get() else {
-                                    return Err(ParseError(
-                                        "unexpected end of pattern".into(),
-                                    ));
+                                    return Err(ParseError("unexpected end of pattern".into()));
                                 };
                                 if marker != '=' && marker != '!' {
                                     return Err(ParseError(format!(
@@ -848,9 +825,7 @@ impl Parser {
                                     && condname.chars().all(|c| c.is_ascii_digit())
                                 {
                                     let value: u32 = condname.parse().map_err(|_| {
-                                        ParseError(format!(
-                                            "invalid group reference {condname}"
-                                        ))
+                                        ParseError(format!("invalid group reference {condname}"))
                                     })?;
                                     if value == 0 {
                                         return Err(ParseError("bad group number".into()));
@@ -892,9 +867,7 @@ impl Parser {
                             // syntax floor: atomic groups are a compile
                             // failure there.
                             '>' => {
-                                return Err(ParseError(
-                                    "unknown extension ?>".into(),
-                                ));
+                                return Err(ParseError("unknown extension ?>".into()));
                             }
                             'i' | 'm' | 's' | 'a' | 'x' | 'u' | 'L' | '-' => {
                                 // Re-enter the flag parser at the first char
@@ -920,9 +893,7 @@ impl Parser {
                                 });
                             }
                             other => {
-                                return Err(ParseError(format!(
-                                    "unknown extension ?{other}"
-                                )));
+                                return Err(ParseError(format!("unknown extension ?{other}")));
                             }
                         }
                     } else {
@@ -1112,10 +1083,7 @@ mod tests {
             ops,
             vec![Op::Branch(vec![
                 vec![Op::Literal(u32::from('a'))],
-                vec![
-                    Op::Literal(u32::from('b')),
-                    Op::Literal(u32::from('c')),
-                ],
+                vec![Op::Literal(u32::from('b')), Op::Literal(u32::from('c')),],
             ])]
         );
     }
@@ -1128,10 +1096,7 @@ mod tests {
         };
         assert_eq!(
             body,
-            vec![Op::Branch(vec![
-                vec![Op::Literal(u32::from('a'))],
-                vec![],
-            ])]
+            vec![Op::Branch(vec![vec![Op::Literal(u32::from('a'))], vec![],])]
         );
     }
 
@@ -1140,10 +1105,7 @@ mod tests {
         let (ops, _) = parse_ok("(?:a)(?:b)", Flags::default());
         assert_eq!(
             ops,
-            vec![
-                Op::Literal(u32::from('a')),
-                Op::Literal(u32::from('b')),
-            ]
+            vec![Op::Literal(u32::from('a')), Op::Literal(u32::from('b')),]
         );
     }
 
@@ -1152,10 +1114,7 @@ mod tests {
         let (ops, _) = parse_ok("(?:(?:ab))", Flags::default());
         assert_eq!(
             ops,
-            vec![
-                Op::Literal(u32::from('a')),
-                Op::Literal(u32::from('b')),
-            ]
+            vec![Op::Literal(u32::from('a')), Op::Literal(u32::from('b')),]
         );
     }
 
@@ -1247,7 +1206,11 @@ mod tests {
         let (ops, _) = parse_ok("(?P<x>a)(?(x)b)", Flags::default());
         assert!(matches!(
             ops[1],
-            Op::GroupRefExists { group: 1, no: None, .. }
+            Op::GroupRefExists {
+                group: 1,
+                no: None,
+                ..
+            }
         ));
     }
 
@@ -1263,7 +1226,14 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            vec![(0, None), (1, None), (0, Some(1)), (2, Some(2)), (3, None), (1, Some(4))]
+            vec![
+                (0, None),
+                (1, None),
+                (0, Some(1)),
+                (2, Some(2)),
+                (3, None),
+                (1, Some(4))
+            ]
         );
     }
 
@@ -1317,10 +1287,7 @@ mod tests {
                 kind: RepeatKind::Greedy,
                 low: 1,
                 high: None,
-                body: vec![
-                    Op::Literal(u32::from('a')),
-                    Op::Literal(u32::from('b')),
-                ],
+                body: vec![Op::Literal(u32::from('a')), Op::Literal(u32::from('b')),],
             }]
         );
     }
@@ -1388,7 +1355,9 @@ mod tests {
     fn turned_on_and_off_flag_is_an_error() {
         assert_eq!(
             parse("(?i-i:x)", Flags::default()).err(),
-            Some(ParseError("bad inline flags: flag turned on and off".into()))
+            Some(ParseError(
+                "bad inline flags: flag turned on and off".into()
+            ))
         );
     }
 
@@ -1430,10 +1399,7 @@ mod tests {
     #[test]
     fn unicode_escapes() {
         let (ops, _) = parse_ok(r"\u00e9\U0001F600", Flags::default());
-        assert_eq!(
-            ops,
-            vec![Op::Literal(0xE9), Op::Literal(0x1F600)]
-        );
+        assert_eq!(ops, vec![Op::Literal(0xE9), Op::Literal(0x1F600)]);
     }
 
     #[test]
@@ -1485,16 +1451,25 @@ mod tests {
             ("*leading", ParseError("nothing to repeat".into())),
             ("^*", ParseError("nothing to repeat".into())),
             ("a**", ParseError("multiple repeat".into())),
-            ("a{3,2}", ParseError("min repeat greater than max repeat".into())),
-            ("a{99999999999999999999}", ParseError("the repetition number is too large".into())),
+            (
+                "a{3,2}",
+                ParseError("min repeat greater than max repeat".into()),
+            ),
+            (
+                "a{99999999999999999999}",
+                ParseError("the repetition number is too large".into()),
+            ),
             (r"[z-a]", ParseError("bad character range z-a".into())),
             (r"[\d-a]", ParseError("bad character range \\d-a".into())),
             (r"\q", ParseError("bad escape \\q".into())),
             (r"\x2", ParseError("incomplete escape \\x2".into())),
             (r"\u12", ParseError("incomplete escape \\u12".into())),
-            (r"\N{DASH}", ParseError(
-                "bad escape \\N: named escapes are not supported by the safety chain".into(),
-            )),
+            (
+                r"\N{DASH}",
+                ParseError(
+                    "bad escape \\N: named escapes are not supported by the safety chain".into(),
+                ),
+            ),
             (r"\1", ParseError("invalid group reference 1".into())),
             (r"(a)\2", ParseError("invalid group reference 2".into())),
             (r"(a\1)", ParseError("cannot refer to an open group".into())),
@@ -1505,16 +1480,26 @@ mod tests {
             ("(?P=n)", ParseError("unknown group name \"n\"".into())),
             ("(?(0)a)", ParseError("bad group number".into())),
             ("(?(n)a)", ParseError("unknown group name \"n\"".into())),
-            ("(?P<x", ParseError("missing >, unterminated group name".into())),
+            (
+                "(?P<x",
+                ParseError("missing >, unterminated group name".into()),
+            ),
             ("(?P", ParseError("unexpected end of pattern".into())),
             ("(?P!x)", ParseError("unknown extension ?P!".into())),
             ("(?<x>a)", ParseError("unknown extension ?<x".into())),
             ("(?", ParseError("unexpected end of pattern".into())),
-            ("(?#open", ParseError("missing ), unterminated comment".into())),
-            ("(?(1)a|b|c)", ParseError(
-                "conditional backref with more than two branches".into(),
-            )),
-            ("(?P<>x)", ParseError("bad character in group name \"\"".into())),
+            (
+                "(?#open",
+                ParseError("missing ), unterminated comment".into()),
+            ),
+            (
+                "(?(1)a|b|c)",
+                ParseError("conditional backref with more than two branches".into()),
+            ),
+            (
+                "(?P<>x)",
+                ParseError("bad character in group name \"\"".into()),
+            ),
         ];
         for (pattern, expected) in cases {
             assert_eq!(

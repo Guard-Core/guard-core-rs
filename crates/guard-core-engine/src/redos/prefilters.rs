@@ -59,12 +59,16 @@ pub fn first_structural_safety_violation(pattern: &str) -> Option<String> {
 
 fn dangerous_construct_patterns() -> Vec<String> {
     vec![
-        format!(r"\(\.{INNER}\){OUTER}",
+        format!(
+            r"\(\.{INNER}\){OUTER}",
             INNER = INNER_UNBOUNDED_QUANTIFIER,
-            OUTER = OUTER_UNBOUNDED_QUANTIFIER),
-        format!(r"\([^)]*{INNER}\){OUTER}",
+            OUTER = OUTER_UNBOUNDED_QUANTIFIER
+        ),
+        format!(
+            r"\([^)]*{INNER}\){OUTER}",
             INNER = INNER_UNBOUNDED_QUANTIFIER,
-            OUTER = OUTER_UNBOUNDED_QUANTIFIER),
+            OUTER = OUTER_UNBOUNDED_QUANTIFIER
+        ),
         format!(r"(?:\.{INNER}){{2,}}", INNER = INNER_UNBOUNDED_QUANTIFIER),
     ]
 }

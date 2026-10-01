@@ -6,10 +6,9 @@
 //! single node has identical per-character semantics).
 
 use super::ast::{self, Flags};
-use super::parse_slots::{candidate_chars_for_atom_text, node_intervals, PRINTABLE};
+use super::parse_slots::{PRINTABLE, candidate_chars_for_atom_text, node_intervals};
 use super::structure::{
-    iter_quantified_group_bodies, nesting_depth_rejection_reason, skip_char_class,
-    NestingTooDeep,
+    NestingTooDeep, iter_quantified_group_bodies, nesting_depth_rejection_reason, skip_char_class,
 };
 
 fn dotall_flags() -> Flags {
@@ -173,8 +172,7 @@ pub fn group_inner_is_ambiguous(inner: &str) -> bool {
         let (_text, _optional, unbounded, variable) = &raw_atoms[0];
         return *variable && !unbounded;
     }
-    let shape_only: Vec<(bool, bool)> =
-        raw_atoms.iter().map(|(_, o, u, _)| (*o, *u)).collect();
+    let shape_only: Vec<(bool, bool)> = raw_atoms.iter().map(|(_, o, u, _)| (*o, *u)).collect();
     if atoms_have_ambiguous_pair(&shape_only) {
         return true;
     }

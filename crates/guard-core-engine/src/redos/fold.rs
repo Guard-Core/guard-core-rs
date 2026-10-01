@@ -84,7 +84,9 @@ fn register_variant(
         }
         return;
     }
-    let owner = multi_char_owner.entry(variant.to_owned()).or_insert(code_point);
+    let owner = multi_char_owner
+        .entry(variant.to_owned())
+        .or_insert(code_point);
     if *owner != code_point {
         parent.union(*owner, code_point);
     }

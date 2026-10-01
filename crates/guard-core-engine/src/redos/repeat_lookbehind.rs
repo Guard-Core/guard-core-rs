@@ -4,13 +4,10 @@
 
 use super::intervals::IntervalSet;
 use super::parse_slots::node_intervals;
-use super::repeat_prefix_state::{RepeatPrefixState, REPEAT_PREFIX_STATE_LIMIT};
+use super::repeat_prefix_state::{REPEAT_PREFIX_STATE_LIMIT, RepeatPrefixState};
 use super::timeout::BuilderTimeout;
 
-fn check_mutation_budget(
-    state: &RepeatPrefixState,
-    count: usize,
-) -> Result<(), BuilderTimeout> {
+fn check_mutation_budget(state: &RepeatPrefixState, count: usize) -> Result<(), BuilderTimeout> {
     if !state.captures.is_empty() {
         return Err(BuilderTimeout(
             "Pattern validation cannot resolve capture-dependent lookbehind".into(),
@@ -24,10 +21,7 @@ fn check_mutation_budget(
     Ok(())
 }
 
-fn forbidden_final_atom(
-    body: &[super::ast::Op],
-    flags: super::ast::Flags,
-) -> Option<IntervalSet> {
+fn forbidden_final_atom(body: &[super::ast::Op], flags: super::ast::Flags) -> Option<IntervalSet> {
     if body.len() != 1 || !body[0].is_pairing() {
         return None;
     }
@@ -38,12 +32,7 @@ fn negative_lookbehind(
     forbidden: &IntervalSet,
     state: &RepeatPrefixState,
 ) -> Result<Vec<RepeatPrefixState>, BuilderTimeout> {
-    let last = state
-        .text
-        .chars()
-        .last()
-        .map(|c| u32::from(c))
-        .unwrap_or(0);
+    let last = state.text.chars().last().map(u32::from).unwrap_or(0);
     if state.text.is_empty() || !forbidden.contains(last) {
         return Ok(vec![state.clone()]);
     }
@@ -161,10 +150,7 @@ mod tests {
         );
         assert_eq!(forbidden_final_atom(&[], Flags::default()), None);
         assert_eq!(
-            forbidden_final_atom(
-                &[Op::Literal(97), Op::Literal(98)],
-                Flags::default()
-            ),
+            forbidden_final_atom(&[Op::Literal(97), Op::Literal(98)], Flags::default()),
             None
         );
         assert_eq!(
@@ -198,9 +184,7 @@ mod tests {
         let forbidden = IntervalSet::single(u32::from('b'));
         let state = RepeatPrefixState {
             text: "ab".into(),
-            last_atom: Some(IntervalSet::new(&[
-                (u32::from('a'), u32::from('b')),
-            ])),
+            last_atom: Some(IntervalSet::new(&[(u32::from('a'), u32::from('b'))])),
             ..RepeatPrefixState::default()
         };
         let result = negative_lookbehind(&forbidden, &state).expect("no budget error");
@@ -293,8 +277,7 @@ mod tests {
         let states = witnesses(&["ab"]);
         // One alternative per position in the witness width: the tail
         // first, then the head.
-        let result =
-            lookbehind_alternatives(&state, &states, &["x".to_owned()]).expect("budget");
+        let result = lookbehind_alternatives(&state, &states, &["x".to_owned()]).expect("budget");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].text, "ax");
         assert_eq!(result[1].text, "xb");
@@ -322,7 +305,10 @@ mod tests {
             .collect();
         let error = lookbehind_alternatives(&state, &witnesses(&["a"]), &alphabet)
             .expect_err("budget exceeded");
-        assert_eq!(error.0, "Pattern validation lookbehind state budget exceeded");
+        assert_eq!(
+            error.0,
+            "Pattern validation lookbehind state budget exceeded"
+        );
     }
 
     #[test]
@@ -333,14 +319,8 @@ mod tests {
             last_atom: Some(IntervalSet::new(&[(97, 98)])),
             ..RepeatPrefixState::default()
         };
-        let result = walk_negative_behind(
-            &body,
-            Flags::default(),
-            &[],
-            &[state],
-            &[],
-        )
-        .expect("budget");
+        let result =
+            walk_negative_behind(&body, Flags::default(), &[], &[state], &[]).expect("budget");
         assert_eq!(result[0].text, "aa");
     }
 

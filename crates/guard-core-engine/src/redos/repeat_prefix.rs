@@ -10,15 +10,12 @@ use std::time::Instant;
 
 use super::ast::{self, Flags, Op};
 use super::parse_slots::node_intervals;
-use super::prefix_history::{
-    contains_repeat, optional_states_are_equivalent, suffix_history,
-};
+use super::prefix_history::{contains_repeat, optional_states_are_equivalent, suffix_history};
 use super::repeat_alphabet::repeat_alphabet_fills;
 use super::repeat_lookbehind::walk_negative_behind;
 use super::repeat_prefix_state::{
+    PREFIX_WALK_STATE_LIMIT, PREFIX_WALK_TEXT_BUDGET, REPEAT_PREFIX_STATE_LIMIT, RepeatPrefixState,
     capture_state, consume_atom, consume_piece, positive_assertion, state_text_size,
-    RepeatPrefixState, REPEAT_PREFIX_STATE_LIMIT, PREFIX_WALK_STATE_LIMIT,
-    PREFIX_WALK_TEXT_BUDGET,
 };
 use super::timeout::BuilderTimeout;
 
@@ -76,14 +73,9 @@ fn assertion_witnesses(
         require_reachable: false,
     };
     let states = walker.walk(body, vec![RepeatPrefixState::default()], false)?;
-    if states
-        .iter()
-        .any(|state| {
-            !state.pending.is_empty()
-                || !state.forbidden.is_empty()
-                || !state.excluded.is_empty()
-        })
-    {
+    if states.iter().any(|state| {
+        !state.pending.is_empty() || !state.forbidden.is_empty() || !state.excluded.is_empty()
+    }) {
         return Err(BuilderTimeout(
             "Pattern validation cannot resolve nested assertion constraints".into(),
         ));
@@ -175,13 +167,7 @@ impl PrefixWalk<'_> {
                 None => u64::MAX,
                 Some(high) => u64::from(high.max(1) - 1),
             };
-            return self.pending_repeats(
-                body,
-                combined,
-                expanded,
-                remaining,
-                history_observable,
-            );
+            return self.pending_repeats(body, combined, expanded, remaining, history_observable);
         }
         let mut current = states;
         for _ in 0..low {
@@ -291,21 +277,12 @@ impl PrefixWalk<'_> {
             return Ok(result);
         }
         if behind {
-            return walk_negative_behind(
-                body,
-                self.flags,
-                &witnesses,
-                &states,
-                &self.alphabet,
-            );
+            return walk_negative_behind(body, self.flags, &witnesses, &states, &self.alphabet);
         }
         let mut result = Vec::new();
         for state in &states {
             result.extend(super::repeat_prefix_state::negative_assertion(
-                body,
-                self.flags,
-                &witnesses,
-                state,
+                body, self.flags, &witnesses, state,
             ));
         }
         Ok(result)
@@ -339,11 +316,9 @@ impl PrefixWalk<'_> {
         history_observable: bool,
     ) -> Result<Vec<RepeatPrefixState>, BuilderTimeout> {
         match op {
-            Op::Literal(_)
-            | Op::NotLiteral(_)
-            | Op::In(_)
-            | Op::Any
-            | Op::Category(_) => self.atoms(op, states),
+            Op::Literal(_) | Op::NotLiteral(_) | Op::In(_) | Op::Any | Op::Category(_) => {
+                self.atoms(op, states)
+            }
             Op::Repeat {
                 kind: _,
                 low,
@@ -351,9 +326,7 @@ impl PrefixWalk<'_> {
                 body,
             } => self.repeat(*low, *high, body, states, history_observable),
             Op::GroupRef(group) => self.backreference(*group, states),
-            Op::Branch(alternatives) => {
-                self.branch(alternatives, states, history_observable)
-            }
+            Op::Branch(alternatives) => self.branch(alternatives, states, history_observable),
             Op::SubPattern {
                 group,
                 add,
@@ -592,7 +565,7 @@ mod tests {
                 ..RepeatPrefixState::default()
             })
             .collect();
-        let error = unique_states(many).err().expect("state budget exceeded");
+        let error = unique_states(many).expect_err("state budget exceeded");
         assert_eq!(
             error.0,
             "Pattern validation repeat-prefix state budget exceeded"
@@ -601,7 +574,7 @@ mod tests {
             text: "a".repeat(PREFIX_WALK_TEXT_BUDGET + 1),
             ..RepeatPrefixState::default()
         }];
-        let error = unique_states(long).err().expect("text budget exceeded");
+        let error = unique_states(long).expect_err("text budget exceeded");
         assert_eq!(
             error.0,
             "Pattern validation repeat-prefix text budget exceeded"
@@ -611,8 +584,8 @@ mod tests {
     #[test]
     fn repeat_reaching_prefixes_returns_deduped_prefixes() {
         // Prefixes are the states recorded before each repeated site.
-        let prefixes = repeat_reaching_prefixes("xa*b", Flags::default(), None, false)
-            .expect("prefixes");
+        let prefixes =
+            repeat_reaching_prefixes("xa*b", Flags::default(), None, false).expect("prefixes");
         assert!(prefixes.contains(&"x".to_owned()));
         assert!(prefixes.iter().all(|prefix| !prefix.is_empty()));
         let mut sorted = prefixes.clone();

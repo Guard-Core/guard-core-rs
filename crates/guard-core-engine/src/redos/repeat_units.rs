@@ -50,14 +50,19 @@ pub fn repeat_group_units(
     let mut pairs: HashMap<(String, String), ()> = HashMap::new();
     let mut pair_text_size = 0usize;
     {
-        let mut collect = |body: &[Op], local_flags: Flags, states: &[RepeatPrefixState]| -> Result<(), BuilderTimeout> {
+        let mut collect = |body: &[Op],
+                           local_flags: Flags,
+                           states: &[RepeatPrefixState]|
+         -> Result<(), BuilderTimeout> {
             let units = repeated_body_units(body, local_flags, deadline)?;
             for state in states {
                 let prefix = format!("{}{}", state.text, state.pending);
                 for unit in &units {
                     let pair = (prefix.clone(), unit.clone());
-                    if !pairs.contains_key(&pair) {
-                        pairs.insert(pair, ());
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        pairs.entry(pair)
+                    {
+                        entry.insert(());
                         pair_text_size += prefix.chars().count() + unit.chars().count();
                     }
                     if pairs.len() > REPEAT_UNIT_PAIR_LIMIT {
@@ -97,8 +102,7 @@ mod tests {
 
     #[test]
     fn repeat_sites_yield_prefix_unit_pairs() {
-        let pairs =
-            repeat_group_units(r"(ab)+x", Flags::default(), None).expect("units");
+        let pairs = repeat_group_units(r"(ab)+x", Flags::default(), None).expect("units");
         assert_eq!(pairs, vec![("".to_owned(), "ab".to_owned())]);
     }
 
@@ -114,8 +118,7 @@ mod tests {
 
     #[test]
     fn parse_failures_yield_no_pairs() {
-        let pairs =
-            repeat_group_units("[oops", Flags::default(), None).expect("units");
+        let pairs = repeat_group_units("[oops", Flags::default(), None).expect("units");
         assert!(pairs.is_empty());
     }
 

@@ -37,7 +37,9 @@ impl IntervalSet {
     /// The empty set.
     #[must_use]
     pub fn empty() -> Self {
-        Self { intervals: Vec::new() }
+        Self {
+            intervals: Vec::new(),
+        }
     }
 
     /// Every code point.
@@ -59,7 +61,6 @@ impl IntervalSet {
     /// An inclusive range, clamped to the Unicode bounds.
     #[must_use]
     pub fn from_range(low: u32, high: u32) -> Self {
-        let low = low.max(MIN_CODE_POINT);
         let high = high.min(MAX_CODE_POINT);
         if low > high {
             return Self::empty();
@@ -130,8 +131,7 @@ impl IntervalSet {
     /// Union (concatenate then renormalize).
     #[must_use]
     pub fn union(&self, other: &IntervalSet) -> IntervalSet {
-        let mut intervals =
-            Vec::with_capacity(self.intervals.len() + other.intervals.len());
+        let mut intervals = Vec::with_capacity(self.intervals.len() + other.intervals.len());
         intervals.extend_from_slice(&self.intervals);
         intervals.extend_from_slice(&other.intervals);
         Self::new(&intervals)
@@ -236,7 +236,10 @@ mod tests {
         let interval = IntervalSet::from_range(0, u32::MAX);
         assert!(interval.contains(MIN_CODE_POINT));
         assert!(interval.contains(MAX_CODE_POINT));
-        assert_eq!(interval.intervals().last().copied(), Some((0, MAX_CODE_POINT)));
+        assert_eq!(
+            interval.intervals().last().copied(),
+            Some((0, MAX_CODE_POINT))
+        );
     }
 
     #[test]
@@ -252,8 +255,7 @@ mod tests {
 
     #[test]
     fn union_keeps_disjoint_intervals_sorted() {
-        let disjoint =
-            IntervalSet::from_range(50, 60).union(&IntervalSet::from_range(1, 5));
+        let disjoint = IntervalSet::from_range(50, 60).union(&IntervalSet::from_range(1, 5));
         assert_eq!(disjoint.first_member(), Some(1));
         assert_eq!(disjoint.intervals(), &[(1, 5), (50, 60)]);
     }
@@ -277,7 +279,10 @@ mod tests {
     fn complement_splits_around_members() {
         let set = IntervalSet::new(&[(5, 10), (20, 30)]);
         let complement = set.complement();
-        assert_eq!(complement.intervals(), &[(0, 4), (11, 19), (31, MAX_CODE_POINT)]);
+        assert_eq!(
+            complement.intervals(),
+            &[(0, 4), (11, 19), (31, MAX_CODE_POINT)]
+        );
         assert!(complement.contains(0));
         assert!(!complement.contains(5));
         assert!(complement.contains(MAX_CODE_POINT));

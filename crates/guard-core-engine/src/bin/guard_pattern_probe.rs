@@ -7,11 +7,9 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    match guard_core_engine::redos::child::child_main(&args) {
-        Some(code) => std::process::exit(code),
-        None => {
-            eprintln!("usage: guard-pattern-probe __guard_pattern_probe < payload.json");
-            std::process::exit(2);
-        }
+    if let Some(code) = guard_core_engine::redos::child::child_main(&args) {
+        std::process::exit(code);
     }
+    eprintln!("usage: guard-pattern-probe __guard_pattern_probe < payload.json");
+    std::process::exit(2);
 }

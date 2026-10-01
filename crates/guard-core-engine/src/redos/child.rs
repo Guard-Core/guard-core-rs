@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::ast::Flags;
 
@@ -111,14 +111,8 @@ fn flags_value(flags: &Flags) -> Value {
 
 fn flags_from_value(value: &Value) -> Flags {
     Flags {
-        ignorecase: value
-            .get("i")
-            .and_then(Value::as_bool)
-            .unwrap_or_default(),
-        multiline: value
-            .get("m")
-            .and_then(Value::as_bool)
-            .unwrap_or_default(),
+        ignorecase: value.get("i").and_then(Value::as_bool).unwrap_or_default(),
+        multiline: value.get("m").and_then(Value::as_bool).unwrap_or_default(),
         dotall: value.get("s").and_then(Value::as_bool).unwrap_or_default(),
         ascii: value.get("a").and_then(Value::as_bool).unwrap_or_default(),
     }
@@ -205,7 +199,10 @@ fn parse_outcome(stdout: &str) -> Result<ChildOutcome, ChildSpawnError> {
                         .collect()
                 })
                 .unwrap_or_default();
-            return Ok(ChildOutcome::Timing { results: rows, reference });
+            return Ok(ChildOutcome::Timing {
+                results: rows,
+                reference,
+            });
         }
         return Ok(ChildOutcome::Reference { reference });
     }
@@ -374,8 +371,7 @@ impl CompiledProbe {
 }
 
 fn reference_scan_times(samples: usize) -> Vec<f64> {
-    let Ok(reference) = CompiledProbe::compile(REFERENCE_SCAN_PATTERN, &Flags::default())
-    else {
+    let Ok(reference) = CompiledProbe::compile(REFERENCE_SCAN_PATTERN, &Flags::default()) else {
         return Vec::new();
     };
     let probe = format!("/{}", "0".repeat(REFERENCE_SCAN_PROBE_LENGTH));
@@ -440,9 +436,7 @@ fn child_reach_timing(payload: &Value) -> Value {
         if probe_times[0] >= trigger {
             for _ in 0..samples.saturating_sub(1) {
                 probe_times.push(compiled.timed_search(probe));
-                if *probe_times.last().expect("just pushed")
-                    > LARGE_SAMPLE_SECONDS
-                {
+                if *probe_times.last().expect("just pushed") > LARGE_SAMPLE_SECONDS {
                     break;
                 }
             }
@@ -553,8 +547,8 @@ mod tests {
 
     #[test]
     fn parse_outcome_maps_every_child_shape() {
-        let safety = parse_outcome(r#"{"safe": true, "reason": "Pattern appears safe"}"#)
-            .expect("outcome");
+        let safety =
+            parse_outcome(r#"{"safe": true, "reason": "Pattern appears safe"}"#).expect("outcome");
         assert!(matches!(
             safety,
             ChildOutcome::Safety {
@@ -586,8 +580,7 @@ mod tests {
     #[test]
     fn timed_search_falls_back_to_fancy_regex() {
         // Lookarounds only compile under fancy-regex.
-        let compiled = CompiledProbe::compile("(?!x)a", &Flags::default())
-            .expect("fancy compile");
+        let compiled = CompiledProbe::compile("(?!x)a", &Flags::default()).expect("fancy compile");
         assert!(matches!(compiled, CompiledProbe::Fancy(_)));
         assert!(compiled.timed_search("ab") > 0.0);
     }
@@ -607,15 +600,15 @@ mod tests {
         // reports a timeout instead of blocking forever on a child that
         // cannot be interrupted in-process.
         let start = Instant::now();
-        let outcome = run_child_request(
-            &ChildRequest::ReferenceLoad,
-            0.0005,
-        );
+        let outcome = run_child_request(&ChildRequest::ReferenceLoad, 0.0005);
         assert!(
             matches!(outcome, Err(ChildSpawnError::Timeout)),
             "expected a killed child, got {outcome:?}"
         );
-        assert!(start.elapsed().as_secs_f64() < 5.0, "the kill must be prompt");
+        assert!(
+            start.elapsed().as_secs_f64() < 5.0,
+            "the kill must be prompt"
+        );
     }
 
     #[test]
@@ -633,8 +626,7 @@ mod tests {
 
     #[test]
     fn compiled_probe_uses_the_regex_crate_first() {
-        let compiled =
-            CompiledProbe::compile("abc", &Flags::default()).expect("compile");
+        let compiled = CompiledProbe::compile("abc", &Flags::default()).expect("compile");
         assert!(matches!(compiled, CompiledProbe::Re(_)));
     }
 }

@@ -77,9 +77,7 @@ fn group_open_step(
     current: &mut Vec<char>,
     stack: &mut Vec<bool>,
 ) -> usize {
-    let transparent = pattern.len() >= i + 3
-        && pattern[i + 1] == '?'
-        && pattern[i + 2] == ':';
+    let transparent = pattern.len() >= i + 3 && pattern[i + 1] == '?' && pattern[i + 2] == ':';
     if transparent {
         stack.push(true);
         return i + 3;
@@ -242,10 +240,7 @@ mod tests {
             adversarial_literal_runs("(?:ab)cd"),
             vec!["abcd".to_owned()]
         );
-        assert_eq!(
-            adversarial_literal_runs(r"a\.b"),
-            vec!["a.b".to_owned()]
-        );
+        assert_eq!(adversarial_literal_runs(r"a\.b"), vec!["a.b".to_owned()]);
     }
 
     #[test]
@@ -258,10 +253,7 @@ mod tests {
 
     #[test]
     fn narrow_char_classes_contribute_their_first_char() {
-        assert_eq!(
-            adversarial_literal_runs("[ab]x"),
-            vec!["ax".to_owned()]
-        );
+        assert_eq!(adversarial_literal_runs("[ab]x"), vec!["ax".to_owned()]);
         // Wide or negated classes flush instead.
         assert_eq!(adversarial_literal_runs("[a-z]x"), vec!["x".to_owned()]);
     }

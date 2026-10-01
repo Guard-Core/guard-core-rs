@@ -110,10 +110,7 @@ fn terminator_chars_at_slice(chars: &[char], j: usize) -> Option<BTreeSet<char>>
     Some(BTreeSet::from([c]))
 }
 
-fn broad_scan_excluded_chars(
-    pattern: &[char],
-    i: usize,
-) -> (usize, Option<BTreeSet<char>>) {
+fn broad_scan_excluded_chars(pattern: &[char], i: usize) -> (usize, Option<BTreeSet<char>>) {
     let c = pattern[i];
     if c == '.' {
         return (i + 1, Some(BTreeSet::new()));
@@ -152,25 +149,23 @@ fn class_terminator_finding(
     None
 }
 
-fn broad_scan_step(
-    pattern: &[char],
-    i: usize,
-    prefix_chars: &BTreeSet<char>,
-) -> StepResult {
+fn broad_scan_step(pattern: &[char], i: usize, prefix_chars: &BTreeSet<char>) -> StepResult {
     let (scan_end, excluded) = broad_scan_excluded_chars(pattern, i);
     let Some(excluded) = excluded else {
         return (scan_end, BTreeSet::new(), None);
     };
-    if let Some(finding) =
-        class_terminator_finding(pattern, i, scan_end, prefix_chars, &excluded)
-    {
+    if let Some(finding) = class_terminator_finding(pattern, i, scan_end, prefix_chars, &excluded) {
         return (scan_end, prefix_chars.clone(), Some(finding));
     }
     let next_i = scan_end + skip_quantifier_at(pattern, scan_end);
     (next_i, BTreeSet::new(), None)
 }
 
-fn escape_step(pattern: &[char], i: usize, prefix_chars: &BTreeSet<char>) -> (usize, BTreeSet<char>) {
+fn escape_step(
+    pattern: &[char],
+    i: usize,
+    prefix_chars: &BTreeSet<char>,
+) -> (usize, BTreeSet<char>) {
     let next = pattern[i + 1];
     let token_end = i + 2;
     let next_prefix = if !next.is_alphanumeric() {
@@ -182,7 +177,10 @@ fn escape_step(pattern: &[char], i: usize, prefix_chars: &BTreeSet<char>) -> (us
     } else {
         BTreeSet::new()
     };
-    (token_end + skip_quantifier_at(pattern, token_end), next_prefix)
+    (
+        token_end + skip_quantifier_at(pattern, token_end),
+        next_prefix,
+    )
 }
 
 fn group_open_step(
@@ -190,9 +188,8 @@ fn group_open_step(
     i: usize,
     prefix_chars: &BTreeSet<char>,
 ) -> (usize, BTreeSet<char>) {
-    let starts_with_qcolon = pattern.len() >= i + 3
-        && pattern[i + 1] == '?'
-        && pattern[i + 2] == ':';
+    let starts_with_qcolon =
+        pattern.len() >= i + 3 && pattern[i + 1] == '?' && pattern[i + 2] == ':';
     if starts_with_qcolon {
         return (i + 3, prefix_chars.clone());
     }
@@ -269,10 +266,7 @@ mod tests {
 
     #[test]
     fn terminator_chars_singleton_for_a_literal() {
-        assert_eq!(
-            terminator_chars_at("x", 0),
-            Some(BTreeSet::from(['x']))
-        );
+        assert_eq!(terminator_chars_at("x", 0), Some(BTreeSet::from(['x'])));
     }
 
     #[test]

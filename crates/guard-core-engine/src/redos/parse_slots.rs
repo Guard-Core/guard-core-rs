@@ -17,12 +17,11 @@ use super::intervals::IntervalSet;
 /// The reference `_OVERLAP_PROBE_ALPHABET` (`string.printable`): digits,
 /// letters, punctuation, then the whitespace run, in exactly this order.
 pub const PRINTABLE: &[char] = &[
-    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
-    'w', 'x', 'y', 'z', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L',
-    'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', '!', '"',
-    '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<',
-    '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~', ' ',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i',
+    'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', 'A', 'B',
+    'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+    'V', 'W', 'X', 'Y', 'Z', '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.',
+    '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~', ' ',
     '\t', '\n', '\r', '\x0b', '\x0c',
 ];
 
@@ -56,13 +55,12 @@ pub enum Slot {
 static ASCII_DIGIT: LazyLock<IntervalSet> = LazyLock::new(|| IntervalSet::from_range(0x30, 0x39));
 static ASCII_WORD: LazyLock<IntervalSet> =
     LazyLock::new(|| IntervalSet::new(&[(0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A)]));
-static ASCII_SPACE: LazyLock<IntervalSet> = LazyLock::new(|| {
-    IntervalSet::new(&[(0x09, 0x0D), (0x20, 0x20)])
-});
+static ASCII_SPACE: LazyLock<IntervalSet> =
+    LazyLock::new(|| IntervalSet::new(&[(0x09, 0x0D), (0x20, 0x20)]));
 
 fn category_intervals(category: Category, flags: Flags) -> IntervalSet {
     let ascii = flags.ascii;
-    let base = match category {
+    match category {
         Category::Digit => {
             if ascii {
                 ASCII_DIGIT.clone()
@@ -84,32 +82,25 @@ fn category_intervals(category: Category, flags: Flags) -> IntervalSet {
                 IntervalSet::from_normalized(CATEGORY_WORD_INTERVALS.to_vec())
             }
         }
-        Category::NotDigit => {
-            if ascii {
-                ASCII_DIGIT.clone()
-            } else {
-                IntervalSet::from_normalized(CATEGORY_DIGIT_INTERVALS.to_vec())
-            }
-            .complement()
+        Category::NotDigit => if ascii {
+            ASCII_DIGIT.clone()
+        } else {
+            IntervalSet::from_normalized(CATEGORY_DIGIT_INTERVALS.to_vec())
         }
-        Category::NotSpace => {
-            if ascii {
-                ASCII_SPACE.clone()
-            } else {
-                IntervalSet::from_normalized(CATEGORY_SPACE_INTERVALS.to_vec())
-            }
-            .complement()
+        .complement(),
+        Category::NotSpace => if ascii {
+            ASCII_SPACE.clone()
+        } else {
+            IntervalSet::from_normalized(CATEGORY_SPACE_INTERVALS.to_vec())
         }
-        Category::NotWord => {
-            if ascii {
-                ASCII_WORD.clone()
-            } else {
-                IntervalSet::from_normalized(CATEGORY_WORD_INTERVALS.to_vec())
-            }
-            .complement()
+        .complement(),
+        Category::NotWord => if ascii {
+            ASCII_WORD.clone()
+        } else {
+            IntervalSet::from_normalized(CATEGORY_WORD_INTERVALS.to_vec())
         }
-    };
-    base
+        .complement(),
+    }
 }
 
 fn apply_ignorecase(intervals: &IntervalSet, flags: Flags) -> IntervalSet {
@@ -142,11 +133,7 @@ pub fn in_intervals(items: &[ClassItem], flags: Flags) -> IntervalSet {
         }
         member = member.union(&member_intervals(item, flags));
     }
-    if negate {
-        member.complement()
-    } else {
-        member
-    }
+    if negate { member.complement() } else { member }
 }
 
 fn any_intervals(flags: Flags) -> IntervalSet {
@@ -170,7 +157,14 @@ pub fn node_intervals(op: &Op, flags: Flags) -> IntervalSet {
     }
 }
 
-fn pairing_atom(op: &Op, flags: Flags, allows_zero: bool, unbounded: bool, max_repeat: Option<u32>, variable_bounded: bool) -> Slot {
+fn pairing_atom(
+    op: &Op,
+    flags: Flags,
+    allows_zero: bool,
+    unbounded: bool,
+    max_repeat: Option<u32>,
+    variable_bounded: bool,
+) -> Slot {
     Slot::Pairing(PairingAtom {
         intervals: node_intervals(op, flags),
         allows_zero,
@@ -507,26 +501,31 @@ mod tests {
 
     #[test]
     fn node_intervals_folds_not_literal_under_ignorecase() {
-        let mut flags = Flags::default();
-        flags.ignorecase = true;
-        let intervals =
-            node_intervals(&Op::NotLiteral(u32::from('a')), flags);
+        let flags = Flags {
+            ignorecase: true,
+            ..Flags::default()
+        };
+        let intervals = node_intervals(&Op::NotLiteral(u32::from('a')), flags);
         assert!(!intervals.contains(u32::from('a')));
         assert!(!intervals.contains(u32::from('A')));
     }
 
     #[test]
     fn node_intervals_literal_folds_under_ignorecase() {
-        let mut flags = Flags::default();
-        flags.ignorecase = true;
+        let flags = Flags {
+            ignorecase: true,
+            ..Flags::default()
+        };
         let intervals = node_intervals(&Op::Literal(u32::from('a')), flags);
         assert!(intervals.contains(u32::from('A')));
     }
 
     #[test]
     fn ascii_flag_narrows_the_digit_category() {
-        let mut flags = Flags::default();
-        flags.ascii = true;
+        let flags = Flags {
+            ascii: true,
+            ..Flags::default()
+        };
         let intervals = node_intervals(&Op::Category(Category::Digit), flags);
         assert!(intervals.contains(u32::from('5')));
         assert!(!intervals.contains(0x0660));
@@ -534,10 +533,7 @@ mod tests {
 
     #[test]
     fn in_intervals_negates_after_the_member_union() {
-        let items = vec![
-            ClassItem::Negate,
-            ClassItem::Literal(u32::from('a')),
-        ];
+        let items = vec![ClassItem::Negate, ClassItem::Literal(u32::from('a'))];
         let intervals = in_intervals(&items, Flags::default());
         assert!(intervals.contains(u32::from('b')));
         assert!(!intervals.contains(u32::from('a')));

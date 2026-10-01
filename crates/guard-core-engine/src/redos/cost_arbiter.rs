@@ -11,11 +11,11 @@
 use std::sync::LazyLock;
 use std::time::Instant;
 
-use super::child::{run_child_request, ChildOutcome, ChildRequest, ChildSpawnError};
+use super::child::{ChildOutcome, ChildRequest, ChildSpawnError, run_child_request};
 use super::prefilters::first_structural_safety_violation;
 use super::probe_batches::{
-    decode_reach_timing, probe_set_digest, valid_timing_rows, ReachProbeTiming,
-    REACH_PROBE_BATCH_SIZE,
+    REACH_PROBE_BATCH_SIZE, ReachProbeTiming, decode_reach_timing, probe_set_digest,
+    valid_timing_rows,
 };
 use super::probe_fill::reach_probe_candidate_builders;
 use super::reach_probe::synthesize_reaching_probe;
@@ -84,8 +84,7 @@ pub fn reference_scan_seconds() -> f64 {
 /// Reference `_load_factor`.
 #[must_use]
 pub fn load_factor(reference_seconds: f64) -> f64 {
-    (reference_seconds / reference_scan_seconds())
-        .clamp(LOAD_FACTOR_FLOOR, LOAD_FACTOR_CEILING)
+    (reference_seconds / reference_scan_seconds()).clamp(LOAD_FACTOR_FLOOR, LOAD_FACTOR_CEILING)
 }
 
 /// Host load factor measured in a killable child; fails open to 1.0.
@@ -181,12 +180,7 @@ pub fn time_reach_probes_ascending(
     let mut samples_by_size: Vec<Vec<f64>> = Vec::new();
     let mut load_factor_min = LOAD_FACTOR_CEILING;
     for probe in probes {
-        let timing = time_single_reach_probe_subprocess(
-            pattern,
-            probe,
-            deadline,
-            flags,
-        )?;
+        let timing = time_single_reach_probe_subprocess(pattern, probe, deadline, flags)?;
         samples_by_size.extend(timing.samples_by_size);
         load_factor_min = load_factor_min.min(timing.load_factor);
     }
@@ -197,7 +191,8 @@ pub fn time_reach_probes_ascending(
 }
 
 /// The timing strategy signature.
-pub type TimeProbes<'a> = &'a dyn Fn(&str, Vec<String>, Instant, super::ast::Flags) -> Option<ReachProbeTiming>;
+pub type TimeProbes<'a> =
+    &'a dyn Fn(&str, Vec<String>, Instant, super::ast::Flags) -> Option<ReachProbeTiming>;
 
 pub(crate) enum TimingStrategy {
     Combined,
@@ -234,12 +229,8 @@ fn run_with_strategy(
     flags: super::ast::Flags,
 ) -> Option<ReachProbeTiming> {
     match strategy {
-        TimingStrategy::Combined => {
-            time_reach_probes_subprocess(pattern, probes, deadline, flags)
-        }
-        TimingStrategy::Ascending => {
-            time_reach_probes_ascending(pattern, probes, deadline, flags)
-        }
+        TimingStrategy::Combined => time_reach_probes_subprocess(pattern, probes, deadline, flags),
+        TimingStrategy::Ascending => time_reach_probes_ascending(pattern, probes, deadline, flags),
     }
 }
 
@@ -276,14 +267,17 @@ pub fn reach_probe_verdict_from_samples(
     };
     let doublings = (cap.max(1) as f64 / REACH_PROBE_SIZES[3] as f64).log2();
     let extrapolated = min_32 * ratio.powf(doublings);
-    (extrapolated > REACH_PROBE_BUDGET_SECONDS, OverBudget {
-        cap,
-        extrapolated,
-        ratio,
-        min_32,
-        median_32,
-        load_factor: load,
-    })
+    (
+        extrapolated > REACH_PROBE_BUDGET_SECONDS,
+        OverBudget {
+            cap,
+            extrapolated,
+            ratio,
+            min_32,
+            median_32,
+            load_factor: load,
+        },
+    )
 }
 
 /// The human-readable over-budget reason (reference `_reach_probe_cost_reason`).
@@ -342,8 +336,7 @@ fn unique_probe_sets(
     let mut seen: Vec<[u8; 32]> = Vec::new();
     let mut sets: Vec<Vec<String>> = Vec::new();
     for builder in builders {
-        let probes: Vec<String> =
-            probe_sizes.iter().map(|size| builder(*size)).collect();
+        let probes: Vec<String> = probe_sizes.iter().map(|size| builder(*size)).collect();
         let digest = probe_set_digest(&probes);
         if seen.contains(&digest) {
             continue;
@@ -354,10 +347,7 @@ fn unique_probe_sets(
     sets
 }
 
-fn stride_sampled_probe_sets(
-    probe_sets: Vec<Vec<String>>,
-    cap: usize,
-) -> Vec<Vec<String>> {
+fn stride_sampled_probe_sets(probe_sets: Vec<Vec<String>>, cap: usize) -> Vec<Vec<String>> {
     let total = probe_sets.len();
     if total <= cap {
         return probe_sets;
@@ -385,15 +375,12 @@ pub fn reach_probe_cost_verdict(
     if synthesize_reaching_probe(pattern).is_none() {
         return CostOutcome::Unreachable;
     }
-    let builders =
-        match reach_probe_candidate_builders(pattern, flags, Some(deadline)) {
-            Ok(builders) => builders,
-            Err(BuilderTimeout(message)) => {
-                return CostOutcome::BuilderDeadline(
-                    structural_violation.unwrap_or(message),
-                );
-            }
-        };
+    let builders = match reach_probe_candidate_builders(pattern, flags, Some(deadline)) {
+        Ok(builders) => builders,
+        Err(BuilderTimeout(message)) => {
+            return CostOutcome::BuilderDeadline(structural_violation.unwrap_or(message));
+        }
+    };
     if remaining_budget(deadline) <= 0.0 {
         return CostOutcome::BuilderDeadline(
             "Pattern validation probe construction exceeded its deadline".into(),
@@ -427,17 +414,13 @@ fn first_over_budget_reason(
     bounded_repeat_risk: bool,
 ) -> Option<CostOutcome> {
     let strategy = timing_strategy(structural_violation, bounded_repeat_risk);
-    let probe_sizes = reach_probe_sizes_for_strategy(
-        structural_violation,
-        bounded_repeat_risk,
-    );
+    let probe_sizes = reach_probe_sizes_for_strategy(structural_violation, bounded_repeat_risk);
     let probe_sets = stride_sampled_probe_sets(
         unique_probe_sets(builders, &probe_sizes),
         MAX_TIMED_PROBE_SETS,
     );
-    let time_probes = |probes: Vec<String>| {
-        run_with_strategy(&strategy, pattern, probes, deadline, flags)
-    };
+    let time_probes =
+        |probes: Vec<String>| run_with_strategy(&strategy, pattern, probes, deadline, flags);
     if structural_violation.is_none()
         && !bounded_repeat_risk
         && builders.len() >= REACH_PROBE_BATCH_SIZE
@@ -447,10 +430,8 @@ fn first_over_budget_reason(
         // streams batches lazily).
         for batch in probe_sets.chunks(REACH_PROBE_BATCH_SIZE) {
             let flattened: Vec<String> = batch.concat();
-            let validated = valid_timing_rows(
-                time_probes(flattened.clone()).as_ref(),
-                flattened.len(),
-            );
+            let validated =
+                valid_timing_rows(time_probes(flattened.clone()).as_ref(), flattened.len());
             let Some((rows, load)) = validated else {
                 return batch_timeout_outcome(structural_violation);
             };
@@ -473,19 +454,11 @@ fn first_over_budget_reason(
         return None;
     }
     for probes in probe_sets {
-        let validated =
-            valid_timing_rows(time_probes(probes.clone()).as_ref(), probes.len());
+        let validated = valid_timing_rows(time_probes(probes.clone()).as_ref(), probes.len());
         let Some((rows, load)) = validated else {
             return batch_timeout_outcome(structural_violation);
         };
-        if let Some(outcome) = verdict_for_set(
-            &probes,
-            &rows,
-            load,
-            cap,
-            deadline,
-            &time_probes,
-        ) {
+        if let Some(outcome) = verdict_for_set(&probes, &rows, load, cap, deadline, &time_probes) {
             return Some(outcome);
         }
     }
@@ -513,10 +486,7 @@ fn verdict_for_set(
 ) -> Option<CostOutcome> {
     let (mut over, mut over_budget) = reach_probe_verdict_from_samples(rows, cap, load);
     if over && remaining_budget(deadline) > 0.0 {
-        let retry = valid_timing_rows(
-            time_probes(probes.to_vec()).as_ref(),
-            probes.len(),
-        );
+        let retry = valid_timing_rows(time_probes(probes.to_vec()).as_ref(), probes.len());
         if let Some((retry_rows, retry_load)) = retry {
             let (retry_over, retry_budget) =
                 reach_probe_verdict_from_samples(&retry_rows, cap, retry_load);
@@ -573,9 +543,7 @@ pub(crate) fn run_pattern_safety_probe(
                 TestStringsOutcome::CompileFailed(reason)
             }
         }
-        Ok(_) => TestStringsOutcome::SpawnFailed(
-            "unexpected child outcome".to_owned(),
-        ),
+        Ok(_) => TestStringsOutcome::SpawnFailed("unexpected child outcome".to_owned()),
     }
 }
 
@@ -583,13 +551,6 @@ pub(crate) fn run_pattern_safety_probe(
 mod tests {
     use super::*;
     use crate::redos::ast::Flags;
-
-    fn timing(rows: Vec<Vec<f64>>, load: f64) -> ReachProbeTiming {
-        ReachProbeTiming {
-            samples_by_size: rows,
-            load_factor: load,
-        }
-    }
 
     #[test]
     fn load_factor_is_one_on_the_reference_host() {
@@ -620,20 +581,14 @@ mod tests {
     #[test]
     fn scaled_deadline_scales_with_load_and_respects_the_ceiling() {
         let combined = reach_probe_combined_timeout_seconds();
-        assert_eq!(
-            scaled_probe_deadline_seconds(LOAD_FACTOR_FLOOR),
-            combined
-        );
+        assert_eq!(scaled_probe_deadline_seconds(LOAD_FACTOR_FLOOR), combined);
         assert!((scaled_probe_deadline_seconds(1.0) - combined).abs() < 1e-9);
         assert!((scaled_probe_deadline_seconds(2.0) - 2.0 * combined).abs() < 1e-9);
         assert_eq!(
             scaled_probe_deadline_seconds(LOAD_FACTOR_CEILING),
             REACH_PROBE_DEADLINE_SCALE_CEILING_SECONDS
         );
-        assert_eq!(
-            reach_verdict_probe_sizes(),
-            vec![16000, 32000]
-        );
+        assert_eq!(reach_verdict_probe_sizes(), vec![16000, 32000]);
     }
 
     #[test]
@@ -644,8 +599,7 @@ mod tests {
             vec![0.004; 5],
             vec![0.008; 5],
         ];
-        let (over, over_budget) =
-            reach_probe_verdict_from_samples(&linear, 512, 1.0);
+        let (over, over_budget) = reach_probe_verdict_from_samples(&linear, 512, 1.0);
         assert!(!over);
         assert!((over_budget.ratio - 2.0).abs() < 1e-9);
         assert!(over_budget.extrapolated < 0.008);
@@ -661,11 +615,8 @@ mod tests {
             vec![0.016; 5],
             vec![0.064; 5],
         ];
-        let (over, over_budget) = reach_probe_verdict_from_samples(
-            &quadratic,
-            PATTERN_SAFETY_DEFAULT_CAP,
-            1.0,
-        );
+        let (over, over_budget) =
+            reach_probe_verdict_from_samples(&quadratic, PATTERN_SAFETY_DEFAULT_CAP, 1.0);
         assert!(over);
         assert!((over_budget.ratio - 4.0).abs() < 1e-9);
         assert!(over_budget.extrapolated > REACH_PROBE_BUDGET_SECONDS);
@@ -679,8 +630,7 @@ mod tests {
             vec![0.010; 5],
             vec![0.006; 5],
         ];
-        let (over, over_budget) =
-            reach_probe_verdict_from_samples(&non_monotonic, 512, 1.0);
+        let (over, over_budget) = reach_probe_verdict_from_samples(&non_monotonic, 512, 1.0);
         assert!((over_budget.ratio - 1.0).abs() < 1e-9);
         assert!(!over);
         assert!((over_budget.extrapolated - over_budget.min_32).abs() < 1e-12);
@@ -757,8 +707,10 @@ mod tests {
             reach_probe_unreachable_reason(Some("some structural reason")),
             "some structural reason"
         );
-        assert!(reach_probe_unreachable_reason(None)
-            .starts_with("Pattern validation probe could not construct"));
+        assert!(
+            reach_probe_unreachable_reason(None)
+                .starts_with("Pattern validation probe could not construct")
+        );
     }
 
     #[test]
@@ -771,13 +723,19 @@ mod tests {
             timing_strategy(None, true),
             TimingStrategy::Ascending
         ));
-        assert!(matches!(timing_strategy(None, false), TimingStrategy::Combined));
+        assert!(matches!(
+            timing_strategy(None, false),
+            TimingStrategy::Combined
+        ));
         // Sizes widen for flagged patterns.
         assert_eq!(
             reach_probe_sizes_for_strategy(Some("x"), false),
             REACH_PROBE_SIZES.to_vec()
         );
-        assert_eq!(reach_probe_sizes_for_strategy(None, false), vec![16000, 32000]);
+        assert_eq!(
+            reach_probe_sizes_for_strategy(None, false),
+            vec![16000, 32000]
+        );
     }
 
     #[test]
@@ -874,8 +832,7 @@ mod tests {
 
     #[test]
     fn test_strings_probe_reports_compile_failures() {
-        let outcome =
-            run_pattern_safety_probe("[invalid", vec!["a".to_owned()], Flags::default());
+        let outcome = run_pattern_safety_probe("[invalid", vec!["a".to_owned()], Flags::default());
         assert!(matches!(outcome, TestStringsOutcome::CompileFailed(_)));
     }
 
@@ -885,8 +842,7 @@ mod tests {
             .map(|index| vec![format!("p{index}"), format!("p{index}!")])
             .collect();
         let sampled = stride_sampled_probe_sets(probe_sets.clone(), 512);
-        let expected: Vec<Vec<String>> =
-            probe_sets.iter().step_by(3).cloned().collect();
+        let expected: Vec<Vec<String>> = probe_sets.iter().step_by(3).cloned().collect();
         assert_eq!(sampled, expected);
         assert_eq!(
             stride_sampled_probe_sets(probe_sets[..512].to_vec(), 512).len(),
@@ -919,8 +875,7 @@ mod tests {
 
     #[test]
     fn cost_verdict_reports_unreachable_probes() {
-        let outcome =
-            reach_probe_cost_verdict(r"[^\x00-\U0010FFFF]+", None, Flags::default());
+        let outcome = reach_probe_cost_verdict(r"[^\x00-\U0010FFFF]+", None, Flags::default());
         assert_eq!(outcome, CostOutcome::Unreachable);
     }
 

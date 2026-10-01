@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use super::intervals::IntervalSet;
-use super::parse_slots::{pattern_slots, PairingAtom, Slot};
+use super::parse_slots::{PairingAtom, Slot, pattern_slots};
 use super::timeout::BuilderTimeout;
 
 /// Reference `_LARGE_BOUNDED_REPEAT_LIMIT`.
@@ -22,12 +22,8 @@ fn is_large_bounded_repeat(slot: &Slot) -> bool {
 
 fn can_repeat(slot: &Slot) -> bool {
     match slot {
-        Slot::Pairing(atom) => {
-            atom.unbounded || atom.max_repeat.is_some_and(|max| max > 1)
-        }
-        Slot::NonPairing(non) => {
-            non.unbounded || non.max_repeat.is_some_and(|max| max > 1)
-        }
+        Slot::Pairing(atom) => atom.unbounded || atom.max_repeat.is_some_and(|max| max > 1),
+        Slot::NonPairing(non) => non.unbounded || non.max_repeat.is_some_and(|max| max > 1),
     }
 }
 
@@ -164,8 +160,8 @@ mod tests {
 
     #[test]
     fn repeated_characters_drive_the_fills() {
-        let fills = repeat_alphabet_fills(r"'(\w+)\1", Flags::default(), None, false)
-            .expect("fills");
+        let fills =
+            repeat_alphabet_fills(r"'(\w+)\1", Flags::default(), None, false).expect("fills");
         // The repeated word characters contribute their first member.
         assert!(!fills.is_empty());
         assert!(fills.iter().any(|fill| fill == "0"));
@@ -173,25 +169,21 @@ mod tests {
 
     #[test]
     fn patterns_without_repeats_have_no_fills() {
-        let fills =
-            repeat_alphabet_fills("abc", Flags::default(), None, false).expect("fills");
+        let fills = repeat_alphabet_fills("abc", Flags::default(), None, false).expect("fills");
         assert!(fills.is_empty());
     }
 
     #[test]
     fn parse_failures_yield_no_fills() {
-        let fills =
-            repeat_alphabet_fills("[oops", Flags::default(), None, false).expect("fills");
+        let fills = repeat_alphabet_fills("[oops", Flags::default(), None, false).expect("fills");
         assert!(fills.is_empty());
     }
 
     #[test]
     fn include_prefix_collects_unrepeated_atoms_too() {
-        let without =
-            repeat_alphabet_fills(r"a\d", Flags::default(), None, false).expect("fills");
+        let without = repeat_alphabet_fills(r"a\d", Flags::default(), None, false).expect("fills");
         assert!(without.is_empty());
-        let with =
-            repeat_alphabet_fills(r"a\d", Flags::default(), None, true).expect("fills");
+        let with = repeat_alphabet_fills(r"a\d", Flags::default(), None, true).expect("fills");
         assert!(!with.is_empty());
     }
 
@@ -221,8 +213,7 @@ mod tests {
     #[test]
     fn can_repeat_covers_both_slot_kinds() {
         // Exercised through fills: unbounded and max>1 atoms split regions.
-        let fills = repeat_alphabet_fills(r"\d\w", Flags::default(), None, true)
-            .expect("fills");
+        let fills = repeat_alphabet_fills(r"\d\w", Flags::default(), None, true).expect("fills");
         assert!(fills.contains(&"0".to_owned()));
     }
 }

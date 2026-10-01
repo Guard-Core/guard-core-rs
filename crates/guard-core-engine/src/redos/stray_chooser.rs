@@ -6,17 +6,16 @@
 
 use std::time::Instant;
 
-use super::child::{run_child_request, ChildRequest, ChildSpawnError};
+use super::child::{ChildRequest, ChildSpawnError, run_child_request};
 use super::intervals::IntervalSet;
-use super::parse_slots::{pattern_slots, PairingAtom, Slot};
+use super::parse_slots::{PairingAtom, Slot, pattern_slots};
 use super::structure::find_group_end;
 use super::timeout::BuilderTimeout;
 
 const REACH_PROBE_STRAY_BYTE: char = '\0';
 const LEADING_PREFIX_METACHARS: &str = ".^$*+?{}[]()|\\";
 const STRAY_FALLBACK_CANDIDATES: &[&str] = &[
-    "\u{0}", "z", "\n", " ", "-", "\t", "\r", "9", "!", "~", "_", ".", "A", "\u{1f}",
-    "\u{7f}", "/",
+    "\u{0}", "z", "\n", " ", "-", "\t", "\r", "9", "!", "~", "_", ".", "A", "\u{1f}", "\u{7f}", "/",
 ];
 const STRAY_CANDIDATE_CAP: usize = 16;
 const STRAY_VERIFY_FILL_COUNTS: &[usize] = &[1, 2, 8];
@@ -60,10 +59,7 @@ pub fn leading_literal_prefix(pattern: &str) -> String {
     let n = chars.len();
     while i < n {
         let c = chars[i];
-        if c == '\\'
-            && i + 1 < n
-            && !chars[i + 1].is_alphanumeric()
-        {
+        if c == '\\' && i + 1 < n && !chars[i + 1].is_alphanumeric() {
             prefix.push(chars[i + 1]);
             i += 2;
             continue;
@@ -85,18 +81,15 @@ pub fn fill_to_length(prefix: &str, fill_char: &str, stray: &str, length: usize)
     }
     let body_length = length - prefix.len();
     if body_length > 1 {
-        return format!(
-            "{prefix}{}{stray}",
-            fill_char.repeat(body_length - 1)
-        );
+        return format!("{prefix}{}{stray}", fill_char.repeat(body_length - 1));
     }
     format!("{prefix}{}", fill_char.repeat(body_length))
 }
 
 fn homogeneous_unit(unit: &str) -> bool {
-    unit.chars().next().is_none_or(|first| {
-        unit.chars().all(|c| c == first)
-    })
+    unit.chars()
+        .next()
+        .is_none_or(|first| unit.chars().all(|c| c == first))
 }
 
 /// Reference `_repeat_probe_to_length`.
@@ -107,7 +100,7 @@ pub fn repeat_probe_to_length(unit: &str, length: usize, stray: &str) -> String 
     }
     let unit_len = unit.chars().count();
     let mut result: Vec<char> = unit.chars().cycle().take(length).collect();
-    if homogeneous_unit(unit) || length % unit_len == 0 {
+    if homogeneous_unit(unit) || length.is_multiple_of(unit_len) {
         // The reference appends the stray as the last character.
         let stray_char = stray.chars().next().unwrap_or(REACH_PROBE_STRAY_BYTE);
         if let Some(last) = result.last_mut() {
@@ -121,10 +114,8 @@ pub fn repeat_probe_to_length(unit: &str, length: usize, stray: &str) -> String 
 #[must_use]
 pub fn stray_for_pair(left: &IntervalSet, right: &IntervalSet) -> String {
     let member = left.union(right).complement().first_member();
-    char::from_u32(member.unwrap_or(0)).map_or_else(
-        || REACH_PROBE_STRAY_BYTE.to_string(),
-        |c| c.to_string(),
-    )
+    char::from_u32(member.unwrap_or(0))
+        .map_or_else(|| REACH_PROBE_STRAY_BYTE.to_string(), |c| c.to_string())
 }
 
 /// Reference `_first_complement_char`.
@@ -137,9 +128,7 @@ pub fn first_complement_char(intervals: &IntervalSet) -> Option<String> {
         .map(String::from)
 }
 
-fn dedup_capped_candidates<I: IntoIterator<Item = Option<String>>>(
-    candidates: I,
-) -> Vec<String> {
+fn dedup_capped_candidates<I: IntoIterator<Item = Option<String>>>(candidates: I) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
     let mut result: Vec<String> = Vec::new();
     for candidate in candidates {
@@ -222,9 +211,7 @@ pub fn build_stray_context(
     }
 }
 
-fn stray_verification_timeout(
-    ctx: &StrayContext,
-) -> Result<f64, BuilderTimeout> {
+fn stray_verification_timeout(ctx: &StrayContext) -> Result<f64, BuilderTimeout> {
     let Some(deadline) = ctx.deadline else {
         return Ok(STRAY_VERIFY_TIMEOUT_SECONDS);
     };
@@ -303,12 +290,15 @@ fn class_intersection_stray_candidates(
     right: &IntervalSet,
     pattern_union: &IntervalSet,
 ) -> Vec<String> {
-    let mut ordered: Vec<Option<String>> =
-        tail.iter().map(first_complement_char).collect();
+    let mut ordered: Vec<Option<String>> = tail.iter().map(first_complement_char).collect();
     ordered.push(first_complement_char(right));
     ordered.push(first_complement_char(&left.union(right)));
     ordered.push(first_complement_char(pattern_union));
-    ordered.extend(STRAY_FALLBACK_CANDIDATES.iter().map(|c| Some((*c).to_owned())));
+    ordered.extend(
+        STRAY_FALLBACK_CANDIDATES
+            .iter()
+            .map(|c| Some((*c).to_owned())),
+    );
     dedup_capped_candidates(ordered)
 }
 
@@ -354,17 +344,19 @@ pub fn choose_class_intersection_stray(
     right: &IntervalSet,
     tail: &[IntervalSet],
 ) -> Result<String, BuilderTimeout> {
-    let candidates =
-        class_intersection_stray_candidates(tail, left, right, &ctx.pattern_union);
+    let candidates = class_intersection_stray_candidates(tail, left, right, &ctx.pattern_union);
     let probes = stray_verify_probes(ctx, fill_char, &candidates);
     let chosen = first_bounded_forcing_candidate(ctx, &candidates, &probes)?;
     Ok(chosen.unwrap_or_else(|| stray_for_pair(left, right)))
 }
 
 fn repeat_unit_stray_candidates(pattern_union: &IntervalSet) -> Vec<String> {
-    let mut ordered: Vec<Option<String>> =
-        vec![first_complement_char(pattern_union)];
-    ordered.extend(STRAY_FALLBACK_CANDIDATES.iter().map(|c| Some((*c).to_owned())));
+    let mut ordered: Vec<Option<String>> = vec![first_complement_char(pattern_union)];
+    ordered.extend(
+        STRAY_FALLBACK_CANDIDATES
+            .iter()
+            .map(|c| Some((*c).to_owned())),
+    );
     dedup_capped_candidates(ordered)
 }
 
@@ -384,10 +376,7 @@ fn repeat_unit_verify_probes(unit: &str, candidates: &[String]) -> Vec<Vec<Strin
 }
 
 /// Reference `choose_repeat_unit_stray`.
-pub fn choose_repeat_unit_stray(
-    ctx: &StrayContext,
-    unit: &str,
-) -> Result<String, BuilderTimeout> {
+pub fn choose_repeat_unit_stray(ctx: &StrayContext, unit: &str) -> Result<String, BuilderTimeout> {
     if unit.is_empty() {
         return Ok(REACH_PROBE_STRAY_BYTE.to_string());
     }
@@ -469,7 +458,10 @@ mod tests {
 
     #[test]
     fn stray_for_pair_falls_back_to_nul_on_a_universal_union() {
-        assert_eq!(stray_for_pair(&IntervalSet::full(), &IntervalSet::full()), "\0");
+        assert_eq!(
+            stray_for_pair(&IntervalSet::full(), &IntervalSet::full()),
+            "\0"
+        );
     }
 
     #[test]
@@ -502,10 +494,7 @@ mod tests {
     #[test]
     fn choose_repeat_unit_stray_rejects_empty_units() {
         let ctx = build_stray_context("abc", Flags::default(), None);
-        assert_eq!(
-            choose_repeat_unit_stray(&ctx, "").expect("stray"),
-            "\0"
-        );
+        assert_eq!(choose_repeat_unit_stray(&ctx, "").expect("stray"), "\0");
     }
 
     #[test]
@@ -520,8 +509,8 @@ mod tests {
     fn choose_class_intersection_stray_prefers_tail_complements() {
         let pattern = r"\s*[\s\S]+[\x00-\x08]";
         let flags = Flags::ignorecase_multiline();
-        let slots = crate::redos::parse_slots::pattern_slots(pattern, flags)
-            .expect("pattern parses");
+        let slots =
+            crate::redos::parse_slots::pattern_slots(pattern, flags).expect("pattern parses");
         let Slot::Pairing(left) = &slots[0] else {
             panic!("expected pairing");
         };

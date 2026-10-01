@@ -55,15 +55,17 @@ pub fn compile(pattern: &str) -> Result<Regex, regex::Error> {
 }
 
 /// Check whether a pattern is safe from catastrophic backtracking with the
-/// full reference safety chain (dangerous constructs, compile check,
-/// structural detectors, probe synthesis, and the empirical cost arbiter).
+/// full reference safety chain.
 ///
-/// The `regex` crate is linear-time, so this certifies the pattern source
-/// the way the reference engine does: the reasons name the specific
-/// finding and match the reference's human-readable prefixes.
+/// The chain runs dangerous constructs, the compile check, the structural
+/// detectors, probe synthesis, and the empirical cost arbiter. The `regex`
+/// crate is linear-time, so this certifies the pattern source the way the
+/// reference engine does: the reasons name the specific finding and match
+/// the reference's human-readable prefixes.
 ///
 /// Prefer [`crate::redos::validate_pattern_safety`] for the structured
 /// verdict; this compat shim keeps the historic two-tuple shape.
+#[must_use]
 pub fn validate_pattern_safety(pattern: &str) -> (bool, String) {
     crate::redos::validate_pattern_safety_compat(pattern)
 }

@@ -161,16 +161,17 @@ pub fn outer_quantifier_len(text: &[char], k: usize) -> usize {
     if k < text.len() && (text[k] == '*' || text[k] == '+') {
         return 1;
     }
-    if k < text.len() && text[k] == '{' {
-        if let Some(offset) = text[k..].iter().position(|c| *c == '}') {
-            let end_brace = k + offset;
-            let brace_inner: String = text[k + 1..end_brace].iter().collect();
-            if let Some(pos) = brace_inner.find(',') {
-                // The part after the first comma must be empty: `{n,}`.
-                if brace_inner[pos + 1..].is_empty() {
-                    return end_brace - k + 1;
-                }
-            }
+    if k < text.len()
+        && text[k] == '{'
+        && let Some(offset) = text[k..].iter().position(|c| *c == '}')
+    {
+        let end_brace = k + offset;
+        let brace_inner: String = text[k + 1..end_brace].iter().collect();
+        // The part after the first comma must be empty: `{n,}`.
+        if let Some(pos) = brace_inner.find(',')
+            && brace_inner[pos + 1..].is_empty()
+        {
+            return end_brace - k + 1;
         }
     }
     0
@@ -285,16 +286,12 @@ fn iter_quantified_group_bodies_at(
 }
 
 /// Every quantified group body as `(start, end, inner)` over the source.
-pub fn iter_quantified_group_bodies(
-    pattern: &str,
-) -> StructureResult<Vec<(usize, usize, String)>> {
+pub fn iter_quantified_group_bodies(pattern: &str) -> StructureResult<Vec<(usize, usize, String)>> {
     let chars: Vec<char> = pattern.chars().collect();
-    Ok(
-        iter_quantified_group_bodies_at(&chars, 0, 0)?
-            .into_iter()
-            .map(|g| (g.start, g.end, g.inner))
-            .collect(),
-    )
+    Ok(iter_quantified_group_bodies_at(&chars, 0, 0)?
+        .into_iter()
+        .map(|g| (g.start, g.end, g.inner))
+        .collect())
 }
 
 fn chars_in_range(pattern: &str, start: usize, end: usize) -> String {
@@ -305,7 +302,7 @@ fn chars_in_range(pattern: &str, start: usize, end: usize) -> String {
 fn nested_body_is_unbounded(inner: &str) -> bool {
     let chars: Vec<char> = inner.chars().collect();
     let stripped = strip_escapes_and_char_classes(&chars);
-    if stripped.split('|').any(|b| branch_is_unbounded_single(b)) {
+    if stripped.split('|').any(branch_is_unbounded_single) {
         return true;
     }
     overlapping_literal_branches(inner)
@@ -327,9 +324,7 @@ const BROAD_SHORTHAND_ESCAPE_LETTERS: &str = "SWD";
 
 fn is_broad_char_class_inner(inner: &str) -> bool {
     if let Some(excluded) = inner.strip_prefix('^') {
-        return !excluded.contains("\\S")
-            && !excluded.contains("\\W")
-            && !excluded.contains("\\D");
+        return !excluded.contains("\\S") && !excluded.contains("\\W") && !excluded.contains("\\D");
     }
     matches!(inner, "\\s\\S" | "\\S\\s")
 }
@@ -339,7 +334,10 @@ fn broad_atom_span(pattern: &[char], i: usize) -> (usize, bool) {
     let c = pattern[i];
     let n = pattern.len();
     if c == '\\' && i + 1 < n {
-        return (i + 2, BROAD_SHORTHAND_ESCAPE_LETTERS.contains(pattern[i + 1]));
+        return (
+            i + 2,
+            BROAD_SHORTHAND_ESCAPE_LETTERS.contains(pattern[i + 1]),
+        );
     }
     if c == '[' {
         let j = skip_char_class(pattern, i);
@@ -352,10 +350,7 @@ fn broad_atom_span(pattern: &[char], i: usize) -> (usize, bool) {
     (i + 1, false)
 }
 
-fn broad_unbounded_run_at(
-    pattern: &str,
-    depth: usize,
-) -> StructureResult<(usize, Vec<String>)> {
+fn broad_unbounded_run_at(pattern: &str, depth: usize) -> StructureResult<(usize, Vec<String>)> {
     if depth > MAX_GROUP_NESTING_DEPTH {
         return Err(NestingTooDeep);
     }
@@ -474,9 +469,15 @@ mod tests {
     #[test]
     fn normalize_group_inner_variants() {
         assert_eq!(normalize_group_inner(&chars("?:ab")), Some("ab".to_owned()));
-        assert_eq!(normalize_group_inner(&chars("?P<name>x")), Some("x".to_owned()));
+        assert_eq!(
+            normalize_group_inner(&chars("?P<name>x")),
+            Some("x".to_owned())
+        );
         assert_eq!(normalize_group_inner(&chars("?P=name")), None);
-        assert_eq!(normalize_group_inner(&chars("plain")), Some("plain".to_owned()));
+        assert_eq!(
+            normalize_group_inner(&chars("plain")),
+            Some("plain".to_owned())
+        );
         let unterminated = chars("?P<name");
         assert_eq!(normalize_group_inner(&unterminated), None);
     }
@@ -612,8 +613,7 @@ mod tests {
         assert_eq!(*start, 0);
         assert_eq!(*end, 7);
         assert_eq!(inner_outer, "a(b)");
-        let bodies =
-            iter_quantified_group_bodies("(a(b)*)+").expect("parses");
+        let bodies = iter_quantified_group_bodies("(a(b)*)+").expect("parses");
         assert_eq!(bodies.len(), 2);
         // The body text is the normalized inner source (no quantifier).
         assert_eq!(bodies[0].2, "b");

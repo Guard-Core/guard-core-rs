@@ -26,9 +26,7 @@ fn wildcard_absorbs_literal(pattern: &[char], i: usize, end: usize) -> Option<St
     }
     let (literal, _literal_end) = literal_run_at(pattern, end + qlen);
     let literal_chars: Vec<char> = literal.chars().collect();
-    if literal_chars.len() < 2
-        || !literal_chars.iter().all(|c| class_chars.contains(c))
-    {
+    if literal_chars.len() < 2 || !literal_chars.iter().all(|c| class_chars.contains(c)) {
         return None;
     }
     let quantified: String = pattern[i..end + qlen].iter().collect();

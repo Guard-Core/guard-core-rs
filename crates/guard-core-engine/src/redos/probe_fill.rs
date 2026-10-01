@@ -6,16 +6,15 @@
 use std::time::Instant;
 
 use super::ambiguous_tail::{
-    group_inner_is_ambiguous, parse_flat_quantified_atoms_with_text,
-    representative_char_for_atom,
+    group_inner_is_ambiguous, parse_flat_quantified_atoms_with_text, representative_char_for_atom,
 };
 use super::class_intersection::class_intersection_probe_units;
 use super::repeat_alphabet::repeat_alphabet_fills;
 use super::repeat_prefix::repeat_reaching_prefixes;
 use super::repeat_units::repeat_group_units;
 use super::stray_chooser::{
-    build_stray_context, choose_repeat_unit_stray, fill_to_length,
-    pattern_complement_chars, repeat_probe_to_length, StrayContext,
+    StrayContext, build_stray_context, choose_repeat_unit_stray, fill_to_length,
+    pattern_complement_chars, repeat_probe_to_length,
 };
 use super::structure::iter_quantified_group_bodies;
 use super::timeout::BuilderTimeout;
@@ -37,11 +36,10 @@ fn literal_run_builders(
     pattern: &str,
     ctx: &StrayContext,
 ) -> Result<Vec<ProbeBuilder>, BuilderTimeout> {
-    let runs: Vec<String> =
-        super::literal_runs::adversarial_literal_runs(pattern)
-            .into_iter()
-            .take(REACH_PROBE_MAX_RUN_VARIANTS)
-            .collect();
+    let runs: Vec<String> = super::literal_runs::adversarial_literal_runs(pattern)
+        .into_iter()
+        .take(REACH_PROBE_MAX_RUN_VARIANTS)
+        .collect();
     runs.into_iter()
         .map(|run| repeat_unit_builder(ctx, run))
         .collect()
@@ -79,9 +77,8 @@ fn class_intersection_builders(
         .into_iter()
         .map(|(fill_char, stray)| {
             let prefix = prefix.clone();
-            Box::new(move |length: usize| {
-                fill_to_length(&prefix, &fill_char, &stray, length)
-            }) as ProbeBuilder
+            Box::new(move |length: usize| fill_to_length(&prefix, &fill_char, &stray, length))
+                as ProbeBuilder
         })
         .collect())
 }
@@ -92,11 +89,7 @@ fn ambiguous_group_fill_unit(inner: &str) -> Option<String> {
     for (text, _optional, _unbounded, _variable) in &atoms {
         unit.push(representative_char_for_atom(text)?);
     }
-    if unit.is_empty() {
-        None
-    } else {
-        Some(unit)
-    }
+    if unit.is_empty() { None } else { Some(unit) }
 }
 
 fn ambiguous_group_fill_builders(
@@ -129,11 +122,9 @@ pub fn reach_probe_candidate_builders(
     let class_units = class_intersection_probe_units(pattern, flags, Some(&ctx), true)?;
     let group_pairs = repeat_group_units(pattern, flags, deadline)?;
     let group_strays = pattern_complement_chars(pattern, flags);
-    let prefixed_builders = group_unit_builders(
-        &group_pairs,
-        &group_strays,
-        &|unit: &str| choose_repeat_unit_stray(&ctx, unit),
-    )?;
+    let prefixed_builders = group_unit_builders(&group_pairs, &group_strays, &|unit: &str| {
+        choose_repeat_unit_stray(&ctx, unit)
+    })?;
     let mut class_prefix_units: Vec<(String, String)> = class_units.clone();
     for (fill, _stray) in &class_units {
         for stray in &group_strays {
@@ -156,7 +147,10 @@ pub fn reach_probe_candidate_builders(
         }));
     }
     builders.extend(class_intersection_builders(pattern, flags, &ctx)?);
-    builders.extend(prefixed_unit_builders(&class_prefixes, &class_prefix_units)?);
+    builders.extend(prefixed_unit_builders(
+        &class_prefixes,
+        &class_prefix_units,
+    )?);
     builders.extend(prefixed_builders);
     builders.extend(literal_run_builders(pattern, &ctx)?);
     builders.extend(reach_probe_prefix_builders(pattern, &ctx)?);
@@ -183,11 +177,7 @@ fn prefixed_repeat_probe(
         return prefix.chars().take(length).collect();
     }
     let remaining = length - prefix.chars().count();
-    let tail_length = if flood {
-        (remaining / 2).max(1)
-    } else {
-        1
-    };
+    let tail_length = if flood { (remaining / 2).max(1) } else { 1 };
     let body_length = remaining - tail_length;
     let body: String = unit.chars().cycle().take(body_length).collect();
     format!("{prefix}{body}{}", stray.repeat(tail_length))
@@ -273,9 +263,7 @@ fn group_unit_builders(
     choose_stray: &dyn Fn(&str) -> Result<String, BuilderTimeout>,
 ) -> Result<Vec<ProbeBuilder>, BuilderTimeout> {
     let mut builders: Vec<ProbeBuilder> = Vec::new();
-    for (prefix, unit, stray) in
-        group_probe_candidates(group_pairs, strays, choose_stray)?
-    {
+    for (prefix, unit, stray) in group_probe_candidates(group_pairs, strays, choose_stray)? {
         for flood in [false, true] {
             let prefix = prefix.clone();
             let unit = unit.clone();
@@ -313,11 +301,9 @@ mod tests {
 
     #[test]
     fn prefixed_unit_builders_emit_flood_variants() {
-        let builders = prefixed_unit_builders(
-            &["".to_owned()],
-            &[("ab".to_owned(), "\0".to_owned())],
-        )
-        .expect("builders");
+        let builders =
+            prefixed_unit_builders(&["".to_owned()], &[("ab".to_owned(), "\0".to_owned())])
+                .expect("builders");
         assert_eq!(builders.len(), 2);
         assert_eq!(builders[0](4), "aba\0");
         assert_eq!(builders[1](4), "ab\0\0");
@@ -326,8 +312,7 @@ mod tests {
     #[test]
     fn prefixed_unit_builders_empty_prefixes_is_empty() {
         let builders =
-            prefixed_unit_builders(&[], &[("ab".to_owned(), "\0".to_owned())])
-                .expect("builders");
+            prefixed_unit_builders(&[], &[("ab".to_owned(), "\0".to_owned())]).expect("builders");
         assert!(builders.is_empty());
     }
 
@@ -349,9 +334,7 @@ mod tests {
     fn group_probe_candidates_cover_prefixed_and_bare_units() {
         let pairs = vec![("".to_owned(), "ab".to_owned())];
         let strays = vec!["z".to_owned()];
-        let choose = |_unit: &str| -> Result<String, BuilderTimeout> {
-            Ok("\0".to_owned())
-        };
+        let choose = |_unit: &str| -> Result<String, BuilderTimeout> { Ok("\0".to_owned()) };
         let candidates = group_probe_candidates(&pairs, &strays, &choose).expect("candidates");
         assert_eq!(
             candidates,
@@ -367,10 +350,8 @@ mod tests {
         let pairs: Vec<(String, String)> = (0..9000)
             .map(|index| (format!("p{index}"), "ab".to_owned()))
             .collect();
-        let choose =
-            |_unit: &str| -> Result<String, BuilderTimeout> { Ok("\0".to_owned()) };
-        let error = group_probe_candidates(&pairs, &[], &choose)
-            .expect_err("budget exceeded");
+        let choose = |_unit: &str| -> Result<String, BuilderTimeout> { Ok("\0".to_owned()) };
+        let error = group_probe_candidates(&pairs, &[], &choose).expect_err("budget exceeded");
         assert_eq!(
             error.0,
             "Pattern validation group-probe candidate budget exceeded"
@@ -380,8 +361,7 @@ mod tests {
     #[test]
     fn group_unit_builders_emit_flood_variants() {
         let pairs = vec![("".to_owned(), "ab".to_owned())];
-        let choose =
-            |_unit: &str| -> Result<String, BuilderTimeout> { Ok("\0".to_owned()) };
+        let choose = |_unit: &str| -> Result<String, BuilderTimeout> { Ok("\0".to_owned()) };
         let builders = group_unit_builders(&pairs, &[], &choose).expect("builders");
         assert_eq!(builders.len(), 2);
     }
@@ -389,12 +369,8 @@ mod tests {
     #[test]
     fn event_handler_builders_produce_full_length_probes() {
         let pattern = r"(?:<[^<>]*[\s/]+on\w+\s*=)";
-        let builders = reach_probe_candidate_builders(
-            pattern,
-            Flags::ignorecase_multiline(),
-            None,
-        )
-        .expect("builders");
+        let builders = reach_probe_candidate_builders(pattern, Flags::ignorecase_multiline(), None)
+            .expect("builders");
         assert!(!builders.is_empty());
         for builder in &builders {
             assert_eq!(builder(4000).chars().count(), 4000);
@@ -411,8 +387,7 @@ mod tests {
     #[test]
     fn ambiguous_group_fill_builders_append_for_ambiguous_groups() {
         let ctx = ctx_for(r"(a?)+");
-        let builders =
-            ambiguous_group_fill_builders(r"(a?)+", &ctx).expect("builders");
+        let builders = ambiguous_group_fill_builders(r"(a?)+", &ctx).expect("builders");
         assert_eq!(builders.len(), 1);
         assert!(builders[0](10).starts_with('a'));
     }
