@@ -572,4 +572,30 @@ mod tests {
         assert_eq!(events.len(), 1, "the reference emits on the truthy answer");
         assert_eq!(events[0].metadata["validator_name"], "flagger");
     }
+
+    #[test]
+    fn passive_mode_flips_the_validator_event_action() {
+        let (log, bus) = recording_bus();
+        let stage = CustomChecksStage::builder()
+            .validators_resolver(Arc::new(|_path| {
+                Some(vec![(
+                    String::from("passive_gate"),
+                    Arc::new(|_ctx: &CustomRequestContext<'_>| {
+                        Some(ValidatorAnswer::Response(CustomResponse {
+                            status: Some(403),
+                        }))
+                    }) as CustomValidatorFn,
+                )])
+            }))
+            .passive_mode(true)
+            .events(bus)
+            .build();
+        // Passive mode never blocks but still emits, with the flipped
+        // action (the reference emits in both modes).
+        assert!(stage.decide_custom_validators("/x", "GET", None).is_none());
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action_taken, "logged_only");
+        assert_eq!(events[0].metadata["validator_name"], "passive_gate");
+    }
 }

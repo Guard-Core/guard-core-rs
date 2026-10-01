@@ -651,6 +651,45 @@ mod tests {
         assert_eq!(events[0].event_type, EVENT_HTTPS_ENFORCED);
     }
 
+    #[test]
+    fn the_sensitive_sets_redact_the_emitted_redirect_target() {
+        // The `sensitive` builder seam feeds the `redirect_url` and
+        // `endpoint` redaction the reference event carries: an extra
+        // param name nobody defaults to still redacts its value.
+        let (log, bus) = recording_bus();
+        let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+            .enforce_https(true)
+            .sensitive(SensitiveNames::new(
+                None,
+                Some(&std::collections::HashSet::from([String::from(
+                    "guard_test_param",
+                )])),
+                None,
+            ))
+            .events(bus)
+            .build()
+            .expect("valid");
+        stage
+            .decide(
+                "/x?guard_test_param=leaked",
+                "http",
+                None,
+                None,
+                "https://host.example/x?guard_test_param=leaked",
+            )
+            .expect("redirected");
+        let events = log.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].metadata["redirect_url"],
+            serde_json::json!("https://host.example/x?guard_test_param=[REDACTED]")
+        );
+        assert_eq!(
+            events[0].endpoint.as_deref(),
+            Some("/x?guard_test_param=[REDACTED]")
+        );
+    }
+
     /// The future the plumbing tests drive.
     fn block_on<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
