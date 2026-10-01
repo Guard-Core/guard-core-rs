@@ -77,6 +77,14 @@ mod tests {
     use super::*;
     use crate::redos::ast::Flags;
     use crate::redos::parse_slots::{NonPairingSlot, pattern_slots};
+
+    /// Destructure a pairing slot; panics on any other variant.
+    fn expect_pairing(slot: &Slot) -> &PairingAtom {
+        match slot {
+            Slot::Pairing(atom) => atom,
+            other => panic!("expected pairing, got {other:?}"),
+        }
+    }
     use exact_overlap_fill_raw as exact_overlap_fill;
     use narrow_exact_state_raw as narrow_exact_state;
 
@@ -130,9 +138,7 @@ mod tests {
     #[test]
     fn isolated_alternative_skips_a_zero_admitting_atom() {
         let pattern_slots_vec = slots("a*");
-        let Slot::Pairing(atom) = &pattern_slots_vec[0] else {
-            panic!("expected pairing atom");
-        };
+        let atom = expect_pairing(&pattern_slots_vec[0]);
         let zero_atom = PairingAtom {
             allows_zero: true,
             ..atom.clone()
@@ -144,10 +150,8 @@ mod tests {
     #[test]
     fn isolated_alternative_narrows_through_a_mandatory_atom() {
         let pattern_slots_vec = slots("z");
-        let state = isolated_alternative_exact_state(&[pattern_slots_vec[0].clone()], 0);
-        let Some(state) = state else {
-            panic!("expected a state");
-        };
+        let state = isolated_alternative_exact_state(&[pattern_slots_vec[0].clone()], 0)
+            .expect("expected a state");
         assert!(state.contains(u32::from('z')));
         assert!(!state.contains(u32::from('y')));
     }
@@ -182,10 +186,8 @@ mod tests {
     #[test]
     fn isolated_alternative_recurses_into_a_nested_group() {
         let pattern_slots_vec = slots("(z)");
-        let state = isolated_alternative_exact_state(&[pattern_slots_vec[0].clone()], 0);
-        let Some(state) = state else {
-            panic!("expected a state");
-        };
+        let state = isolated_alternative_exact_state(&[pattern_slots_vec[0].clone()], 0)
+            .expect("expected a state");
         assert!(state.contains(u32::from('z')));
         assert!(!state.contains(u32::from('y')));
     }
@@ -237,10 +239,9 @@ mod tests {
         let a = slots("a");
         let b = slots("b");
         let state = isolated_group_exact_state(&[a.clone(), b.clone()], 0);
-        let expected = match (a[0].clone(), b[0].clone()) {
-            (Slot::Pairing(left), Slot::Pairing(right)) => left.intervals.union(&right.intervals),
-            _ => panic!("expected pairing atoms"),
-        };
+        let expected = expect_pairing(&a[0])
+            .intervals
+            .union(&expect_pairing(&b[0]).intervals);
         assert_eq!(state, Some(expected));
     }
 
@@ -257,5 +258,17 @@ mod tests {
             isolated_group_exact_state(&[vec![hard.clone()], vec![hard]], 0),
             None
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected pairing")]
+    fn expect_pairing_rejects_other_variants() {
+        let _ = expect_pairing(&Slot::NonPairing(NonPairingSlot {
+            is_boundary: false,
+            inner: None,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        }));
     }
 }

@@ -600,4 +600,90 @@ mod tests {
             repeat_reaching_prefixes("[oops", Flags::default(), None, false).expect("empty");
         assert!(prefixes.is_empty());
     }
+
+    #[test]
+    fn check_deadline_maps_all_three_states() {
+        assert!(check_deadline(None).is_ok());
+        assert!(check_deadline(Some(Instant::now() + std::time::Duration::from_secs(60))).is_ok());
+        let error = check_deadline(Some(Instant::now() - std::time::Duration::from_secs(1)))
+            .expect_err("expired");
+        assert_eq!(
+            error.0,
+            "Pattern validation repeat-prefix construction exceeded its deadline"
+        );
+    }
+
+    #[test]
+    fn assertion_witnesses_reject_unresolved_nested_assertions() {
+        let (ops, _) = crate::redos::ast::parse("a(?=x)", Flags::default())
+            .map_err(|_| BuilderTimeout("parse error".into()))
+            .expect("parses");
+        let error = assertion_witnesses(&ops, Flags::default(), None).expect_err("pending");
+        assert_eq!(
+            error.0,
+            "Pattern validation cannot resolve nested assertion constraints"
+        );
+    }
+
+    #[test]
+    fn collected_prefixes_honor_the_candidate_budget() {
+        // Seed the collector past its budget; the very next collected
+        // repeat must trip the guard.
+        let (ops, flags) = crate::redos::ast::parse("x+", Flags::default())
+            .map_err(|_| BuilderTimeout("parse error".into()))
+            .expect("parses");
+        let mut prefixes = vec![String::new(); REPEAT_PREFIX_STATE_LIMIT * 4 + 1];
+        let mut walker = PrefixWalk {
+            flags,
+            prefixes: &mut prefixes,
+            deadline: None,
+            collect: true,
+            alphabet: Vec::new(),
+            repeat_collector: None,
+            canonical_optionals: true,
+            require_reachable: false,
+        };
+        let error = walker
+            .walk(&ops, vec![RepeatPrefixState::default()], false)
+            .expect_err("budget");
+        assert_eq!(
+            error.0,
+            "Pattern validation repeat-prefix candidate budget exceeded"
+        );
+    }
+
+    #[test]
+    fn a_fixed_repeat_of_a_state_unchanging_body_stops_early() {
+        // Anchors leave the walk state untouched, so the fixed-repeat loop
+        // breaks out instead of spinning to its bound.
+        let (_prefixes, states) = walk(r"(?:\b){2}x", false, false).expect("walk");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text, "x");
+    }
+
+    #[test]
+    fn pending_assertion_states_are_replayed_after_a_repeat() {
+        // The lookahead defers pending states that the repeat loop must
+        // replay to keep the prefix language complete.
+        let (_prefixes, states) = walk(r"(?:x(?=y))+", true, false).expect("walk");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text, "x");
+    }
+
+    #[test]
+    fn a_conditional_without_else_walks_an_empty_branch() {
+        // The group was never captured, so the conditional takes the
+        // missing else branch, which contributes nothing.
+        let (_prefixes, states) = walk(r"(?(1)b)x", false, false).expect("walk");
+        let texts: Vec<String> = states.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(texts, vec!["x".to_owned()]);
+    }
+
+    #[test]
+    fn pending_replay_stops_at_a_fixed_point() {
+        // The lookahead's witness merges back into the pending state, so
+        // the replay loop detects no progress and stops.
+        let (_prefixes, states) = walk(r"(?:(?=x))+", true, false).expect("walk");
+        assert_eq!(states.len(), 1);
+    }
 }

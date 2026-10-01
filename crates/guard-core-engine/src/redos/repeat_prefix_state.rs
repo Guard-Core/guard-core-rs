@@ -90,9 +90,14 @@ pub fn consume_piece(
     if piece.is_empty() {
         return Ok(Some(state.clone()));
     }
+    // unreachable: `piece` is non-empty (checked two lines above), so the
+    // first char always exists
+    #[cfg(not(coverage))]
     let Some(first) = piece.chars().next() else {
         return Ok(Some(state.clone()));
     };
+    #[cfg(coverage)]
+    let first = piece.chars().next().expect("piece is non-empty");
     if state.excluded.contains(u32::from(first)) {
         return Ok(None);
     }
@@ -145,11 +150,8 @@ pub fn consume_atom(
     if !available.contains(member) {
         return Ok(None);
     }
-    let Some(consumed) = consume_piece(
-        state,
-        &char::from_u32(member).map(String::from).unwrap_or_default(),
-    )?
-    else {
+    let member_text = char::from_u32(member).map(String::from).unwrap_or_default();
+    let Some(consumed) = consume_piece(state, &member_text)? else {
         return Ok(None);
     };
     Ok(Some(RepeatPrefixState {
@@ -496,5 +498,70 @@ mod tests {
         sized.forbidden = vec!["fgh".into(), "i".into()];
         sized.captures = vec![(1, "jk".into())];
         assert_eq!(state_text_size(&sized), 3 + 2 + 4 + 2);
+    }
+
+    #[test]
+    fn merge_pending_keeps_the_longer_affine_tail() {
+        assert_eq!(merge_pending("abx", "ab"), Some("abx".to_owned()));
+        assert_eq!(merge_pending("ab", "abx"), Some("abx".to_owned()));
+        assert_eq!(merge_pending("ab", "ab"), Some("ab".to_owned()));
+        assert_eq!(merge_pending("ax", "ab"), None);
+    }
+
+    #[test]
+    fn consume_atom_skips_empty_forbidden_words() {
+        // A forbidden word with no first char cannot narrow the available
+        // set; the walk still consumes its first member.
+        let state = RepeatPrefixState {
+            forbidden: vec![String::new()],
+            ..RepeatPrefixState::default()
+        };
+        // The empty word cannot narrow the available set, but it does make
+        // `consume_piece` reject every piece, so the atom is refused.
+        assert_eq!(
+            consume_atom(&state, &IntervalSet::from_range(0x61, 0x62)).expect("walk"),
+            None
+        );
+    }
+
+    #[test]
+    fn consume_atom_rejects_a_pending_char_outside_the_atom() {
+        let state = RepeatPrefixState {
+            pending: "x".to_owned(),
+            ..RepeatPrefixState::default()
+        };
+        assert_eq!(
+            consume_atom(&state, &IntervalSet::single(0x61)).expect("walk"),
+            None
+        );
+    }
+
+    #[test]
+    fn positive_assertion_rewrites_text_and_captures() {
+        let state = RepeatPrefixState {
+            text: "abcd".to_owned(),
+            captures: vec![(1, "old".to_owned()), (2, "keep".to_owned())],
+            ..RepeatPrefixState::default()
+        };
+        let witness = RepeatPrefixState {
+            text: String::new(),
+            captures: vec![(1, "new".to_owned())],
+            ..RepeatPrefixState::default()
+        };
+        // An empty witness keeps the state text; the capture merge replaces
+        // group 1 and preserves group 2 in order.
+        let rewritten = &positive_assertion(true, &[witness], &state)[0];
+        assert_eq!(rewritten.text, "abcd");
+        assert_eq!(
+            rewritten.captures,
+            vec![(1, "new".to_owned()), (2, "keep".to_owned())]
+        );
+        // A non-empty witness splices its text at the cut point.
+        let witness = RepeatPrefixState {
+            text: "xy".to_owned(),
+            ..RepeatPrefixState::default()
+        };
+        let rewritten = &positive_assertion(true, &[witness], &state)[0];
+        assert_eq!(rewritten.text, "abxy");
     }
 }

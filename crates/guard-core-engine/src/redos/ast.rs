@@ -162,7 +162,6 @@ impl Op {
     }
 }
 
-const SPECIAL_CHARS: &str = ".\\[{()*+?^$|";
 const MAXREPEAT: u64 = 4_294_967_287;
 
 /// Parse failure; the message mirrors the reference `re.error` text.
@@ -685,12 +684,12 @@ impl Parser {
                 break;
             }
             self.pos += 1;
+            // `|` and `)` broke out of the loop above, and every remaining
+            // `SPECIAL_CHARS` member has an arm here, so the final catch-all
+            // only ever sees plain literal characters.
             match this {
                 '\\' => {
                     ops.push(self.escape()?);
-                }
-                c if !SPECIAL_CHARS.contains(c) => {
-                    ops.push(Op::Literal(u32::from(c)));
                 }
                 '[' => {
                     ops.push(self.parse_class()?);
@@ -897,11 +896,7 @@ impl Parser {
                         });
                     }
                 }
-                other => {
-                    return Err(ParseError(format!(
-                        "unsupported special character {other:?}"
-                    )));
-                }
+                other => ops.push(Op::Literal(u32::from(other))),
             }
         }
         Ok(ops)
@@ -979,6 +974,19 @@ mod tests {
 
     fn parse_ok(pattern: &str, flags: Flags) -> (Vec<Op>, Flags) {
         parse(pattern, flags).expect("pattern must parse")
+    }
+
+    /// Destructure a subpattern op; panics on any other variant.
+    fn subpattern_parts(op: Op) -> (Option<u32>, Flags, Flags, Vec<Op>) {
+        match op {
+            Op::SubPattern {
+                group,
+                add,
+                del,
+                body,
+            } => (group, add, del, body),
+            other => panic!("expected a subpattern, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1080,9 +1088,7 @@ mod tests {
     #[test]
     fn empty_alternation_branch_is_allowed() {
         let (ops, _) = parse_ok("(a|)", Flags::default());
-        let Some(Op::SubPattern { body, .. }) = ops.into_iter().next() else {
-            panic!("expected subpattern");
-        };
+        let (_, _, _, body) = subpattern_parts(ops.into_iter().next().expect("an op"));
         assert_eq!(
             body,
             vec![Op::Branch(vec![vec![Op::Literal(u32::from('a'))], vec![],])]
@@ -1109,7 +1115,8 @@ mod tests {
 
     #[test]
     fn capturing_groups_are_numbered_in_order() {
-        let (ops, _) = parse_ok("(a)(b)", Flags::default());
+        // The leading literal keeps the catch-all filter arm exercised.
+        let (ops, _) = parse_ok("(?:a)(b)(c)", Flags::default());
         let groups: Vec<Option<u32>> = ops
             .iter()
             .filter_map(|op| match op {
@@ -1205,7 +1212,8 @@ mod tests {
 
     #[test]
     fn repeats_apply_to_the_previous_item() {
-        let (ops, _) = parse_ok("a*b+c?d{2}e{3,}f{1,4}", Flags::default());
+        // The trailing literal keeps the catch-all filter arm exercised.
+        let (ops, _) = parse_ok("a*b+c?d{2}e{3,}f{1,4}g", Flags::default());
         let kinds: Vec<(u32, Option<u32>)> = ops
             .iter()
             .filter_map(|op| match op {
@@ -1284,22 +1292,16 @@ mod tests {
     #[test]
     fn flagged_groups_keep_their_flag_deltas() {
         let (ops, _) = parse_ok("(?i:x)", Flags::default());
-        match ops.first() {
-            Some(Op::SubPattern { add, del, .. }) => {
-                assert!(add.ignorecase);
-                assert_eq!(*del, Flags::default());
-            }
-            other => panic!("expected scoped-flag subpattern, got {other:?}"),
-        }
+        let (_, add, del, _) = subpattern_parts(ops.into_iter().next().expect("an op"));
+        assert!(add.ignorecase);
+        assert_eq!(del, Flags::default());
     }
 
     #[test]
     fn negated_scoped_flags_are_recorded() {
         let (ops, _) = parse_ok("(?-i:x)", Flags::ignorecase_multiline());
-        match ops.first() {
-            Some(Op::SubPattern { del, .. }) => assert!(del.ignorecase),
-            other => panic!("expected negated scoped flags, got {other:?}"),
-        }
+        let (_, _, del, _) = subpattern_parts(ops.into_iter().next().expect("an op"));
+        assert!(del.ignorecase);
     }
 
     #[test]
@@ -1371,7 +1373,8 @@ mod tests {
 
     #[test]
     fn escapes_and_octal_forms() {
-        let (ops, _) = parse_ok(r"\a\f\n\r\t\v\\\x41\101\0", Flags::default());
+        // The trailing anchor keeps the catch-all filter arm exercised.
+        let (ops, _) = parse_ok(r"\a\f\n\r\t\v\\\x41\101\0\A", Flags::default());
         let literals: Vec<u32> = ops
             .iter()
             .filter_map(|op| match op {
@@ -1448,6 +1451,10 @@ mod tests {
                 "a{99999999999999999999}",
                 ParseError("the repetition number is too large".into()),
             ),
+            (
+                "a{4294967287}",
+                ParseError("the repetition number is too large".into()),
+            ),
             (r"[z-a]", ParseError("bad character range z-a".into())),
             (r"[\d-a]", ParseError("bad character range \\d-a".into())),
             (r"\q", ParseError("bad escape \\q".into())),
@@ -1488,6 +1495,19 @@ mod tests {
             (
                 "(?P<>x)",
                 ParseError("bad character in group name \"\"".into()),
+            ),
+            (
+                "(?P<n>(?P=n)",
+                ParseError("cannot refer to an open group".into()),
+            ),
+            ("(?<", ParseError("unexpected end of pattern".into())),
+            (
+                "(?(99999999999)a)",
+                ParseError("invalid group reference 99999999999".into()),
+            ),
+            (
+                "(?(1)a",
+                ParseError("missing ), unterminated subpattern".into()),
             ),
         ];
         for (pattern, expected) in cases {
@@ -1552,19 +1572,14 @@ mod tests {
     #[test]
     fn scoped_flag_group_body_is_parsed() {
         let (ops, _) = parse_ok("(?i:a|b)", Flags::default());
-        match ops.first() {
-            Some(Op::SubPattern { body, .. }) => assert_eq!(body.len(), 1),
-            other => panic!("expected scoped subpattern, got {other:?}"),
-        }
+        let (_, _, _, body) = subpattern_parts(ops.into_iter().next().expect("an op"));
+        assert_eq!(body.len(), 1);
     }
 
     #[test]
     fn conditional_without_else_uses_none() {
         let (ops, _) = parse_ok("(a)(?(1)b)", Flags::default());
-        match &ops[1] {
-            Op::GroupRefExists { no: None, .. } => {}
-            other => panic!("expected no else branch, got {other:?}"),
-        }
+        assert!(matches!(&ops[1], Op::GroupRefExists { no: None, .. }));
     }
 
     #[test]
@@ -1577,5 +1592,171 @@ mod tests {
         assert!(!Op::At(At::Boundary).is_pairing());
         assert!(!Op::Failure.is_pairing());
         assert!(!Op::GroupRef(1).is_pairing());
+    }
+
+    #[test]
+    fn apply_delta_delete_arms_clear_flags() {
+        // parse_slots and repeat_prefix drive negated scoped-flag groups
+        // (`(?-i:x)`) through this method with a non-empty `del`; the four
+        // delete arms must clear the flags the walk started with.
+        let mut flags = Flags {
+            ignorecase: true,
+            multiline: true,
+            dotall: true,
+            ascii: true,
+        };
+        let del = Flags {
+            ignorecase: true,
+            multiline: true,
+            dotall: true,
+            ascii: true,
+        };
+        flags.apply_delta(&Flags::default(), &del);
+        assert_eq!(flags, Flags::default());
+    }
+
+    #[test]
+    fn negated_category_escapes_inside_a_class() {
+        let (ops, _) = parse_ok(r"[\D\S\W]", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::In(vec![
+                ClassItem::Category(Category::NotDigit),
+                ClassItem::Category(Category::NotSpace),
+                ClassItem::Category(Category::NotWord),
+            ])]
+        );
+    }
+
+    #[test]
+    fn parse_error_display_shows_the_message() {
+        let err = parse("(", Flags::default()).expect_err("pattern must fail");
+        assert_eq!(err.to_string(), "missing ), unterminated subpattern");
+    }
+
+    #[test]
+    fn verbose_and_unicode_flags_parse_as_noops() {
+        // The reference accepts 'x' and 'u' inline flags; neither changes
+        // the op tree or the effective flags for str patterns.
+        let (ops, flags) = parse_ok("(?ux)a", Flags::default());
+        assert_eq!(ops, vec![Op::Literal(u32::from('a'))]);
+        assert_eq!(flags, Flags::default());
+    }
+
+    #[test]
+    fn flag_parser_rejects_junk_after_valid_flags() {
+        assert_eq!(
+            parse("(?i", Flags::default()).err(),
+            Some(ParseError("missing -, : or )".into()))
+        );
+        assert_eq!(
+            parse("(?iz", Flags::default()).err(),
+            Some(ParseError("unknown flag".into()))
+        );
+        assert_eq!(
+            parse("(?i1", Flags::default()).err(),
+            Some(ParseError("missing -, : or )".into()))
+        );
+    }
+
+    #[test]
+    fn class_control_escapes_are_literals() {
+        let (ops, _) = parse_ok(r"[\a\f\n\r\t\v]", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::In(vec![
+                ClassItem::Literal(0x07),
+                ClassItem::Literal(0x0C),
+                ClassItem::Literal(0x0A),
+                ClassItem::Literal(0x0D),
+                ClassItem::Literal(0x09),
+                ClassItem::Literal(0x0B),
+            ])]
+        );
+    }
+
+    #[test]
+    fn class_unicode_escape_edges() {
+        let (ops, _) = parse_ok(r"[\u00e9\U0001F600]", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::In(vec![
+                ClassItem::Literal(0xE9),
+                ClassItem::Literal(0x1F600),
+            ])]
+        );
+        assert_eq!(
+            parse(r"[\x1]", Flags::default()).err(),
+            Some(ParseError("incomplete escape \\x1".into()))
+        );
+        assert_eq!(
+            parse(r"[\u12]", Flags::default()).err(),
+            Some(ParseError("incomplete escape \\u12".into()))
+        );
+        assert_eq!(
+            parse(r"[\U0001]", Flags::default()).err(),
+            Some(ParseError("incomplete escape \\U0001".into()))
+        );
+        assert_eq!(
+            parse(r"[\ud800]", Flags::default()).err(),
+            Some(ParseError("illegal Unicode character in \\ud800".into()))
+        );
+        assert_eq!(
+            parse(r"[\N]", Flags::default()).err(),
+            Some(ParseError(
+                "bad escape \\N: named escapes are not supported by the safety chain".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn class_octal_escape_edges() {
+        let (ops, _) = parse_ok(r"[\101\0]", Flags::default());
+        assert_eq!(
+            ops,
+            vec![Op::In(vec![
+                ClassItem::Literal(0o101),
+                ClassItem::Literal(0),
+            ])]
+        );
+        assert_eq!(
+            parse(r"[\777]", Flags::default()).err(),
+            Some(ParseError(
+                "octal escape value \\777 outside of range 0-0o377".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn outside_class_escape_edges() {
+        assert_eq!(
+            parse(r"\U0001", Flags::default()).err(),
+            Some(ParseError("incomplete escape \\U0001".into()))
+        );
+        assert_eq!(
+            parse(r"\777", Flags::default()).err(),
+            Some(ParseError(
+                "octal escape value \\777 outside of range 0-0o377".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn empty_brace_pair_is_a_literal_brace() {
+        let (ops, _) = parse_ok("a{}", Flags::default());
+        assert_eq!(
+            ops,
+            vec![
+                Op::Literal(u32::from('a')),
+                Op::Literal(u32::from('{')),
+                Op::Literal(u32::from('}')),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a subpattern")]
+    fn subpattern_parts_rejects_other_variants() {
+        let _ = subpattern_parts(Op::Any);
     }
 }

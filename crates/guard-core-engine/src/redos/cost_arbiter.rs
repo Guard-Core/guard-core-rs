@@ -69,17 +69,24 @@ pub fn reach_probe_combined_timeout_seconds() -> f64 {
 /// The recalibrated reference scan constant: measured once on first use
 /// under the Rust regex engine, falling back to the reference value.
 pub fn reference_scan_seconds() -> f64 {
-    static MEASURED: LazyLock<f64> = LazyLock::new(|| {
-        match run_child_request(
-            &ChildRequest::ReferenceLoad,
-            REFERENCE_LOAD_PROBE_TIMEOUT_SECONDS,
-        ) {
-            Ok(ChildOutcome::Reference { reference }) if reference > 0.0 => reference,
-            _ => REFERENCE_SCAN_FALLBACK_SECONDS,
-        }
-    });
+    static MEASURED: LazyLock<f64> = LazyLock::new(|| measured_reference_scan(&run_child_request));
     *MEASURED
 }
+
+/// The pure half of [`reference_scan_seconds`], injectable for tests.
+fn measured_reference_scan(run: ChildRunner<'_>) -> f64 {
+    match run(
+        &ChildRequest::ReferenceLoad,
+        REFERENCE_LOAD_PROBE_TIMEOUT_SECONDS,
+    ) {
+        Ok(ChildOutcome::Reference { reference }) if reference > 0.0 => reference,
+        _ => REFERENCE_SCAN_FALLBACK_SECONDS,
+    }
+}
+
+/// A killable child runner, injectable for deterministic tests.
+pub(crate) type ChildRunner<'a> =
+    &'a dyn Fn(&ChildRequest, f64) -> Result<ChildOutcome, ChildSpawnError>;
 
 /// Reference `_load_factor`.
 #[must_use]
@@ -90,7 +97,12 @@ pub fn load_factor(reference_seconds: f64) -> f64 {
 /// Host load factor measured in a killable child; fails open to 1.0.
 #[must_use]
 pub fn measure_host_load_factor() -> f64 {
-    match run_child_request(
+    measured_host_load_factor(&run_child_request)
+}
+
+/// The pure half of [`measure_host_load_factor`], injectable for tests.
+fn measured_host_load_factor(run: ChildRunner<'_>) -> f64 {
+    match run(
         &ChildRequest::ReferenceLoad,
         REFERENCE_LOAD_PROBE_TIMEOUT_SECONDS,
     ) {
@@ -367,6 +379,30 @@ pub fn reach_probe_cost_verdict(
         + std::time::Duration::from_secs_f64(scaled_probe_deadline_seconds(
             measure_host_load_factor(),
         ));
+    let structural_violation = first_structural_safety_violation(pattern);
+    let bounded_repeat_risk = has_large_bounded_repeat(pattern, flags);
+    let run: TimeProbes<'_> = &|_pattern, probes, dl, fl| {
+        run_with_strategy(
+            &timing_strategy(structural_violation.as_deref(), bounded_repeat_risk),
+            pattern,
+            probes,
+            dl,
+            fl,
+        )
+    };
+    reach_probe_cost_verdict_with_deadline(pattern, max_content_length, flags, deadline, run)
+}
+
+/// The pure half of [`reach_probe_cost_verdict`]: the deadline and the
+/// timing strategy are injected so tests can force every arm
+/// deterministically.
+pub(crate) fn reach_probe_cost_verdict_with_deadline(
+    pattern: &str,
+    max_content_length: Option<usize>,
+    flags: super::ast::Flags,
+    deadline: Instant,
+    time_probes: TimeProbes<'_>,
+) -> CostOutcome {
     let cap = max_content_length
         .filter(|length| *length > 0)
         .unwrap_or(PATTERN_SAFETY_DEFAULT_CAP);
@@ -389,7 +425,7 @@ pub fn reach_probe_cost_verdict(
     if builders.is_empty() {
         return CostOutcome::Safe;
     }
-    if let Some(over) = first_over_budget_reason(
+    if let Some(over) = first_over_budget_reason_with(
         pattern,
         &builders,
         cap,
@@ -397,6 +433,7 @@ pub fn reach_probe_cost_verdict(
         deadline,
         flags,
         bounded_repeat_risk,
+        time_probes,
     ) {
         return over;
     }
@@ -404,7 +441,7 @@ pub fn reach_probe_cost_verdict(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn first_over_budget_reason(
+fn first_over_budget_reason_with(
     pattern: &str,
     builders: &[super::probe_fill::ProbeBuilder],
     cap: usize,
@@ -412,15 +449,14 @@ fn first_over_budget_reason(
     deadline: Instant,
     flags: super::ast::Flags,
     bounded_repeat_risk: bool,
+    time_probes: TimeProbes<'_>,
 ) -> Option<CostOutcome> {
-    let strategy = timing_strategy(structural_violation, bounded_repeat_risk);
     let probe_sizes = reach_probe_sizes_for_strategy(structural_violation, bounded_repeat_risk);
     let probe_sets = stride_sampled_probe_sets(
         unique_probe_sets(builders, &probe_sizes),
         MAX_TIMED_PROBE_SETS,
     );
-    let time_probes =
-        |probes: Vec<String>| run_with_strategy(&strategy, pattern, probes, deadline, flags);
+    let run = |probes: Vec<String>| time_probes(pattern, probes, deadline, flags);
     if structural_violation.is_none()
         && !bounded_repeat_risk
         && builders.len() >= REACH_PROBE_BATCH_SIZE
@@ -430,8 +466,7 @@ fn first_over_budget_reason(
         // streams batches lazily).
         for batch in probe_sets.chunks(REACH_PROBE_BATCH_SIZE) {
             let flattened: Vec<String> = batch.concat();
-            let validated =
-                valid_timing_rows(time_probes(flattened.clone()).as_ref(), flattened.len());
+            let validated = valid_timing_rows(run(flattened.clone()).as_ref(), flattened.len());
             let Some((rows, load)) = validated else {
                 return batch_timeout_outcome(structural_violation);
             };
@@ -444,7 +479,7 @@ fn first_over_budget_reason(
                     load,
                     cap,
                     deadline,
-                    &time_probes,
+                    &run,
                 ) {
                     return Some(outcome);
                 }
@@ -454,11 +489,11 @@ fn first_over_budget_reason(
         return None;
     }
     for probes in probe_sets {
-        let validated = valid_timing_rows(time_probes(probes.clone()).as_ref(), probes.len());
+        let validated = valid_timing_rows(run(probes.clone()).as_ref(), probes.len());
         let Some((rows, load)) = validated else {
             return batch_timeout_outcome(structural_violation);
         };
-        if let Some(outcome) = verdict_for_set(&probes, &rows, load, cap, deadline, &time_probes) {
+        if let Some(outcome) = verdict_for_set(&probes, &rows, load, cap, deadline, &run) {
             return Some(outcome);
         }
     }
@@ -518,7 +553,18 @@ pub(crate) fn run_pattern_safety_probe(
     test_strings: Vec<String>,
     flags: super::ast::Flags,
 ) -> TestStringsOutcome {
-    let outcome = run_child_request(
+    run_pattern_safety_probe_with(pattern, test_strings, flags, &run_child_request)
+}
+
+/// The pure half of [`run_pattern_safety_probe`]: the child runner is
+/// injected so tests can force every outcome deterministically.
+pub(crate) fn run_pattern_safety_probe_with(
+    pattern: &str,
+    test_strings: Vec<String>,
+    flags: super::ast::Flags,
+    run: ChildRunner<'_>,
+) -> TestStringsOutcome {
+    let outcome = run(
         &ChildRequest::TestStrings {
             pattern: pattern.to_owned(),
             test_strings,
@@ -892,5 +938,304 @@ mod tests {
     fn combined_timeout_is_the_budget_ladder_product() {
         assert!((reach_probe_combined_timeout_seconds() - 40.0).abs() < 1e-9);
         assert!((REACH_PROBE_CHILD_TIMEOUT_SECONDS - 2.5).abs() < 1e-9);
+    }
+
+    /// Extract the over-budget payload; panics on any other outcome.
+    fn expect_over(outcome: CostOutcome) -> OverBudget {
+        match outcome {
+            CostOutcome::Over(over) => over,
+            other => panic!("expected an over-budget verdict, got {other:?}"),
+        }
+    }
+
+    fn failing_runner(
+        _request: &ChildRequest,
+        _timeout: f64,
+    ) -> Result<ChildOutcome, ChildSpawnError> {
+        Err(ChildSpawnError::Failed("stub".to_owned()))
+    }
+
+    fn reference_runner(
+        reference: f64,
+    ) -> impl Fn(&ChildRequest, f64) -> Result<ChildOutcome, ChildSpawnError> {
+        move |_request, _timeout| Ok(ChildOutcome::Reference { reference })
+    }
+
+    #[test]
+    fn reference_scan_falls_back_when_the_child_fails() {
+        assert_eq!(
+            measured_reference_scan(&failing_runner),
+            REFERENCE_SCAN_FALLBACK_SECONDS
+        );
+    }
+
+    #[test]
+    fn reference_scan_falls_back_on_a_nonpositive_reference() {
+        assert_eq!(
+            measured_reference_scan(&reference_runner(0.0)),
+            REFERENCE_SCAN_FALLBACK_SECONDS
+        );
+    }
+
+    #[test]
+    fn host_load_fails_open_to_one_when_the_child_fails() {
+        assert_eq!(measured_host_load_factor(&failing_runner), 1.0);
+    }
+
+    #[test]
+    fn host_load_normalizes_the_measured_reference() {
+        // reference_scan_seconds() equals the measured constant on the
+        // reference host, so a doubled measurement reads as load 2.0.
+        let doubled = reference_scan_seconds() * 2.0;
+        assert!((measured_host_load_factor(&reference_runner(doubled)) - 2.0).abs() < 1e-6);
+    }
+
+    fn stub_probes(
+        value: f64,
+    ) -> impl Fn(&str, Vec<String>, Instant, Flags) -> Option<ReachProbeTiming> {
+        move |_pattern, probes, _deadline, _flags| {
+            Some(ReachProbeTiming {
+                samples_by_size: probes.iter().map(|_| vec![value; 5]).collect(),
+                load_factor: 1.0,
+            })
+        }
+    }
+
+    fn stub_builders(count: usize) -> Vec<super::super::probe_fill::ProbeBuilder> {
+        (0..count)
+            .map(|index| {
+                Box::new(move |size: usize| {
+                    let fill = "a".repeat(size.saturating_sub(1));
+                    format!(
+                        "{}{fill}",
+                        char::from_u32(0x4E00 + index as u32).unwrap_or('x')
+                    )
+                }) as super::super::probe_fill::ProbeBuilder
+            })
+            .collect()
+    }
+
+    #[test]
+    fn builder_timeout_is_echoed_as_a_builder_deadline() {
+        let outcome = reach_probe_cost_verdict_with_deadline(
+            "a+",
+            None,
+            Flags::default(),
+            Instant::now() - std::time::Duration::from_secs(1),
+            &stub_probes(1e-9),
+        );
+        assert!(
+            matches!(outcome, CostOutcome::BuilderDeadline(_)),
+            "expected a builder deadline, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_after_builders_is_reported() {
+        // The empty pattern synthesizes a trivially reaching probe and its
+        // builder walk has nothing to walk, so synthesis completes without
+        // polling the deadline; the expired deadline is then caught right
+        // after the builders return.
+        let outcome = reach_probe_cost_verdict_with_deadline(
+            "",
+            None,
+            Flags::default(),
+            Instant::now() - std::time::Duration::from_secs(1),
+            &stub_probes(1e-9),
+        );
+        assert_eq!(
+            outcome,
+            CostOutcome::BuilderDeadline(
+                "Pattern validation probe construction exceeded its deadline".into()
+            )
+        );
+    }
+
+    #[test]
+    fn the_cost_verdict_returns_over_from_the_injected_timer() {
+        let outcome = reach_probe_cost_verdict_with_deadline(
+            "a+",
+            None,
+            Flags::default(),
+            Instant::now() + std::time::Duration::from_secs(30),
+            &stub_probes(0.1),
+        );
+        let over = expect_over(outcome);
+        assert!((over.min_32 - 0.1).abs() < 1e-9);
+        assert!((over.extrapolated - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn batched_mode_walks_every_set_when_under_budget() {
+        let outcome = first_over_budget_reason_with(
+            "a+",
+            &stub_builders(REACH_PROBE_BATCH_SIZE + 1),
+            262_144,
+            None,
+            Instant::now() + std::time::Duration::from_secs(30),
+            Flags::default(),
+            false,
+            &stub_probes(1e-9),
+        );
+        assert_eq!(outcome, None);
+    }
+
+    #[test]
+    fn batched_mode_stops_at_the_first_over_budget_set() {
+        let outcome = first_over_budget_reason_with(
+            "a+",
+            &stub_builders(REACH_PROBE_BATCH_SIZE + 1),
+            262_144,
+            None,
+            Instant::now() + std::time::Duration::from_secs(30),
+            Flags::default(),
+            false,
+            &stub_probes(0.1),
+        );
+        assert!(matches!(outcome, Some(CostOutcome::Over(_))));
+    }
+
+    #[test]
+    fn batched_mode_reports_a_deadline_when_the_child_fails() {
+        let outcome = first_over_budget_reason_with(
+            "a+",
+            &stub_builders(REACH_PROBE_BATCH_SIZE + 1),
+            262_144,
+            None,
+            Instant::now() + std::time::Duration::from_secs(30),
+            Flags::default(),
+            false,
+            &|_pattern, _probes, _deadline, _flags| None,
+        );
+        assert_eq!(
+            outcome,
+            Some(CostOutcome::BuilderDeadline(
+                "Pattern validation probe exceeded the killable-subprocess \
+                 timeout while measuring reach-probe cost at scale"
+                    .into()
+            ))
+        );
+    }
+
+    #[test]
+    fn ascending_mode_reports_structural_when_the_child_fails() {
+        // "(?:a+)+b" carries a nested-unbounded structural violation, so
+        // the walk takes the ascending strategy and, on child failure,
+        // the structural verdict stands.
+        let outcome = reach_probe_cost_verdict_with_deadline(
+            "(?:a+)+b",
+            None,
+            Flags::default(),
+            Instant::now() + std::time::Duration::from_secs(30),
+            &|_pattern, _probes, _deadline, _flags| None,
+        );
+        assert_eq!(outcome, CostOutcome::Structural);
+    }
+
+    #[test]
+    fn verdict_for_set_retries_once_and_can_flip_to_safe() {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let probes = vec!["p".to_owned(); 2];
+        let rows = vec![vec![0.1; 5]; 2];
+        // First measurement over budget, retry under: the verdict flips.
+        let calls = std::cell::Cell::new(0usize);
+        let outcome = verdict_for_set(&probes, &rows, 1.0, 262_144, deadline, &|_retry: Vec<
+            String,
+        >| {
+            calls.set(calls.get() + 1);
+            Some(ReachProbeTiming {
+                samples_by_size: vec![vec![1e-9; 5]; 2],
+                load_factor: 1.0,
+            })
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(outcome, None);
+        // Retry still over: the verdict stands with the retry payload.
+        let outcome = verdict_for_set(&probes, &rows, 1.0, 262_144, deadline, &|_retry: Vec<
+            String,
+        >| {
+            Some(ReachProbeTiming {
+                samples_by_size: vec![vec![0.2; 5]; 2],
+                load_factor: 2.0,
+            })
+        });
+        let over = expect_over(outcome.expect("an outcome"));
+        assert!((over.min_32 - 0.1).abs() < 1e-9, "retry payload wins");
+        assert!((over.load_factor - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn safety_probe_maps_every_child_outcome() {
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Err(ChildSpawnError::Timeout)
+            };
+        assert_eq!(
+            run_pattern_safety_probe_with("a", vec![], Flags::default(), &runner),
+            TestStringsOutcome::SubprocessTimeout
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Err(ChildSpawnError::Failed("spawn".to_owned()))
+            };
+        assert_eq!(
+            run_pattern_safety_probe_with("a", vec![], Flags::default(), &runner),
+            TestStringsOutcome::SpawnFailed("spawn".to_owned())
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Failed("bad pattern".to_owned()))
+            };
+        assert_eq!(
+            run_pattern_safety_probe_with("a", vec![], Flags::default(), &runner),
+            TestStringsOutcome::CompileFailed("bad pattern".to_owned())
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Safety {
+                    safe: true,
+                    reason: "Pattern appears safe".to_owned(),
+                })
+            };
+        assert_eq!(
+            run_pattern_safety_probe_with("a", vec![], Flags::default(), &runner),
+            TestStringsOutcome::Safe
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Safety {
+                    safe: false,
+                    reason: "Pattern timed out on test string of length 42".to_owned(),
+                })
+            };
+        assert_eq!(
+            run_pattern_safety_probe_with("a", vec![], Flags::default(), &runner),
+            TestStringsOutcome::SlowString(42)
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Safety {
+                    safe: false,
+                    reason: "Pattern validation failed: nope".to_owned(),
+                })
+            };
+        assert_eq!(
+            run_pattern_safety_probe_with("a", vec![], Flags::default(), &runner),
+            TestStringsOutcome::CompileFailed("Pattern validation failed: nope".to_owned())
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Reference { reference: 0.5 })
+            };
+        assert_eq!(
+            run_pattern_safety_probe_with("a", vec![], Flags::default(), &runner),
+            TestStringsOutcome::SpawnFailed("unexpected child outcome".to_owned())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected an over-budget verdict")]
+    fn expect_over_rejects_other_outcomes() {
+        let _ = expect_over(CostOutcome::Safe);
     }
 }

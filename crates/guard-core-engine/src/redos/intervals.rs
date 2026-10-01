@@ -341,4 +341,17 @@ mod tests {
         let set = IntervalSet::from_range(MAX_CODE_POINT, MAX_CODE_POINT);
         assert_eq!(set.complement().intervals(), &[(0, MAX_CODE_POINT - 1)]);
     }
+
+    #[test]
+    fn complement_at_the_code_point_ceilings_is_well_defined() {
+        // An interval ending at the last code point has no successor; the
+        // complement walk must stop without overflowing.
+        assert_eq!(
+            IntervalSet::single(u32::MAX).complement(),
+            IntervalSet::new(&[(0, u32::MAX - 1)])
+        );
+        let head = IntervalSet::from_range(1, u32::MAX);
+        assert_eq!(head.complement(), IntervalSet::single(0));
+        assert_eq!(IntervalSet::full().complement(), IntervalSet::empty());
+    }
 }

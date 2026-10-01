@@ -288,4 +288,19 @@ mod tests {
         assert!(clone.is_blocked("SQLMAP"));
         assert_eq!(clone.len(), filter.len());
     }
+
+    #[test]
+    fn a_chain_safe_pattern_the_engine_cannot_compile_is_rejected() {
+        // Lookarounds pass the Python-syntax safety chain but the concrete
+        // engine compiler rejects them, so the config constructor fails.
+        let error = UserAgentFilter::new(["(?=x)a"]).expect_err("rejected");
+        assert_eq!(error.entry, "(?=x)a");
+        assert!(
+            error
+                .reason
+                .starts_with("expected a compilable regular expression"),
+            "{}",
+            error.reason
+        );
+    }
 }

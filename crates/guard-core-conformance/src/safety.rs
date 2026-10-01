@@ -140,3 +140,17 @@ pub fn run_safety_case(case: &SafetyCase) -> CaseResult {
         diffs,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_decoding_rejects_unknown_and_missing_modes() {
+        let error =
+            mode_from_value(&serde_json::json!({ "mode": "teleport" })).expect_err("unknown mode");
+        assert_eq!(error, "unknown input.mode \"teleport\"");
+        let error = mode_from_value(&serde_json::json!({})).expect_err("missing mode");
+        assert_eq!(error, "missing input.mode");
+    }
+}

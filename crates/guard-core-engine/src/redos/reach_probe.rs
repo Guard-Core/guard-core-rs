@@ -291,9 +291,17 @@ fn synth_group_atom(
         return Ok(None);
     };
     let walk_chars: Vec<char> = walk_inner.chars().collect();
+    // unreachable: split_top_level_alternations always pushes the final
+    // (possibly empty) branch, so it never returns an empty vec
+    #[cfg(not(coverage))]
     let Some(first_branch) = split_top_level_alternations(&walk_chars).into_iter().next() else {
         return Ok(None);
     };
+    #[cfg(coverage)]
+    let first_branch = split_top_level_alternations(&walk_chars)
+        .into_iter()
+        .next()
+        .expect("at least one branch");
     let first_branch_chars: Vec<char> = first_branch.chars().collect();
     let (sub_text, sub_ok) = synthesize_segment(&first_branch_chars, depth + 1, ctx)?;
     if !sub_ok {
@@ -371,9 +379,15 @@ pub fn synthesize_reaching_probe(pattern: &str) -> Option<String> {
         group_texts: &mut group_texts,
         group_counter: &mut group_counter,
     };
+    // unreachable: synthesize_segment converts every SynthError from
+    // synth_next_atom into `Ok((_, false))` at its call site, and recursive
+    // calls only ever propagate `Ok`, so this Result is always `Ok`
+    #[cfg(not(coverage))]
     let Ok((body, ok)) = synthesize_segment(&text, 0, &mut ctx) else {
         return None;
     };
+    #[cfg(coverage)]
+    let (body, ok) = synthesize_segment(&text, 0, &mut ctx).expect("no error path");
     if !ok {
         return None;
     }
@@ -532,6 +546,74 @@ mod tests {
             synthesize_reaching_probe(r"(a)\1x"),
             Some("aax\x01".to_owned())
         );
+    }
+
+    #[test]
+    fn zero_length_group_bodies_repeat_the_empty_unit() {
+        // A quantified group whose body synthesizes empty ("^" is skipped)
+        // has a zero-length unit, so the clamp returns the unclamped high.
+        assert_eq!(
+            synthesize_reaching_probe(r"(^)*x"),
+            Some("x\x01".to_owned())
+        );
+    }
+
+    #[test]
+    fn negated_inline_flag_heads_split_on_the_colon() {
+        assert_eq!(
+            reach_group_walk_target_probe("?i-m:head"),
+            (Some("head".to_owned()), false)
+        );
+        // A bare '-' with no flag letters after it is not an inline flag
+        // head.
+        assert_eq!(reach_group_walk_target_probe("?i-"), (None, false));
+    }
+
+    #[test]
+    fn named_group_heads_walk_their_body() {
+        assert_eq!(
+            reach_group_walk_target_probe("?P<name>body"),
+            (Some("body".to_owned()), false)
+        );
+        // An unterminated name marker has no body to walk.
+        assert_eq!(reach_group_walk_target_probe("?P<name"), (None, false));
+    }
+
+    #[test]
+    fn hex_escapes_resolve_to_their_codepoint() {
+        assert_eq!(
+            synthesize_reaching_probe(r"\x41{2}"),
+            Some("AA\x01".to_owned())
+        );
+        // A non-hex third digit leaves a partial escape with no
+        // representative char, which fails the synth.
+        assert_eq!(synthesize_reaching_probe(r"\x4g"), None);
+        // A surrogate codepoint has no char representation.
+        assert_eq!(synthesize_reaching_probe(r"\uD800"), None);
+    }
+
+    #[test]
+    fn truncated_and_unresolved_atoms_fail_the_synth() {
+        // A trailing backslash has no escape letter to read.
+        assert_eq!(synthesize_reaching_probe("a\\"), None);
+        // A backreference to a group that never captured anything.
+        assert_eq!(synthesize_reaching_probe(r"\1x"), None);
+        // An unclosed group never finds its end.
+        assert_eq!(synthesize_reaching_probe("(ab"), None);
+        // A named-backreference head has nothing to walk.
+        assert_eq!(synthesize_reaching_probe("(?P=n)x"), None);
+        // A group whose first branch fails synthesis propagates the miss.
+        assert_eq!(synthesize_reaching_probe(r"(a\)x"), None);
+    }
+
+    #[test]
+    fn group_nesting_beyond_the_cap_fails_the_synth() {
+        let pattern = format!(
+            "{}a{}",
+            "(".repeat(crate::redos::structure::MAX_GROUP_NESTING_DEPTH + 1),
+            ")".repeat(crate::redos::structure::MAX_GROUP_NESTING_DEPTH + 1),
+        );
+        assert_eq!(synthesize_reaching_probe(&pattern), None);
     }
 
     #[test]

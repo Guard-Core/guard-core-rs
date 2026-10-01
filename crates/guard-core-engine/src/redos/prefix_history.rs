@@ -18,10 +18,8 @@ pub fn node_observes_history(op: &Op) -> bool {
             del,
             body,
         } => {
-            group.is_some()
-                || *add != Flags::default()
-                || *del != Flags::default()
-                || observes_history(body)
+            let flagged = group.is_some() || *add != Flags::default() || *del != Flags::default();
+            flagged || observes_history(body)
         }
         Op::Branch(alternatives) => alternatives.iter().any(|alt| observes_history(alt)),
         _ => true,
@@ -226,5 +224,36 @@ mod tests {
         assert!(matches!(slots[0], Slot::Pairing(_)));
         assert!(matches!(slots[1], Slot::NonPairing(_)));
         assert!(matches!(slots[2], Slot::Pairing(_)));
+    }
+
+    #[test]
+    fn scoped_flag_groups_count_as_history_when_flags_change() {
+        // A negated scoped-flag group flips the walk flags, so it observes
+        // history even with a plain body.
+        let (ops, _) = crate::redos::ast::parse("(?-i:x)", Flags::default()).expect("parses");
+        assert!(observes_history(&ops));
+        // An explicitly scoped group with default flags has no flag or
+        // capture history of its own, so only its body decides.
+        let (ops, _) = crate::redos::ast::parse(r"(?::\b)", Flags::default()).expect("parses");
+        assert!(observes_history(&ops));
+        let (ops, _) = crate::redos::ast::parse(r"(?::x)", Flags::default()).expect("parses");
+        assert!(!observes_history(&ops));
+        // The node form reports per-op: a body whose atoms carry no
+        // history reads as false even inside a scoped group.
+        let (boundary_ops, _) =
+            crate::redos::ast::parse(r"(?::\\b)", Flags::default()).expect("parses");
+        assert!(!node_observes_history(&boundary_ops[0]));
+        let (plain_ops, _) = crate::redos::ast::parse(r"(?::x)", Flags::default()).expect("parses");
+        assert!(!node_observes_history(&plain_ops[0]));
+    }
+
+    #[test]
+    fn contains_repeat_looks_inside_groups_and_assertions() {
+        let (ops, _) = crate::redos::ast::parse("(a+)x", Flags::default()).expect("parses");
+        assert!(contains_repeat(&ops));
+        let (ops, _) = crate::redos::ast::parse("(?=a+)x", Flags::default()).expect("parses");
+        assert!(contains_repeat(&ops));
+        let (ops, _) = crate::redos::ast::parse("(?:a)b", Flags::default()).expect("parses");
+        assert!(!contains_repeat(&ops));
     }
 }

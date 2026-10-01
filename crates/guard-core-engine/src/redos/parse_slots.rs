@@ -129,8 +129,9 @@ pub fn in_intervals(items: &[ClassItem], flags: Flags) -> IntervalSet {
     for item in items {
         if matches!(item, ClassItem::Negate) {
             negate = true;
-            continue;
         }
+        // The marker contributes no intervals either way, so every item
+        // dispatches through the same member walk.
         member = member.union(&member_intervals(item, flags));
     }
     if negate { member.complement() } else { member }
@@ -296,10 +297,9 @@ pub fn walk_sequence(ops: &[Op], flags: Flags) -> Vec<Slot> {
 /// Reference `_sequence_to_alternatives`.
 #[must_use]
 pub fn sequence_to_alternatives(ops: &[Op], flags: Flags) -> Vec<Vec<Slot>> {
-    if ops.len() == 1 && matches!(&ops[0], Op::Branch(_)) {
-        let Op::Branch(alternatives) = &ops[0] else {
-            unreachable!("guarded above");
-        };
+    if let [op] = ops
+        && let Op::Branch(alternatives) = op
+    {
         return alternatives
             .iter()
             .map(|alt| walk_sequence(alt, flags))
@@ -335,6 +335,22 @@ pub fn candidate_chars_for_atom_text(atom_text: &str, flags: Flags) -> Vec<char>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Destructure a pairing slot; panics on any other variant.
+    fn expect_pairing(slot: &Slot) -> &PairingAtom {
+        match slot {
+            Slot::Pairing(atom) => atom,
+            other => panic!("expected pairing, got {other:?}"),
+        }
+    }
+
+    /// Destructure a non-pairing slot; panics on any other variant.
+    fn expect_non_pairing(slot: &Slot) -> &NonPairingSlot {
+        match slot {
+            Slot::NonPairing(non) => non,
+            other => panic!("expected non-pairing, got {other:?}"),
+        }
+    }
 
     #[test]
     fn candidate_chars_for_a_single_class_are_component_starts() {
@@ -374,9 +390,7 @@ mod tests {
     fn negated_class_is_a_pairing_atom_with_the_complement() {
         let slots = pattern_slots("[^a]", Flags::default()).expect("parses");
         assert_eq!(slots.len(), 1);
-        let Slot::Pairing(atom) = &slots[0] else {
-            panic!("expected pairing");
-        };
+        let atom = expect_pairing(&slots[0]);
         assert!(!atom.allows_zero);
         assert!(!atom.unbounded);
         let expected = IntervalSet::full().difference(&IntervalSet::single(u32::from('a')));
@@ -387,12 +401,8 @@ mod tests {
     fn dotall_widens_any_to_the_full_alphabet() {
         let dotted = pattern_slots("(?s).", Flags::default()).expect("parses");
         let plain = pattern_slots(".", Flags::default()).expect("parses");
-        let Slot::Pairing(dotted_atom) = &dotted[0] else {
-            panic!("expected pairing");
-        };
-        let Slot::Pairing(plain_atom) = &plain[0] else {
-            panic!("expected pairing");
-        };
+        let dotted_atom = expect_pairing(&dotted[0]);
+        let plain_atom = expect_pairing(&plain[0]);
         assert_eq!(dotted_atom.intervals, IntervalSet::full());
         assert_eq!(
             plain_atom.intervals,
@@ -404,9 +414,7 @@ mod tests {
     fn backreference_is_a_hard_boundary_slot() {
         let slots = pattern_slots(r"(a)\1", Flags::default()).expect("parses");
         assert_eq!(slots.len(), 2);
-        let Slot::NonPairing(non) = &slots[1] else {
-            panic!("expected non-pairing");
-        };
+        let non = expect_non_pairing(&slots[1]);
         assert!(non.is_boundary);
         assert!(non.inner.is_none());
     }
@@ -414,9 +422,7 @@ mod tests {
     #[test]
     fn quantified_wrapped_group_keeps_its_inner_slots() {
         let slots = pattern_slots(r"(\s)+", Flags::default()).expect("parses");
-        let Slot::NonPairing(non) = &slots[0] else {
-            panic!("expected group slot");
-        };
+        let non = expect_non_pairing(&slots[0]);
         assert!(non.unbounded);
         // A mandatory (low=1) group repeat is a boundary slot, exactly like
         // the reference's `not allows_zero`.
@@ -428,9 +434,7 @@ mod tests {
     #[test]
     fn bounded_repeat_carries_max_repeat_and_variability() {
         let slots = pattern_slots(r"a{2,5}", Flags::default()).expect("parses");
-        let Slot::Pairing(atom) = &slots[0] else {
-            panic!("expected pairing");
-        };
+        let atom = expect_pairing(&slots[0]);
         assert_eq!(atom.max_repeat, Some(5));
         assert!(atom.variable_bounded);
         assert!(!atom.unbounded);
@@ -439,9 +443,7 @@ mod tests {
     #[test]
     fn zero_low_repeat_allows_zero() {
         let slots = pattern_slots(r"a*", Flags::default()).expect("parses");
-        let Slot::Pairing(atom) = &slots[0] else {
-            panic!("expected pairing");
-        };
+        let atom = expect_pairing(&slots[0]);
         assert!(atom.allows_zero);
         assert!(atom.unbounded);
     }
@@ -449,9 +451,7 @@ mod tests {
     #[test]
     fn assertions_are_non_boundary_slots() {
         let slots = pattern_slots(r"(?=a)", Flags::default()).expect("parses");
-        let Slot::NonPairing(non) = &slots[0] else {
-            panic!("expected non-pairing");
-        };
+        let non = expect_non_pairing(&slots[0]);
         assert!(!non.is_boundary);
         assert!(non.inner.is_some());
     }
@@ -459,15 +459,11 @@ mod tests {
     #[test]
     fn anchors_and_failure_slots() {
         let slots = pattern_slots(r"\b", Flags::default()).expect("parses");
-        let Slot::NonPairing(non) = &slots[0] else {
-            panic!("expected non-pairing");
-        };
+        let non = expect_non_pairing(&slots[0]);
         assert!(!non.is_boundary);
         assert!(non.inner.is_none());
         let slots = pattern_slots(r"(?!)", Flags::default()).expect("parses");
-        let Slot::NonPairing(non) = &slots[0] else {
-            panic!("expected non-pairing");
-        };
+        let non = expect_non_pairing(&slots[0]);
         assert!(non.is_boundary);
     }
 
@@ -537,5 +533,70 @@ mod tests {
         let intervals = in_intervals(&items, Flags::default());
         assert!(intervals.contains(u32::from('b')));
         assert!(!intervals.contains(u32::from('a')));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected pairing")]
+    fn expect_pairing_rejects_other_variants() {
+        let _ = expect_pairing(&Slot::NonPairing(NonPairingSlot {
+            is_boundary: false,
+            inner: None,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        }));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected non-pairing")]
+    fn expect_non_pairing_rejects_other_variants() {
+        let _ = expect_non_pairing(&Slot::Pairing(PairingAtom {
+            intervals: IntervalSet::empty(),
+            allows_zero: false,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        }));
+    }
+
+    #[test]
+    fn ascii_flags_pick_the_ascii_category_tables() {
+        let ascii = crate::redos::ast::Flags {
+            ascii: true,
+            ..Flags::default()
+        };
+        for pattern in [r"\d", r"\s", r"\w", r"\D", r"\S", r"\W"] {
+            let parsed = pattern_slots(pattern, ascii).expect("parses");
+            assert_eq!(parsed.len(), 1, "{pattern}");
+            assert!(matches!(&parsed[0], Slot::Pairing(_)), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn negated_categories_complement_the_unicode_tables() {
+        for pattern in [r"\D", r"\S", r"\W"] {
+            let parsed = pattern_slots(pattern, Flags::default()).expect("parses");
+            assert_eq!(parsed.len(), 1, "{pattern}");
+            assert!(matches!(&parsed[0], Slot::Pairing(_)), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn negated_classes_start_from_an_empty_set() {
+        // The leading Negate item contributes no intervals of its own.
+        let parsed = pattern_slots(r"[^ab]", Flags::default()).expect("parses");
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn node_intervals_of_non_class_ops_is_empty() {
+        assert_eq!(
+            node_intervals(&Op::At(crate::redos::ast::At::Beginning), Flags::default()),
+            IntervalSet::empty()
+        );
+        assert_eq!(
+            node_intervals(&Op::GroupRef(1), Flags::default()),
+            IntervalSet::empty()
+        );
     }
 }

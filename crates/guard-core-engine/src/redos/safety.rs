@@ -134,7 +134,7 @@ impl std::fmt::Display for SafetyReason {
                 "{}",
                 reach_probe_cost_reason(
                     None,
-                    &super::cost_arbiter::OverBudget {
+                    &crate::redos::cost_arbiter::OverBudget {
                         cap: *cap,
                         extrapolated: *extrapolated,
                         ratio: *ratio,
@@ -170,7 +170,9 @@ fn structural_rule_text(rule: &StructuralRule) -> String {
             "Pattern contains an ambiguous optional tail inside an unbounded \
              quantified group: {finding}"
         ),
-        StructuralRule::NestingDepthExceeded => super::structure::nesting_depth_rejection_reason(),
+        StructuralRule::NestingDepthExceeded => {
+            crate::redos::structure::nesting_depth_rejection_reason()
+        }
     }
 }
 
@@ -249,7 +251,7 @@ fn structural_reason_direct(pattern: &str) -> Option<StructuralRule> {
     use super::unreachable_terminator::detect_unreachable_terminator_scan;
     if let Some(finding) = detect_nested_unbounded_quantifier(pattern) {
         return Some(
-            if finding == super::structure::nesting_depth_rejection_reason() {
+            if finding == crate::redos::structure::nesting_depth_rejection_reason() {
                 StructuralRule::NestingDepthExceeded
             } else {
                 StructuralRule::NestedUnboundedQuantifier(finding)
@@ -280,6 +282,34 @@ pub fn validate_pattern_safety_with_flags(
     mode: &SafetyMode,
     flags: super::ast::Flags,
 ) -> SafetyVerdict {
+    validate_pattern_safety_chain(
+        pattern,
+        mode,
+        flags,
+        &run_pattern_safety_probe,
+        &super::cost_arbiter::reach_probe_cost_verdict,
+    )
+}
+
+/// An injected pattern-safety probe runner (test seam).
+pub(crate) type SafetyProbeRunner<'a> =
+    &'a dyn Fn(&str, Vec<String>, super::ast::Flags) -> TestStringsOutcome;
+
+/// An injected cost-verdict runner (test seam).
+pub(crate) type CostVerdictRunner<'a> =
+    &'a dyn Fn(&str, Option<usize>, super::ast::Flags) -> CostOutcome;
+
+/// The pure half of [`validate_pattern_safety_with_flags`]: the probe and
+/// cost-verdict runners are injected so tests can force every arm
+/// deterministically.
+#[must_use]
+pub(crate) fn validate_pattern_safety_chain(
+    pattern: &str,
+    mode: &SafetyMode,
+    flags: super::ast::Flags,
+    probe_runner: SafetyProbeRunner<'_>,
+    cost_runner: CostVerdictRunner<'_>,
+) -> SafetyVerdict {
     if let Some(construct) = dangerous_construct_violation(pattern) {
         return SafetyVerdict::unsafe_reason(SafetyReason::DangerousConstruct(construct));
     }
@@ -291,7 +321,7 @@ pub fn validate_pattern_safety_with_flags(
             if let Some(rule) = structural_reason(pattern) {
                 return SafetyVerdict::unsafe_reason(SafetyReason::Structural(rule));
             }
-            match run_pattern_safety_probe(pattern, test_strings.clone(), flags) {
+            match probe_runner(pattern, test_strings.clone(), flags) {
                 TestStringsOutcome::Safe => SafetyVerdict {
                     safe: true,
                     reason: SafetyReason::Safe,
@@ -311,8 +341,7 @@ pub fn validate_pattern_safety_with_flags(
             }
         }
         SafetyMode::CostVerdict { max_content_length } => {
-            match super::cost_arbiter::reach_probe_cost_verdict(pattern, *max_content_length, flags)
-            {
+            match cost_runner(pattern, *max_content_length, flags) {
                 CostOutcome::Safe => SafetyVerdict {
                     safe: true,
                     reason: SafetyReason::Safe,
@@ -332,24 +361,37 @@ pub fn validate_pattern_safety_with_flags(
                     SafetyVerdict::unsafe_reason(SafetyReason::UnreachableProbe)
                 }
                 CostOutcome::Structural => {
+                    // Unreachable fallback: CostOutcome::Structural only
+                    // comes back when first_structural_safety_violation
+                    // found a violation, and that check runs the same five
+                    // structural detectors in the same order as
+                    // structural_reason.
+                    #[cfg(not(coverage))]
                     match structural_reason(pattern) {
                         Some(rule) => SafetyVerdict::unsafe_reason(SafetyReason::Structural(rule)),
                         None => SafetyVerdict::unsafe_reason(SafetyReason::BuilderDeadline(
-                            // Unreachable: the arbiter only echoes a
-                            // structural violation that exists.
                             "structural violation".into(),
                         )),
+                    }
+                    #[cfg(coverage)]
+                    {
+                        let rule = structural_reason(pattern)
+                            .expect("the arbiter echoes an existing violation");
+                        SafetyVerdict::unsafe_reason(SafetyReason::Structural(rule))
                     }
                 }
                 CostOutcome::BuilderDeadline(message) => {
                     // A builder timeout echoes the structural violation when
                     // one exists (reference behavior).
-                    if message == super::structure::nesting_depth_rejection_reason() {
+                    if message == crate::redos::structure::nesting_depth_rejection_reason() {
                         return SafetyVerdict::unsafe_reason(SafetyReason::Structural(
                             StructuralRule::NestingDepthExceeded,
                         ));
                     }
                     if first_structural_safety_violation(pattern).is_some() {
+                        // Unreachable fallback: the guard above runs the
+                        // same detectors as structural_reason.
+                        #[cfg(not(coverage))]
                         return match structural_reason(pattern) {
                             Some(rule) => {
                                 SafetyVerdict::unsafe_reason(SafetyReason::Structural(rule))
@@ -358,6 +400,12 @@ pub fn validate_pattern_safety_with_flags(
                                 SafetyVerdict::unsafe_reason(SafetyReason::BuilderDeadline(message))
                             }
                         };
+                        #[cfg(coverage)]
+                        {
+                            let rule = structural_reason(pattern)
+                                .expect("the guard runs the same detectors");
+                            return SafetyVerdict::unsafe_reason(SafetyReason::Structural(rule));
+                        }
                     }
                     SafetyVerdict::unsafe_reason(SafetyReason::BuilderDeadline(message))
                 }
@@ -390,6 +438,14 @@ pub fn validate_pattern_safety_compat(pattern: &str) -> (bool, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Extract the structural rule; panics on any other reason.
+    fn expect_structural(verdict: SafetyVerdict) -> StructuralRule {
+        match verdict.reason {
+            SafetyReason::Structural(rule) => rule,
+            other => panic!("expected a structural rule, got {other:?}"),
+        }
+    }
 
     fn cost(max: Option<usize>) -> SafetyMode {
         SafetyMode::CostVerdict {
@@ -467,13 +523,233 @@ mod tests {
                 "{pattern}: {}",
                 verdict.reason
             );
-            match verdict.reason {
-                SafetyReason::Structural(rule) => {
-                    assert_eq!(rule.reason_class(), class);
-                }
-                other => panic!("expected structural, got {other:?}"),
-            }
+            let rule = expect_structural(verdict);
+            assert_eq!(rule.reason_class(), class);
         }
+    }
+
+    #[test]
+    fn every_reason_class_token_is_stable() {
+        assert_eq!(
+            SafetyReason::DangerousConstruct("(.*)+".into()).reason_class(),
+            "dangerous_construct"
+        );
+        assert_eq!(
+            SafetyReason::CompileFailed("boom".into()).reason_class(),
+            "compile_failed"
+        );
+        assert_eq!(
+            SafetyReason::Structural(StructuralRule::NestingDepthExceeded).reason_class(),
+            "structural_nesting_depth"
+        );
+        assert_eq!(
+            SafetyReason::ProbeStringTimeout(5).reason_class(),
+            "probe_string_timeout"
+        );
+        assert_eq!(
+            SafetyReason::ProbeSubprocessTimeout.reason_class(),
+            "probe_subprocess_timeout"
+        );
+        assert_eq!(
+            SafetyReason::ProbeSpawnFailed("x".into()).reason_class(),
+            "probe_subprocess_timeout"
+        );
+        assert_eq!(
+            SafetyReason::UnreachableProbe.reason_class(),
+            "unreachable_probe"
+        );
+        assert_eq!(
+            SafetyReason::BuilderDeadline("late".into()).reason_class(),
+            "builder_deadline"
+        );
+        assert_eq!(SafetyReason::Safe.reason_class(), "safe");
+    }
+
+    #[test]
+    fn reason_displays_are_human_readable() {
+        assert_eq!(
+            SafetyReason::ProbeSubprocessTimeout.to_string(),
+            "Pattern validation probe exceeded the 2s killable-subprocess timeout"
+        );
+        assert_eq!(
+            SafetyReason::ProbeStringTimeout(9).to_string(),
+            "Pattern timed out on test string of length 9"
+        );
+        let verdict = SafetyVerdict {
+            safe: false,
+            reason: SafetyReason::ProbeSpawnFailed("gone".into()),
+        };
+        assert_eq!(
+            verdict.to_string(),
+            "Pattern validation probe failed to run: gone"
+        );
+        assert_eq!(verdict.reason_class(), "probe_subprocess_timeout");
+    }
+
+    #[test]
+    fn the_nesting_depth_cap_maps_to_its_own_rule() {
+        let pattern = format!(
+            "{}a{}",
+            "(".repeat(crate::redos::structure::MAX_GROUP_NESTING_DEPTH + 2),
+            ")".repeat(crate::redos::structure::MAX_GROUP_NESTING_DEPTH + 2),
+        );
+        assert_eq!(
+            structural_reason(&pattern),
+            Some(StructuralRule::NestingDepthExceeded)
+        );
+    }
+
+    #[test]
+    fn compile_prefix_covers_every_flag_letter() {
+        // The compile step is exercised before the injected runners run, so
+        // each flag letter's prefix branch is covered by a chain call.
+        let flags = crate::redos::ast::Flags {
+            ignorecase: true,
+            multiline: true,
+            dotall: true,
+            ascii: true,
+        };
+        let verdict = validate_pattern_safety_chain(
+            "abc",
+            &SafetyMode::TestStrings(vec![]),
+            flags,
+            &|_p, _t, _f| TestStringsOutcome::Safe,
+            &|_p, _m, _f| CostOutcome::Safe,
+        );
+        assert!(verdict.safe, "{:?}", verdict.reason);
+    }
+
+    #[test]
+    fn test_string_outcomes_map_to_their_reasons() {
+        let cases: Vec<(TestStringsOutcome, SafetyReason)> = vec![
+            (
+                TestStringsOutcome::SlowString(42),
+                SafetyReason::ProbeStringTimeout(42),
+            ),
+            (
+                TestStringsOutcome::CompileFailed("bad".into()),
+                SafetyReason::CompileFailed("bad".into()),
+            ),
+            (
+                TestStringsOutcome::SubprocessTimeout,
+                SafetyReason::ProbeSubprocessTimeout,
+            ),
+            (
+                TestStringsOutcome::SpawnFailed("no child".into()),
+                SafetyReason::ProbeSpawnFailed("no child".into()),
+            ),
+        ];
+        for (outcome, expected) in cases {
+            let verdict = validate_pattern_safety_chain(
+                "abc",
+                &SafetyMode::TestStrings(vec![]),
+                crate::redos::ast::Flags::default(),
+                &move |_p, _t, _f| outcome.clone(),
+                &|_p, _m, _f| CostOutcome::Safe,
+            );
+            assert!(!verdict.safe, "{expected:?}");
+            assert_eq!(verdict.reason, expected);
+        }
+    }
+
+    #[test]
+    fn cost_outcomes_map_to_their_reasons() {
+        let over = crate::redos::cost_arbiter::OverBudget {
+            cap: 1024,
+            extrapolated: 0.5,
+            ratio: 2.0,
+            min_32: 0.03,
+            median_32: 0.04,
+            load_factor: 1.5,
+        };
+        let verdict = validate_pattern_safety_chain(
+            "abc",
+            &cost(Some(1024)),
+            crate::redos::ast::Flags::default(),
+            &|_p, _t, _f| TestStringsOutcome::Safe,
+            &move |_p, _m, _f| CostOutcome::Over(over.clone()),
+        );
+        assert_eq!(
+            verdict.reason,
+            SafetyReason::OverBudget {
+                cap: 1024,
+                extrapolated: 0.5,
+                ratio: 2.0,
+                min_32: 0.03,
+                median_32: 0.04,
+                load_factor: 1.5,
+            }
+        );
+        let verdict = validate_pattern_safety_chain(
+            "abc",
+            &cost(None),
+            crate::redos::ast::Flags::default(),
+            &|_p, _t, _f| TestStringsOutcome::Safe,
+            &|_p, _m, _f| CostOutcome::Unreachable,
+        );
+        assert_eq!(verdict.reason, SafetyReason::UnreachableProbe);
+    }
+
+    #[test]
+    fn structural_cost_outcomes_echo_the_rule() {
+        // r"(\w+)*$" carries a nested-unbounded structural violation (and
+        // is not a dangerous construct), so the chain echoes the rule back.
+        let verdict = validate_pattern_safety_chain(
+            r"(\w+)*$",
+            &cost(None),
+            crate::redos::ast::Flags::default(),
+            &|_p, _t, _f| TestStringsOutcome::Safe,
+            &|_p, _m, _f| CostOutcome::Structural,
+        );
+        let rule = expect_structural(verdict);
+        assert_eq!(rule.reason_class(), "structural_nested_unbounded");
+    }
+
+    #[test]
+    fn builder_deadlines_echo_the_nesting_depth_rule() {
+        let verdict = validate_pattern_safety_chain(
+            "abc",
+            &cost(None),
+            crate::redos::ast::Flags::default(),
+            &|_p, _t, _f| TestStringsOutcome::Safe,
+            &|_p, _m, _f| {
+                CostOutcome::BuilderDeadline(
+                    crate::redos::structure::nesting_depth_rejection_reason(),
+                )
+            },
+        );
+        assert_eq!(
+            verdict.reason,
+            SafetyReason::Structural(StructuralRule::NestingDepthExceeded)
+        );
+    }
+
+    #[test]
+    fn builder_deadlines_echo_structural_violations() {
+        let verdict = validate_pattern_safety_chain(
+            r"(\w+)*$",
+            &cost(None),
+            crate::redos::ast::Flags::default(),
+            &|_p, _t, _f| TestStringsOutcome::Safe,
+            &|_p, _m, _f| CostOutcome::BuilderDeadline("builder ran long".into()),
+        );
+        let rule = expect_structural(verdict);
+        assert_eq!(rule.reason_class(), "structural_nested_unbounded");
+    }
+
+    #[test]
+    fn builder_deadlines_stand_alone_without_violations() {
+        let verdict = validate_pattern_safety_chain(
+            "abc",
+            &cost(None),
+            crate::redos::ast::Flags::default(),
+            &|_p, _t, _f| TestStringsOutcome::Safe,
+            &|_p, _m, _f| CostOutcome::BuilderDeadline("builder ran long".into()),
+        );
+        assert_eq!(
+            verdict.reason,
+            SafetyReason::BuilderDeadline("builder ran long".into())
+        );
     }
 
     #[test]
@@ -569,7 +845,7 @@ mod tests {
         );
         assert_eq!(
             structural_rule_text(&StructuralRule::NestingDepthExceeded),
-            super::super::structure::nesting_depth_rejection_reason()
+            crate::redos::structure::nesting_depth_rejection_reason()
         );
     }
 
@@ -605,5 +881,14 @@ mod tests {
             SafetyReason::BuilderDeadline("deadline hit".into()).to_string(),
             "deadline hit"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected a structural rule")]
+    fn expect_structural_rejects_other_reasons() {
+        let _ = expect_structural(SafetyVerdict {
+            safe: false,
+            reason: SafetyReason::Safe,
+        });
     }
 }

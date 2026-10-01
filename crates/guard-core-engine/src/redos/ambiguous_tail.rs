@@ -305,4 +305,20 @@ mod tests {
             Some(r"((\d{1,3}))+".to_owned())
         );
     }
+
+    #[test]
+    fn multi_op_atom_texts_have_no_single_interval() {
+        // A two-literal atom text parses to two ops, so it has no single
+        // atom interval and no representative char.
+        assert!(atom_char_set("ab").is_empty());
+        assert_eq!(representative_char_for_atom("ab"), None);
+    }
+
+    #[test]
+    fn lazy_bounded_braces_advance_past_the_marker() {
+        // The lazy marker after a brace quantifier is consumed by the atom
+        // walk.
+        let atoms = parse_flat_quantified_atoms_with_text(r"a{2,3}?b").expect("atoms");
+        assert_eq!(atoms.len(), 2);
+    }
 }

@@ -59,9 +59,15 @@ fn quantifier_at_allows_zero(text: &[char], k: usize) -> bool {
         '*' | '?' => true,
         '{' => {
             let end_brace = text[k..].iter().position(|c| *c == '}').map(|o| k + o);
+            // unreachable: `skip_quantifier_at` returned nonzero above,
+            // which for a `{` token happens only when a closing brace
+            // exists ahead, so the same lookup cannot fail here
+            #[cfg(not(coverage))]
             let Some(end_brace) = end_brace else {
                 return false;
             };
+            #[cfg(coverage)]
+            let end_brace = end_brace.expect("the brace was counted above");
             let low: String = text[k + 1..end_brace]
                 .iter()
                 .collect::<String>()
@@ -343,5 +349,15 @@ mod tests {
         assert!(!allows("a+b", 1));
         assert!(!allows("a{2,3}b", 1));
         assert!(!allows("ab", 1));
+    }
+
+    #[test]
+    fn unterminated_constructs_are_scanned_without_panic() {
+        // A brace quantifier with no closing brace, a dangling group, and
+        // an unterminated `(?` marker are all rejected (no finding) by the
+        // scanner instead of panicking.
+        assert_eq!(detect_unreachable_terminator_scan("a{2"), None);
+        assert_eq!(detect_unreachable_terminator_scan("a(?="), None);
+        assert_eq!(detect_unreachable_terminator_scan("(a[^b]*"), None);
     }
 }

@@ -255,13 +255,19 @@ fn resolve_child_path(
     }
     // Doctests run from a temp directory, so the executable-relative search
     // cannot find the probe binary. The workspace-relative location is
-    // compile-time known (crates/guard-core-engine -> <workspace>/target).
+    // compile-time known (crates/guard-core-engine -> <workspace>/target),
+    // so the option always yields a workspace under cargo.
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(workspace) = manifest.parent().and_then(|crates| crates.parent()) {
-        for name in ["guard-pattern-probe", "guard-pattern-probe.exe"] {
-            candidates.push(workspace.join("target/debug").join(name));
-        }
-    }
+    let workspace_candidates = manifest
+        .parent()
+        .and_then(|crates| crates.parent())
+        .into_iter()
+        .flat_map(|workspace| {
+            ["guard-pattern-probe", "guard-pattern-probe.exe"]
+                .iter()
+                .map(move |name| workspace.join("target/debug").join(name))
+        });
+    candidates.extend(workspace_candidates);
     candidates.into_iter().find(|candidate| candidate.exists())
 }
 
@@ -275,8 +281,22 @@ pub fn run_child_request(
     request: &ChildRequest,
     timeout_secs: f64,
 ) -> Result<ChildOutcome, ChildSpawnError> {
+    run_child_request_at(request, timeout_secs, child_path())
+}
+
+/// The pure half of [`run_child_request`]: the child binary path is
+/// injected so tests can force spawn and exit failures deterministically.
+///
+/// # Errors
+///
+/// [`ChildSpawnError`] on deadline or spawn/exit failure.
+pub(crate) fn run_child_request_at(
+    request: &ChildRequest,
+    timeout_secs: f64,
+    child_path: Option<PathBuf>,
+) -> Result<ChildOutcome, ChildSpawnError> {
     let payload = request_payload(request).to_string();
-    let Some(child_path) = child_path() else {
+    let Some(child_path) = child_path else {
         return Err(ChildSpawnError::Failed(
             "probe child binary not found".into(),
         ));
@@ -304,19 +324,23 @@ pub fn run_child_request(
     });
     let start = Instant::now();
     let deadline = Duration::from_secs_f64(timeout_secs.max(0.0));
+    // `try_wait` could only fail with ECHILD here, which cannot happen:
+    // the child was spawned by this process above and only this loop reaps
+    // it. The `?` keeps that impossible path on an always-evaluated line.
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if start.elapsed() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                thread::sleep(Duration::from_millis(2));
+        let Some(status) = child
+            .try_wait()
+            .map_err(|e| ChildSpawnError::Failed(format!("wait failed: {e}")))?
+        else {
+            if start.elapsed() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
             }
-            Err(e) => return Err(ChildSpawnError::Failed(format!("wait failed: {e}"))),
-        }
+            thread::sleep(Duration::from_millis(2));
+            continue;
+        };
+        break Some(status);
     };
     let output = reader.join().unwrap_or_default();
     let Some(status) = status else {
@@ -390,9 +414,14 @@ impl CompiledProbe {
 }
 
 fn reference_scan_times(samples: usize) -> Vec<f64> {
+    #[cfg(not(coverage))] // unreachable: REFERENCE_SCAN_PATTERN is a
+    // compile-time constant that compiles under the regex engine
     let Ok(reference) = CompiledProbe::compile(REFERENCE_SCAN_PATTERN, &Flags::default()) else {
         return Vec::new();
     };
+    #[cfg(coverage)]
+    let reference = CompiledProbe::compile(REFERENCE_SCAN_PATTERN, &Flags::default())
+        .expect("the reference scan pattern is a compile-time constant");
     let probe = format!("/{}", "0".repeat(REFERENCE_SCAN_PROBE_LENGTH));
     let mut times = Vec::with_capacity(samples);
     for _ in 0..samples {
@@ -553,6 +582,22 @@ mod tests {
     use super::*;
     use crate::redos::cost_arbiter::REFERENCE_LOAD_PROBE_TIMEOUT_SECONDS;
 
+    /// Extract the unexpected-exit detail; panics on any other outcome.
+    fn expect_failed(outcome: Result<ChildOutcome, ChildSpawnError>) -> String {
+        match outcome {
+            Err(ChildSpawnError::Failed(detail)) => detail,
+            other => panic!("expected an exit failure, got {other:?}"),
+        }
+    }
+
+    /// Extract the fancy engine; panics on the `regex` engine variant.
+    fn expect_fancy(compiled: &CompiledProbe) -> &fancy_regex::Regex {
+        match compiled {
+            CompiledProbe::Fancy(regex) => regex,
+            CompiledProbe::Re(_) => panic!("expected the fancy engine"),
+        }
+    }
+
     #[test]
     fn child_path_resolves_inside_the_workspace_target_dir() {
         // Under cargo test the sibling binary sits in target/debug.
@@ -671,15 +716,218 @@ mod tests {
             REFERENCE_LOAD_PROBE_TIMEOUT_SECONDS,
         )
         .expect("reference load");
-        let ChildOutcome::Reference { reference } = outcome else {
-            panic!("expected a reference measurement");
-        };
-        assert!(reference > 0.0);
+        assert!(
+            matches!(outcome, ChildOutcome::Reference { reference } if reference > 0.0),
+            "{outcome:?}"
+        );
     }
 
     #[test]
     fn compiled_probe_uses_the_regex_crate_first() {
         let compiled = CompiledProbe::compile("abc", &Flags::default()).expect("compile");
         assert!(matches!(compiled, CompiledProbe::Re(_)));
+    }
+
+    #[test]
+    fn child_spawn_error_display_covers_both_variants() {
+        assert_eq!(
+            ChildSpawnError::Timeout.to_string(),
+            "child deadline elapsed"
+        );
+        assert_eq!(
+            ChildSpawnError::Failed("boom".to_owned()).to_string(),
+            "child failed: boom"
+        );
+    }
+
+    #[test]
+    fn resolve_child_path_prefers_an_existing_override() {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let override_path = manifest.join("Cargo.toml");
+        let resolved = resolve_child_path(Some(override_path.to_str().expect("utf8")), None);
+        assert_eq!(resolved, Some(override_path));
+    }
+
+    #[test]
+    fn resolve_child_path_accepts_the_probe_binary_itself_as_the_exe() {
+        let exe = PathBuf::from("/opt/tools/guard-pattern-probe");
+        let resolved = resolve_child_path(Some("/definitely/missing/bin"), Some(&exe));
+        assert_eq!(resolved, Some(exe));
+    }
+
+    #[test]
+    fn resolve_child_path_skips_a_missing_override() {
+        let exe = PathBuf::from("/opt/tools/other-binary");
+        // A missing override cannot resolve on its own; the candidate
+        // search then walks the exe siblings and finally the workspace
+        // target dir, where cargo built the probe binary.
+        let resolved = resolve_child_path(Some("/definitely/missing/bin"), Some(&exe));
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = workspace
+            .parent()
+            .and_then(|crates| crates.parent())
+            .map(|root| root.join("target/debug/guard-pattern-probe"));
+        assert_eq!(resolved, workspace);
+    }
+
+    #[test]
+    fn a_missing_child_path_is_a_spawn_failure() {
+        let outcome = run_child_request_at(&ChildRequest::ReferenceLoad, 1.0, None);
+        assert_eq!(
+            outcome,
+            Err(ChildSpawnError::Failed(
+                "probe child binary not found".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_failing_child_binary_is_a_spawn_failure() {
+        // /usr/bin/false exists on every supported host and exits nonzero
+        // with no output, which the parent maps to an unexpected-exit
+        // failure.
+        let outcome = run_child_request_at(
+            &ChildRequest::ReferenceLoad,
+            1.0,
+            Some(PathBuf::from("/usr/bin/false")),
+        );
+        let detail = expect_failed(outcome);
+        assert!(detail.contains("child exited unexpectedly"), "{detail}");
+    }
+
+    #[test]
+    fn flag_prefix_includes_the_ascii_letter() {
+        let flags = Flags {
+            ascii: true,
+            ..Flags::default()
+        };
+        assert_eq!(flag_prefix(&flags), "(?a)");
+    }
+
+    #[test]
+    fn child_test_strings_reports_the_first_slow_string() {
+        // A negative threshold makes every search deterministically exceed
+        // it, so the slow-string payload is produced without wall-clock luck.
+        let payload = json!({
+            "op": "test_strings",
+            "pattern": "abc",
+            "test_strings": ["xabcx", "yabcy"],
+            "threshold": -1.0,
+            "flags": {},
+        });
+        let output = dispatch_payload(&payload);
+        assert_eq!(output["safe"], json!(false));
+        let reason = output["reason"].as_str().expect("reason");
+        assert_eq!(reason, "Pattern timed out on test string of length 5");
+    }
+
+    #[test]
+    fn sample_probe_takes_more_samples_only_past_the_trigger() {
+        // First sample below the trigger: exactly one sample.
+        let mut searches = 0usize;
+        let times = sample_probe("p", 5, 0.05, &mut |_text| {
+            searches += 1;
+            0.001
+        });
+        assert_eq!(times, vec![0.001]);
+        assert_eq!(searches, 1);
+        // First sample past the trigger but under the large-sample bound:
+        // the full sample ladder runs.
+        let mut searches = 0usize;
+        let times = sample_probe("p", 4, 0.05, &mut |_text| {
+            searches += 1;
+            0.1
+        });
+        assert_eq!(times, vec![0.1; 4]);
+        assert_eq!(searches, 4);
+        // A sample over the large-sample bound stops the ladder early.
+        let mut searches = 0usize;
+        let times = sample_probe("p", 5, 0.05, &mut |_text| {
+            searches += 1;
+            0.3
+        });
+        assert_eq!(times, vec![0.3, 0.3]);
+        assert_eq!(searches, 2);
+    }
+
+    #[test]
+    fn child_stray_verify_returns_null_on_unusable_payloads() {
+        let bad_pattern = json!({
+            "op": "stray_verify",
+            "pattern": "[invalid",
+            "flags": {},
+            "cases": [["x", ["x"]]],
+        });
+        assert_eq!(dispatch_payload(&bad_pattern), Value::Null);
+        let no_cases = json!({
+            "op": "stray_verify",
+            "pattern": "abc",
+            "flags": {},
+        });
+        assert_eq!(dispatch_payload(&no_cases), Value::Null);
+        let unknown_op = json!({ "op": "teleport" });
+        assert_eq!(dispatch_payload(&unknown_op), Value::Null);
+    }
+
+    #[test]
+    fn search_misses_reports_fancy_results() {
+        // Lookarounds force the fancy engine; the helper must report both
+        // matched and unmatched probes correctly for it.
+        let compiled = CompiledProbe::compile("(?!x)a", &Flags::default()).expect("fancy compile");
+        let regex = expect_fancy(&compiled);
+        assert!(regex.is_match("ab").expect("search"), "sanity: it matches");
+        assert!(!search_misses(&compiled, "ab"), "a match is not a miss");
+        assert!(search_misses(&compiled, "bbb"), "no match is a miss");
+    }
+
+    #[test]
+    fn child_main_ignores_foreign_invocations() {
+        assert_eq!(child_main(&[]), None);
+        assert_eq!(child_main(&["prog".to_owned()]), None);
+        assert_eq!(child_main(&["prog".to_owned(), "other".to_owned()]), None);
+    }
+
+    #[test]
+    fn the_probe_child_fails_on_unreadable_stdin() {
+        // Reading a directory fd fails with EISDIR on macOS and Linux, so
+        // the child exits 1 before parsing any payload.
+        let status = Command::new(child_path().expect("child binary"))
+            .arg(SUBCOMMAND)
+            .stdin(std::fs::File::open("/").expect("directory handle"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .status()
+            .expect("child status");
+        assert_eq!(status.code(), Some(1));
+    }
+
+    #[test]
+    fn the_probe_child_fails_on_a_malformed_payload() {
+        let mut child = Command::new(child_path().expect("child binary"))
+            .arg(SUBCOMMAND)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn");
+        {
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            let _ = stdin.write_all(b"not json");
+        }
+        let status = child.wait().expect("child status");
+        assert_eq!(status.code(), Some(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected an exit failure")]
+    fn expect_failed_rejects_other_outcomes() {
+        let _ = expect_failed(Err(ChildSpawnError::Timeout));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected the fancy engine")]
+    fn expect_fancy_rejects_the_regex_engine() {
+        let compiled = CompiledProbe::compile("abc", &Flags::default()).expect("compile");
+        let _ = expect_fancy(&compiled);
     }
 }

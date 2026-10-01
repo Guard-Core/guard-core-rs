@@ -243,13 +243,24 @@ pub fn first_bounded_forcing_candidate(
     candidates: &[String],
     probes: &[Vec<String>],
 ) -> Result<Option<String>, BuilderTimeout> {
+    first_bounded_forcing_candidate_with(ctx, candidates, probes, &run_child_request)
+}
+
+/// The pure half of [`first_bounded_forcing_candidate`]: the child runner
+/// is injected so tests can force every outcome deterministically.
+pub(crate) fn first_bounded_forcing_candidate_with(
+    ctx: &StrayContext,
+    candidates: &[String],
+    probes: &[Vec<String>],
+    run: super::cost_arbiter::ChildRunner<'_>,
+) -> Result<Option<String>, BuilderTimeout> {
     let timeout = stray_verification_timeout(ctx)?;
     let cases: Vec<(String, Vec<String>)> = candidates
         .iter()
         .cloned()
         .zip(probes.iter().cloned())
         .collect();
-    let outcome = run_child_request(
+    let outcome = run(
         &ChildRequest::StrayVerify {
             pattern: ctx.pattern.clone(),
             flags: ctx.flags,
@@ -400,6 +411,16 @@ pub fn verify_stray_forces_failure(
 mod tests {
     use super::*;
     use crate::redos::ast::Flags;
+    use crate::redos::child::ChildOutcome;
+    use crate::redos::parse_slots::NonPairingSlot;
+
+    /// Destructure a pairing slot; panics on any other variant.
+    fn expect_pairing(slot: &Slot) -> &PairingAtom {
+        match slot {
+            Slot::Pairing(atom) => atom,
+            other => panic!("expected pairing, got {other:?}"),
+        }
+    }
 
     #[test]
     fn leading_literal_prefix_unwraps_transparent_groups() {
@@ -507,20 +528,16 @@ mod tests {
 
     #[test]
     fn choose_class_intersection_stray_prefers_tail_complements() {
-        let pattern = r"\s*[\s\S]+[\x00-\x08]";
+        // The lookahead inserts a non-pairing slot, so the pairing filter's
+        // catch-all arm runs; the tail class moves to slot 3.
+        let pattern = r"\s*[\s\S]+(?=x)[\x00-\x08]";
         let flags = Flags::ignorecase_multiline();
         let slots =
             crate::redos::parse_slots::pattern_slots(pattern, flags).expect("pattern parses");
-        let Slot::Pairing(left) = &slots[0] else {
-            panic!("expected pairing");
-        };
-        let Slot::Pairing(middle) = &slots[1] else {
-            panic!("expected pairing");
-        };
-        let Slot::Pairing(tail_atom) = &slots[2] else {
-            panic!("expected pairing");
-        };
-        let _ = tail_atom;
+        assert!(matches!(&slots[2], Slot::NonPairing(_)));
+        let left = expect_pairing(&slots[0]);
+        let middle = expect_pairing(&slots[1]);
+        let _tail_atom = expect_pairing(&slots[3]);
         let fill_member = left
             .intervals
             .intersection(&middle.intervals)
@@ -535,6 +552,7 @@ mod tests {
                 Slot::NonPairing(_) => None,
             })
             .collect();
+        assert_eq!(slots_ints.len(), 3);
         let stray = choose_class_intersection_stray(
             &ctx,
             &fill.to_string(),
@@ -572,5 +590,112 @@ mod tests {
             error.0,
             "Pattern validation probe construction exceeded its deadline"
         );
+    }
+
+    #[test]
+    fn leading_prefix_unwraps_only_complete_transparent_groups() {
+        // A pattern that is exactly one transparent group unwraps to it.
+        assert_eq!(leading_literal_prefix("(?:abc)"), "abc");
+        // Trailing content stops the unwrap, and the paren is a metachar,
+        // so no literal prefix remains.
+        assert_eq!(leading_literal_prefix("(?:ab)c"), "");
+        // An unclosed transparent group cannot be unwrapped either.
+        assert_eq!(leading_literal_prefix("(?:abc"), "");
+    }
+
+    #[test]
+    fn complement_chars_skip_fully_covered_pairings() {
+        // A class covering every codepoint has an empty complement, so it
+        // contributes no stray candidate.
+        assert_eq!(
+            pattern_complement_chars(r"[\x00-\U0010FFFF]", Flags::default()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            pattern_complement_chars("x", Flags::default()),
+            vec!["\0".to_owned()]
+        );
+    }
+
+    #[test]
+    fn bounded_forcing_candidate_maps_every_child_outcome() {
+        let ctx = build_stray_context("abc", Flags::default(), None);
+        let candidates = vec!["a".to_owned()];
+        let probes = vec![vec!["aa".to_owned()]];
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Err(ChildSpawnError::Timeout)
+            };
+        let error = first_bounded_forcing_candidate_with(&ctx, &candidates, &probes, &runner)
+            .expect_err("timeout");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification exceeded its \
+             killable-subprocess timeout"
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Err(ChildSpawnError::Failed("spawn".to_owned()))
+            };
+        let error = first_bounded_forcing_candidate_with(&ctx, &candidates, &probes, &runner)
+            .expect_err("spawn");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification killable-subprocess \
+             failed to run (child failed: spawn)"
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Stray(Some("not-a-candidate".to_owned())))
+            };
+        let error = first_bounded_forcing_candidate_with(&ctx, &candidates, &probes, &runner)
+            .expect_err("malformed");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification \
+             killable-subprocess returned malformed output"
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Reference { reference: 0.5 })
+            };
+        let error = first_bounded_forcing_candidate_with(&ctx, &candidates, &probes, &runner)
+            .expect_err("unexpected outcome");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification \
+             killable-subprocess returned malformed output"
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Stray(Some("a".to_owned())))
+            };
+        assert_eq!(
+            first_bounded_forcing_candidate_with(&ctx, &candidates, &probes, &runner)
+                .expect("candidate"),
+            Some("a".to_owned())
+        );
+        let runner =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Stray(None))
+            };
+        assert_eq!(
+            first_bounded_forcing_candidate_with(&ctx, &candidates, &probes, &runner)
+                .expect("none"),
+            None
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expected pairing")]
+    fn expect_pairing_rejects_other_variants() {
+        let non_pairing = Slot::NonPairing(NonPairingSlot {
+            is_boundary: false,
+            inner: None,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        let _ = expect_pairing(&non_pairing);
     }
 }

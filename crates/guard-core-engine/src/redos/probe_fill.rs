@@ -147,10 +147,8 @@ pub fn reach_probe_candidate_builders(
         }));
     }
     builders.extend(class_intersection_builders(pattern, flags, &ctx)?);
-    builders.extend(prefixed_unit_builders(
-        &class_prefixes,
-        &class_prefix_units,
-    )?);
+    let prefixed_units = prefixed_unit_builders(&class_prefixes, &class_prefix_units)?;
+    builders.extend(prefixed_units);
     builders.extend(prefixed_builders);
     builders.extend(literal_run_builders(pattern, &ctx)?);
     builders.extend(reach_probe_prefix_builders(pattern, &ctx)?);
@@ -459,5 +457,43 @@ mod tests {
         for builder in &builders {
             assert_eq!(builder(40).chars().count(), 40);
         }
+    }
+
+    #[test]
+    fn prefixed_unit_builders_honor_the_candidate_budget() {
+        // 65 prefixes x 32 units x 2 flood variants trips the 4096 budget.
+        let prefixes: Vec<String> = (0..65).map(|index| format!("p{index}")).collect();
+        let units: Vec<(String, String)> = (0..32)
+            .map(|index| (format!("u{index}"), "\0".to_owned()))
+            .collect();
+        let error = prefixed_unit_builders(&prefixes, &units)
+            .err()
+            .expect("budget");
+        assert_eq!(
+            error.0,
+            "Pattern validation prefixed-probe candidate budget exceeded"
+        );
+    }
+
+    #[test]
+    fn candidate_builders_honor_the_prefixed_unit_budget() {
+        // A chain of overlapping bounded classes multiplies the
+        // (fill, stray) units per adjacent pair; enough pairs push the
+        // prefixed-probe candidate count past its budget.
+        let alphabet = b"abcdefghijklmnopqrstuvwxyz";
+        let mut pattern = String::new();
+        for index in 0..52usize {
+            let low = alphabet[index % alphabet.len()] as char;
+            let high = alphabet[(index + 1) % alphabet.len()] as char;
+            pattern.push_str(&format!("[{low}{high}]+"));
+        }
+        let builders = reach_probe_candidate_builders(
+            &pattern,
+            Flags::default(),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .expect("builders");
+        // Every adjacent class pair contributes its fill-stray unit.
+        assert!(!builders.is_empty());
     }
 }

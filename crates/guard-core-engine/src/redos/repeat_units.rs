@@ -37,6 +37,32 @@ fn repeated_body_units(
         .collect())
 }
 
+/// Record one `(prefix, unit)` pair and enforce both accumulation
+/// budgets.
+fn record_pair(
+    pairs: &mut std::collections::HashMap<(String, String), ()>,
+    pair_text_size: &mut usize,
+    prefix: &str,
+    unit: &str,
+) -> Result<(), BuilderTimeout> {
+    let pair = (prefix.to_owned(), unit.to_owned());
+    if let std::collections::hash_map::Entry::Vacant(entry) = pairs.entry(pair) {
+        entry.insert(());
+        *pair_text_size += prefix.chars().count() + unit.chars().count();
+    }
+    if pairs.len() > REPEAT_UNIT_PAIR_LIMIT {
+        return Err(BuilderTimeout(
+            "Pattern validation repeat-unit budget exceeded".into(),
+        ));
+    }
+    if *pair_text_size > REPEAT_UNIT_TEXT_BUDGET {
+        return Err(BuilderTimeout(
+            "Pattern validation repeat-unit text budget exceeded".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reference `_repeat_group_units`: `(prefix, unit)` pairs for every
 /// unbounded repeat site with `high > 1`.
 pub fn repeat_group_units(
@@ -58,21 +84,7 @@ pub fn repeat_group_units(
             for state in states {
                 let prefix = format!("{}{}", state.text, state.pending);
                 for unit in &units {
-                    let pair = (prefix.clone(), unit.clone());
-                    if let std::collections::hash_map::Entry::Vacant(entry) = pairs.entry(pair) {
-                        entry.insert(());
-                        pair_text_size += prefix.chars().count() + unit.chars().count();
-                    }
-                    if pairs.len() > REPEAT_UNIT_PAIR_LIMIT {
-                        return Err(BuilderTimeout(
-                            "Pattern validation repeat-unit budget exceeded".into(),
-                        ));
-                    }
-                    if pair_text_size > REPEAT_UNIT_TEXT_BUDGET {
-                        return Err(BuilderTimeout(
-                            "Pattern validation repeat-unit text budget exceeded".into(),
-                        ));
-                    }
+                    record_pair(&mut pairs, &mut pair_text_size, &prefix, unit)?;
                 }
             }
             Ok(())
@@ -126,5 +138,41 @@ mod tests {
         // rule.
         let pairs = repeat_group_units(r"(\d)*x", Flags::default(), None).expect("units");
         assert!(pairs.iter().all(|(_prefix, unit)| unit.chars().count() > 1));
+    }
+
+    #[test]
+    fn record_pair_honors_the_pair_budget() {
+        let mut pairs = std::collections::HashMap::new();
+        let mut pair_text_size = 0usize;
+        for index in 0..REPEAT_UNIT_PAIR_LIMIT as u32 {
+            let letter = char::from_u32(0x4E00 + index).unwrap_or('x');
+            record_pair(&mut pairs, &mut pair_text_size, &letter.to_string(), "u")
+                .expect("within budget");
+        }
+        let error =
+            record_pair(&mut pairs, &mut pair_text_size, "overflow", "u").expect_err("budget");
+        assert_eq!(error.0, "Pattern validation repeat-unit budget exceeded");
+    }
+
+    #[test]
+    fn record_pair_honors_the_text_budget() {
+        let mut pairs = std::collections::HashMap::new();
+        let mut pair_text_size = 0usize;
+        // Long units keep the pair count under its budget while the
+        // aggregate text crosses its own.
+        let unit = "z".repeat(600);
+        // 1663 pairs at 601 chars each total 999463 chars, one short pair
+        // under the budget; the next pair must trip it.
+        for index in 0..1663u32 {
+            let letter = char::from_u32(0x4E00 + index).unwrap_or('x');
+            record_pair(&mut pairs, &mut pair_text_size, &letter.to_string(), &unit)
+                .expect("within budget");
+        }
+        let error = record_pair(&mut pairs, &mut pair_text_size, "overflow", &unit)
+            .expect_err("text budget");
+        assert_eq!(
+            error.0,
+            "Pattern validation repeat-unit text budget exceeded"
+        );
     }
 }

@@ -625,4 +625,26 @@ mod tests {
         let bodies = iter_quantified_group_bodies("(unclosed+x").expect("parses");
         assert!(bodies.is_empty());
     }
+
+    #[test]
+    fn brace_shapes_without_a_comma_are_not_unbounded_singles() {
+        // A fixed brace repeat has no comma, so the branch is not an
+        // unbounded single.
+        assert!(!branch_is_unbounded_single(".{22}"));
+        assert!(!branch_is_unbounded_single(".{2,3}"));
+        assert!(branch_is_unbounded_single(".{2,}"));
+    }
+
+    #[test]
+    fn named_backreference_groups_are_invisible_to_the_scans() {
+        // `(?P=n)` groups normalize to nothing, so both scanners skip
+        // them; unclosed groups advance one char at a time instead of
+        // panicking.
+        assert_eq!(detect_nested_unbounded_quantifier(r"(?P=x)(a)+"), None);
+        assert_eq!(
+            detect_adjacent_broad_unbounded_quantifiers(r"(?P=x)abc"),
+            None
+        );
+        assert_eq!(detect_adjacent_broad_unbounded_quantifiers("a(b.*c"), None);
+    }
 }

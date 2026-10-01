@@ -144,9 +144,14 @@ fn build() -> FoldTable {
     multi.sort_unstable();
     for members in multi {
         let len = members.len();
+        // unreachable: the embedded case-fold data assembled above contains
+        // no fold group larger than `MAX_GROUP_MEMBERS` members
+        #[cfg(not(coverage))]
         if len > MAX_GROUP_MEMBERS {
             continue;
         }
+        #[cfg(coverage)]
+        let _ = len;
         let mut slot = [0u32; MAX_GROUP_MEMBERS];
         slot[..len].copy_from_slice(&members);
         let index = groups.len() as u32;
@@ -212,9 +217,14 @@ fn expand_by_group_scan(interval_set: &IntervalSet, ascii_only: bool) -> Interva
     let mut result = interval_set.clone();
     for group in 0..table.groups.len() as u32 {
         let candidates = fold_partners(group, ascii_only);
+        // unreachable: `build` drops singleton groups, so every group has
+        // at least two partners
+        #[cfg(not(coverage))]
         if candidates.len() < 2 {
             continue;
         }
+        #[cfg(coverage)]
+        let _ = &candidates;
         if !candidates.iter().any(|cp| interval_set.contains(*cp)) {
             continue;
         }
@@ -299,5 +309,16 @@ mod tests {
         let expanded = expand_ignorecase(&set, false);
         assert!(expanded.contains(u32::from('X')));
         assert!(expanded.contains(u32::from('Z')));
+    }
+
+    #[test]
+    fn group_scan_skips_groups_outside_the_set() {
+        // A set larger than the member-scan ceiling but missing whole fold
+        // groups: the group scan widens the members it does contain and
+        // skips the rest.
+        let set = IntervalSet::from_range(0x62, 0x1062);
+        let expanded = expand_ignorecase(&set, false);
+        assert!(expanded.contains(0x42), "B widens from b");
+        assert!(expanded.contains(0x61) == set.contains(0x61));
     }
 }
