@@ -307,6 +307,12 @@ pub(crate) fn run_child_request_at(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The child is a killable timing oracle, never a coverage subject: a
+    // spawned child would otherwise flush its own (never fully exercised)
+    // instrumented copy of this crate into the parent run's profile and
+    // skew the coverage summary. The child-side dispatch is covered
+    // in-process below instead.
+    command.env_remove("LLVM_PROFILE_FILE");
     let mut child = command
         .spawn()
         .map_err(|e| ChildSpawnError::Failed(format!("spawn failed: {e}")))?;
@@ -973,5 +979,51 @@ mod tests {
                     .to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn dispatch_runs_the_reach_timing_ladder_in_process() {
+        let payload = json!({
+            "op": "reach_timing",
+            "pattern": "abc",
+            "probes": ["abc", "xabcx"],
+            "samples": 2,
+            "deadline": 10.0,
+            "flags": {},
+            "trigger": 1.0,
+        });
+        let output = dispatch_payload(&payload);
+        let results = output["results"].as_array().expect("results");
+        assert_eq!(results.len(), 2);
+        for row in results {
+            let samples = row.as_array().expect("samples");
+            assert!((1..=2).contains(&samples.len()), "{samples:?}");
+            for sample in samples {
+                assert!(sample.as_f64().expect("finite") >= 0.0);
+            }
+        }
+        assert!(output["reference"].as_f64().expect("reference") >= 0.0);
+    }
+
+    #[test]
+    fn dispatch_runs_the_reference_load_probe_in_process() {
+        let output = dispatch_payload(&json!({ "op": "reference_load" }));
+        let reference = output["reference"].as_f64().expect("reference");
+        assert!(reference >= 0.0);
+    }
+
+    #[test]
+    fn dispatch_reach_timing_reports_compile_failures() {
+        let payload = json!({
+            "op": "reach_timing",
+            "pattern": "[invalid",
+            "probes": ["a"],
+            "samples": 1,
+            "deadline": 10.0,
+            "flags": {},
+            "trigger": 1.0,
+        });
+        let output = dispatch_payload(&payload);
+        assert!(output["error"].as_str().expect("error").contains("Invalid character class"));
     }
 }
