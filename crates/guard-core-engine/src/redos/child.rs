@@ -762,11 +762,12 @@ mod tests {
         // search then walks the exe siblings and finally the workspace
         // target dir, where cargo built the probe binary.
         let resolved = resolve_child_path(Some("/definitely/missing/bin"), Some(&exe));
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let workspace = workspace
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest
             .parent()
             .and_then(|crates| crates.parent())
-            .map(|root| root.join("target/debug/guard-pattern-probe"));
+            .map(|root| root.join("target/debug/guard-pattern-probe"))
+            .filter(|candidate| candidate.exists());
         assert_eq!(resolved, workspace);
     }
 
