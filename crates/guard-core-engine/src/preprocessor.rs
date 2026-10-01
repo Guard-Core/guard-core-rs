@@ -1481,7 +1481,6 @@ mod coverage_tests {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod gap_tests {
     use super::*;
 
