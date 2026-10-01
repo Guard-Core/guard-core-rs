@@ -1078,6 +1078,13 @@ mod tests {
     }
 
     #[test]
+    fn escaped_backslash_inside_a_class_is_a_literal_backslash() {
+        // `\\` inside a class parses to the 0x5C literal.
+        let (ops, _) = parse_ok(r"[\\]", Flags::default());
+        assert_eq!(ops, vec![Op::Literal(0x5C)]);
+    }
+
+    #[test]
     fn class_dedupes_preserving_order() {
         let (ops, _) = parse_ok(r"[aab]", Flags::default());
         assert_eq!(

@@ -938,6 +938,95 @@ mod tests {
     }
 
     #[test]
+    fn the_child_dispatch_answers_every_op_in_process() {
+        // test_strings: the safe answer and the compile-failure answer.
+        let safe = dispatch_payload(&json!({
+            "op": "test_strings",
+            "pattern": "abc",
+            "test_strings": ["zzz"],
+            "threshold": 1.0,
+            "flags": {},
+        }));
+        assert_eq!(safe["safe"], json!(true));
+        assert_eq!(safe["reason"], json!("Pattern appears safe"));
+        let rejected = dispatch_payload(&json!({
+            "op": "test_strings",
+            "pattern": "[invalid",
+            "test_strings": [],
+            "threshold": 1.0,
+            "flags": {},
+        }));
+        assert_eq!(rejected["safe"], json!(false));
+        assert!(
+            rejected["reason"]
+                .as_str()
+                .expect("reason")
+                .starts_with("Pattern validation failed: "),
+            "{rejected}"
+        );
+
+        // reach_timing: real sample rows for a fast pattern, plus the
+        // compile-failure payload.
+        let timing = dispatch_payload(&json!({
+            "op": "reach_timing",
+            "pattern": "abc",
+            "probes": ["xabcx", "zzz"],
+            "samples": 2,
+            "deadline": 1.0,
+            "flags": {},
+            "trigger": 0.0,
+        }));
+        let results = timing["results"].as_array().expect("result rows");
+        assert_eq!(results.len(), 2);
+        for row in results {
+            assert!(!row.as_array().expect("samples").is_empty());
+        }
+        let reference = timing["reference"].as_f64().expect("reference");
+        assert!(reference >= 0.0, "{reference}");
+        let timing_rejected = dispatch_payload(&json!({
+            "op": "reach_timing",
+            "pattern": "[invalid",
+            "probes": ["x"],
+            "samples": 1,
+            "deadline": 1.0,
+            "flags": {},
+            "trigger": 0.0,
+        }));
+        assert!(timing_rejected.get("error").is_some(), "{timing_rejected}");
+
+        // reference_load: a positive normalized scan time.
+        let load = dispatch_payload(&json!({ "op": "reference_load" }));
+        let reference = load["reference"].as_f64().expect("reference");
+        assert!(reference > 0.0, "{reference}");
+
+        // stray_verify: the first all-miss candidate wins; an
+        // all-matching case list answers null.
+        let stray = dispatch_payload(&json!({
+            "op": "stray_verify",
+            "pattern": "^a+$",
+            "flags": {},
+            "cases": [["\u{0}", ["a\u{0}b", "b"]], ["z", ["zz"]]],
+        }));
+        assert_eq!(stray, json!("\u{0}"));
+        let no_stray = dispatch_payload(&json!({
+            "op": "stray_verify",
+            "pattern": "^a+$",
+            "flags": {},
+            "cases": [["a", ["aaa"]]],
+        }));
+        assert_eq!(no_stray, Value::Null);
+        // A lookaround pattern routes the same body through the fancy
+        // engine's miss check.
+        let fancy_stray = dispatch_payload(&json!({
+            "op": "stray_verify",
+            "pattern": "(?!x)a+$",
+            "flags": {},
+            "cases": [["\u{0}", ["a\u{0}"]]],
+        }));
+        assert_eq!(fancy_stray, json!("\u{0}"));
+    }
+
+    #[test]
     fn search_misses_reports_fancy_results() {
         // Lookarounds force the fancy engine; the helper must report both
         // matched and unmatched probes correctly for it.

@@ -624,6 +624,25 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_backreference_expansion_stresses_the_budget_clamp() {
+        // The anchor-only group captures the empty string, so the
+        // backreference repeats a zero-length unit: the clamp answers the
+        // unclamped high and nothing joins the seen-char set.
+        assert_eq!(
+            synthesize_reaching_probe(r"(^)\1x"),
+            Some("x\x01".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_literal_chars_skips_representative_less_escapes() {
+        // A backreference escape has no representative character, so the
+        // extraction continues past it with only the plain literals.
+        assert_eq!(extract_literal_chars(r"\1x"), vec!['x']);
+        assert_eq!(extract_literal_chars(r"\2"), Vec::<char>::new());
+    }
+
+    #[test]
     fn group_nesting_beyond_the_cap_fails_the_synth() {
         let pattern = format!(
             "{}a{}",
@@ -654,6 +673,26 @@ mod tests {
     fn the_breaking_char_is_appended_and_never_seen_in_the_body() {
         let probe = synthesize_reaching_probe("abc").expect("probe");
         assert_eq!(probe, "abc\x01".to_owned());
+    }
+
+    #[test]
+    fn zero_width_escapes_contribute_nothing_to_the_body() {
+        // \\A, \\Z, \\b and \\B are zero-width: the walk skips them and
+        // only the trailing literal lands in the probe.
+        assert_eq!(
+            synthesize_reaching_probe(r"\A\Z\b\Bx"),
+            Some("x\x01".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_dot_atom_fills_with_its_representative() {
+        // The wildcard synthesizes 'a' per repetition.
+        assert_eq!(
+            synthesize_reaching_probe(".{3}"),
+            Some("aaa\x01".to_owned())
+        );
+        assert_eq!(synthesize_reaching_probe("a.c"), Some("aac\x01".to_owned()));
     }
 
     #[test]

@@ -287,6 +287,11 @@ mod tests {
         assert!(!group_inner_is_ambiguous(r"\w+\s"));
         // Cyclic overlap between variable neighbors.
         assert!(group_inner_is_ambiguous("[a-c]*[b-d]*"));
+        // A flat alternation never parses as flat atoms: not ambiguous.
+        assert!(!group_inner_is_ambiguous("a|b"));
+        // An optional atom overlapping its fixed neighbor is caught by the
+        // cyclic overlap check even without an ambiguous shape pair.
+        assert!(group_inner_is_ambiguous("a?a"));
     }
 
     #[test]

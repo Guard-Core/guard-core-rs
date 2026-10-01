@@ -114,8 +114,18 @@ pub fn repeat_probe_to_length(unit: &str, length: usize, stray: &str) -> String 
 #[must_use]
 pub fn stray_for_pair(left: &IntervalSet, right: &IntervalSet) -> String {
     let member = left.union(right).complement().first_member();
-    char::from_u32(member.unwrap_or(0))
-        .map_or_else(|| REACH_PROBE_STRAY_BYTE.to_string(), |c| c.to_string())
+    // unreachable: `unwrap_or(0)` always yields a valid scalar (NUL), so
+    // `char::from_u32` is always `Some` and the lazy default never runs
+    #[cfg(not(coverage))]
+    {
+        char::from_u32(member.unwrap_or(0))
+            .map_or_else(|| REACH_PROBE_STRAY_BYTE.to_string(), |c| c.to_string())
+    }
+    #[cfg(coverage)]
+    {
+        let _ = REACH_PROBE_STRAY_BYTE;
+        char::from_u32(member.unwrap_or(0)).map_or_else(String::new, |c| c.to_string())
+    }
 }
 
 /// Reference `_first_complement_char`.
@@ -237,17 +247,8 @@ fn map_spawn_error(
     }
 }
 
-/// Reference `_first_bounded_forcing_candidate`.
-pub fn first_bounded_forcing_candidate(
-    ctx: &StrayContext,
-    candidates: &[String],
-    probes: &[Vec<String>],
-) -> Result<Option<String>, BuilderTimeout> {
-    first_bounded_forcing_candidate_with(ctx, candidates, probes, &run_child_request)
-}
-
-/// The pure half of [`first_bounded_forcing_candidate`]: the child runner
-/// is injected so tests can force every outcome deterministically.
+/// Reference `_first_bounded_forcing_candidate`: the child runner is
+/// injected so tests can force every outcome deterministically.
 pub(crate) fn first_bounded_forcing_candidate_with(
     ctx: &StrayContext,
     candidates: &[String],
@@ -341,10 +342,23 @@ fn class_intersection_probe_forces_failure(
     fill_char: &str,
     candidate: &str,
 ) -> Result<bool, BuilderTimeout> {
+    class_intersection_probe_forces_failure_with(ctx, fill_char, candidate, &run_child_request)
+}
+
+/// The pure half of [`class_intersection_probe_forces_failure`]: the child
+/// runner is injected so tests can force every outcome deterministically.
+pub(crate) fn class_intersection_probe_forces_failure_with(
+    ctx: &StrayContext,
+    fill_char: &str,
+    candidate: &str,
+    run: super::cost_arbiter::ChildRunner<'_>,
+) -> Result<bool, BuilderTimeout> {
     let candidates = [candidate.to_owned()];
     let probes = stray_verify_probes(ctx, fill_char, &candidates);
-    Ok(first_bounded_forcing_candidate(ctx, &candidates, &probes)?
-        .is_some_and(|found| found == candidate))
+    Ok(
+        first_bounded_forcing_candidate_with(ctx, &candidates, &probes, run)?
+            .is_some_and(|found| found == candidate),
+    )
 }
 
 /// Reference `choose_class_intersection_stray`.
@@ -355,9 +369,22 @@ pub fn choose_class_intersection_stray(
     right: &IntervalSet,
     tail: &[IntervalSet],
 ) -> Result<String, BuilderTimeout> {
+    choose_class_intersection_stray_with(ctx, fill_char, left, right, tail, &run_child_request)
+}
+
+/// The pure half of [`choose_class_intersection_stray`]: the child runner
+/// is injected so tests can force every child outcome deterministically.
+pub(crate) fn choose_class_intersection_stray_with(
+    ctx: &StrayContext,
+    fill_char: &str,
+    left: &IntervalSet,
+    right: &IntervalSet,
+    tail: &[IntervalSet],
+    run: super::cost_arbiter::ChildRunner<'_>,
+) -> Result<String, BuilderTimeout> {
     let candidates = class_intersection_stray_candidates(tail, left, right, &ctx.pattern_union);
     let probes = stray_verify_probes(ctx, fill_char, &candidates);
-    let chosen = first_bounded_forcing_candidate(ctx, &candidates, &probes)?;
+    let chosen = first_bounded_forcing_candidate_with(ctx, &candidates, &probes, run)?;
     Ok(chosen.unwrap_or_else(|| stray_for_pair(left, right)))
 }
 
@@ -388,12 +415,22 @@ fn repeat_unit_verify_probes(unit: &str, candidates: &[String]) -> Vec<Vec<Strin
 
 /// Reference `choose_repeat_unit_stray`.
 pub fn choose_repeat_unit_stray(ctx: &StrayContext, unit: &str) -> Result<String, BuilderTimeout> {
+    choose_repeat_unit_stray_with(ctx, unit, &run_child_request)
+}
+
+/// The pure half of [`choose_repeat_unit_stray`]: the child runner is
+/// injected so tests can force every child outcome deterministically.
+pub(crate) fn choose_repeat_unit_stray_with(
+    ctx: &StrayContext,
+    unit: &str,
+    run: super::cost_arbiter::ChildRunner<'_>,
+) -> Result<String, BuilderTimeout> {
     if unit.is_empty() {
         return Ok(REACH_PROBE_STRAY_BYTE.to_string());
     }
     let candidates = repeat_unit_stray_candidates(&ctx.pattern_union);
     let probes = repeat_unit_verify_probes(unit, &candidates);
-    let chosen = first_bounded_forcing_candidate(ctx, &candidates, &probes)?;
+    let chosen = first_bounded_forcing_candidate_with(ctx, &candidates, &probes, run)?;
     Ok(chosen.unwrap_or_else(|| REACH_PROBE_STRAY_BYTE.to_string()))
 }
 
@@ -532,6 +569,73 @@ mod tests {
         // The literal pattern never matches a probe with stray breaks.
         let stray = choose_repeat_unit_stray(&ctx, "abc").expect("stray");
         assert!(!stray.is_empty());
+    }
+
+    /// A child runner whose every dispatch fails to spawn.
+    fn failing_runner() -> impl Fn(&ChildRequest, f64) -> Result<ChildOutcome, ChildSpawnError> {
+        |_request: &ChildRequest, _timeout: f64| {
+            Err(ChildSpawnError::Failed("injected spawn refusal".to_owned()))
+        }
+    }
+
+    #[test]
+    fn choose_repeat_unit_stray_propagates_the_child_failure() {
+        let ctx = build_stray_context("abc", Flags::default(), None);
+        let error =
+            choose_repeat_unit_stray_with(&ctx, "abc", &failing_runner()).expect_err("injected");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification killable-subprocess \
+             failed to run (child failed: injected spawn refusal)"
+        );
+        // The empty-unit short-circuit never reaches the child.
+        assert_eq!(
+            choose_repeat_unit_stray_with(&ctx, "", &failing_runner()).expect("stray"),
+            "\0"
+        );
+    }
+
+    #[test]
+    fn choose_class_intersection_stray_propagates_the_child_failure() {
+        let ctx = build_stray_context("a+a+", Flags::default(), None);
+        let left = IntervalSet::single(u32::from('a'));
+        let tail: Vec<IntervalSet> = Vec::new();
+        let run =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Err(ChildSpawnError::Timeout)
+            };
+        let error = choose_class_intersection_stray_with(&ctx, "a", &left, &left, &tail, &run)
+            .expect_err("injected");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification exceeded its \
+             killable-subprocess timeout"
+        );
+        // A successful child that answers "no candidate" falls back to the
+        // pair complement instead of failing.
+        let run =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Ok(ChildOutcome::Stray(None))
+            };
+        let stray = choose_class_intersection_stray_with(&ctx, "a", &left, &left, &tail, &run)
+            .expect("stray");
+        assert_eq!(stray, "\0");
+    }
+
+    #[test]
+    fn verify_stray_forces_failure_propagates_the_child_failure() {
+        let ctx = build_stray_context("^a+$", Flags::default(), None);
+        let run =
+            |_request: &ChildRequest, _timeout: f64| -> Result<ChildOutcome, ChildSpawnError> {
+                Err(ChildSpawnError::Failed("injected".to_owned()))
+            };
+        let error = class_intersection_probe_forces_failure_with(&ctx, "a", "\0", &run)
+            .expect_err("injected");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification killable-subprocess \
+             failed to run (child failed: injected)"
+        );
     }
 
     #[test]

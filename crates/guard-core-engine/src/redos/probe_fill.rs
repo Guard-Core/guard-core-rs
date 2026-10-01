@@ -8,12 +8,13 @@ use std::time::Instant;
 use super::ambiguous_tail::{
     group_inner_is_ambiguous, parse_flat_quantified_atoms_with_text, representative_char_for_atom,
 };
-use super::class_intersection::class_intersection_probe_units;
+use super::child::run_child_request;
+use super::class_intersection::class_intersection_probe_units_with;
 use super::repeat_alphabet::repeat_alphabet_fills;
 use super::repeat_prefix::repeat_reaching_prefixes;
 use super::repeat_units::repeat_group_units;
 use super::stray_chooser::{
-    StrayContext, build_stray_context, choose_repeat_unit_stray, fill_to_length,
+    StrayContext, build_stray_context, choose_repeat_unit_stray_with, fill_to_length,
     pattern_complement_chars, repeat_probe_to_length,
 };
 use super::structure::iter_quantified_group_bodies;
@@ -25,29 +26,37 @@ const REACH_PROBE_MAX_RUN_VARIANTS: usize = 12;
 /// A probe builder: maps a probe length to a concrete adversarial string.
 pub type ProbeBuilder = Box<dyn Fn(usize) -> String>;
 
-fn repeat_unit_builder(ctx: &StrayContext, unit: String) -> Result<ProbeBuilder, BuilderTimeout> {
-    let stray = choose_repeat_unit_stray(ctx, &unit)?;
+type ChildRunner<'a> = crate::redos::cost_arbiter::ChildRunner<'a>;
+
+fn repeat_unit_builder_with(
+    ctx: &StrayContext,
+    unit: String,
+    run: ChildRunner<'_>,
+) -> Result<ProbeBuilder, BuilderTimeout> {
+    let stray = choose_repeat_unit_stray_with(ctx, &unit, run)?;
     Ok(Box::new(move |length: usize| {
         repeat_probe_to_length(&unit, length, &stray)
     }))
 }
 
-fn literal_run_builders(
+fn literal_run_builders_with(
     pattern: &str,
     ctx: &StrayContext,
+    run: ChildRunner<'_>,
 ) -> Result<Vec<ProbeBuilder>, BuilderTimeout> {
     let runs: Vec<String> = super::literal_runs::adversarial_literal_runs(pattern)
         .into_iter()
         .take(REACH_PROBE_MAX_RUN_VARIANTS)
         .collect();
     runs.into_iter()
-        .map(|run| repeat_unit_builder(ctx, run))
+        .map(|run_text| repeat_unit_builder_with(ctx, run_text, run))
         .collect()
 }
 
-fn reach_probe_prefix_builders(
+fn reach_probe_prefix_builders_with(
     pattern: &str,
     ctx: &StrayContext,
+    run: ChildRunner<'_>,
 ) -> Result<Vec<ProbeBuilder>, BuilderTimeout> {
     let Some(full_probe) = super::reach_probe::synthesize_reaching_probe(pattern) else {
         return Ok(Vec::new());
@@ -60,19 +69,20 @@ fn reach_probe_prefix_builders(
     for cut in REACH_PROBE_PREFIX_CUT_LENGTHS {
         let prefix: String = body_only.chars().take(*cut).collect();
         if prefix.chars().count() >= 2 {
-            builders.push(repeat_unit_builder(ctx, prefix)?);
+            builders.push(repeat_unit_builder_with(ctx, prefix, run)?);
         }
     }
     Ok(builders)
 }
 
-fn class_intersection_builders(
+fn class_intersection_builders_with(
     pattern: &str,
     flags: super::ast::Flags,
     ctx: &StrayContext,
+    run: ChildRunner<'_>,
 ) -> Result<Vec<ProbeBuilder>, BuilderTimeout> {
     let prefix = super::stray_chooser::leading_literal_prefix(pattern);
-    let units = class_intersection_probe_units(pattern, flags, Some(ctx), false)?;
+    let units = class_intersection_probe_units_with(pattern, flags, Some(ctx), false, run)?;
     Ok(units
         .into_iter()
         .map(|(fill_char, stray)| {
@@ -92,9 +102,12 @@ fn ambiguous_group_fill_unit(inner: &str) -> Option<String> {
     if unit.is_empty() { None } else { Some(unit) }
 }
 
-fn ambiguous_group_fill_builders(
+/// The ambiguous-group builder family: the child runner is injected so
+/// tests can force stray-verification failures deterministically.
+fn ambiguous_group_fill_builders_with(
     pattern: &str,
     ctx: &StrayContext,
+    run: ChildRunner<'_>,
 ) -> Result<Vec<ProbeBuilder>, BuilderTimeout> {
     let mut builders: Vec<ProbeBuilder> = Vec::new();
     let Ok(group_bodies) = iter_quantified_group_bodies(pattern) else {
@@ -105,7 +118,7 @@ fn ambiguous_group_fill_builders(
             continue;
         }
         if let Some(unit) = ambiguous_group_fill_unit(&inner) {
-            builders.push(repeat_unit_builder(ctx, unit)?);
+            builders.push(repeat_unit_builder_with(ctx, unit, run)?);
         }
     }
     Ok(builders)
@@ -117,13 +130,25 @@ pub fn reach_probe_candidate_builders(
     flags: super::ast::Flags,
     deadline: Option<Instant>,
 ) -> Result<Vec<ProbeBuilder>, BuilderTimeout> {
+    reach_probe_candidate_builders_with(pattern, flags, deadline, &run_child_request)
+}
+
+/// The pure half of [`reach_probe_candidate_builders`]: the child runner
+/// is injected so tests can force stray-verification failures
+/// deterministically.
+pub(crate) fn reach_probe_candidate_builders_with(
+    pattern: &str,
+    flags: super::ast::Flags,
+    deadline: Option<Instant>,
+    run: ChildRunner<'_>,
+) -> Result<Vec<ProbeBuilder>, BuilderTimeout> {
     let ctx = build_stray_context(pattern, flags, deadline);
     let repeat_fills = repeat_alphabet_fills(pattern, flags, deadline, false)?;
-    let class_units = class_intersection_probe_units(pattern, flags, Some(&ctx), true)?;
+    let class_units = class_intersection_probe_units_with(pattern, flags, Some(&ctx), true, run)?;
     let group_pairs = repeat_group_units(pattern, flags, deadline)?;
     let group_strays = pattern_complement_chars(pattern, flags);
     let prefixed_builders = group_unit_builders(&group_pairs, &group_strays, &|unit: &str| {
-        choose_repeat_unit_stray(&ctx, unit)
+        choose_repeat_unit_stray_with(&ctx, unit, run)
     })?;
     let mut class_prefix_units: Vec<(String, String)> = class_units.clone();
     for (fill, _stray) in &class_units {
@@ -146,12 +171,12 @@ pub fn reach_probe_candidate_builders(
             fill_to_length(&prefix, &fill, &fill, length)
         }));
     }
-    builders.extend(class_intersection_builders(pattern, flags, &ctx)?);
+    builders.extend(class_intersection_builders_with(pattern, flags, &ctx, run)?);
     let prefixed_units = prefixed_unit_builders(&class_prefixes, &class_prefix_units)?;
     builders.extend(prefixed_units);
     builders.extend(prefixed_builders);
-    builders.extend(literal_run_builders(pattern, &ctx)?);
-    builders.extend(reach_probe_prefix_builders(pattern, &ctx)?);
+    builders.extend(literal_run_builders_with(pattern, &ctx, run)?);
+    builders.extend(reach_probe_prefix_builders_with(pattern, &ctx, run)?);
     for (fill, stray) in &class_units {
         let prefix = ctx.prefix.clone();
         let fill = fill.clone();
@@ -160,7 +185,7 @@ pub fn reach_probe_candidate_builders(
             prefixed_repeat_probe(&prefix, &fill, &stray, false, length)
         }));
     }
-    builders.extend(ambiguous_group_fill_builders(pattern, &ctx)?);
+    builders.extend(ambiguous_group_fill_builders_with(pattern, &ctx, run)?);
     Ok(builders)
 }
 
@@ -362,6 +387,10 @@ mod tests {
         let choose = |_unit: &str| -> Result<String, BuilderTimeout> { Ok("\0".to_owned()) };
         let builders = group_unit_builders(&pairs, &[], &choose).expect("builders");
         assert_eq!(builders.len(), 2);
+        // The plain variant ends on one stray; the flood variant fills
+        // half the remaining length with the unit and the rest with strays.
+        assert_eq!(builders[0](6), "ababa\0");
+        assert_eq!(builders[1](6), "aba\0\0\0");
     }
 
     #[test]
@@ -385,7 +414,8 @@ mod tests {
     #[test]
     fn ambiguous_group_fill_builders_append_for_ambiguous_groups() {
         let ctx = ctx_for(r"(a?)+");
-        let builders = ambiguous_group_fill_builders(r"(a?)+", &ctx).expect("builders");
+        let builders = ambiguous_group_fill_builders_with(r"(a?)+", &ctx, &run_child_request)
+            .expect("builders");
         assert_eq!(builders.len(), 1);
         assert!(builders[0](10).starts_with('a'));
     }
@@ -394,20 +424,20 @@ mod tests {
     fn ambiguous_group_fill_builders_skip_non_ambiguous_and_deep_groups() {
         let ctx = ctx_for("(abc)+");
         assert!(
-            ambiguous_group_fill_builders("(abc)+", &ctx)
+            ambiguous_group_fill_builders_with("(abc)+", &ctx, &run_child_request)
                 .expect("builders")
                 .is_empty()
         );
         let deep = format!("{}a{}", "(".repeat(25), ")".repeat(25));
         let ctx = ctx_for(&deep);
         assert!(
-            ambiguous_group_fill_builders(&deep, &ctx)
+            ambiguous_group_fill_builders_with(&deep, &ctx, &run_child_request)
                 .expect("builders")
                 .is_empty()
         );
         let ctx = ctx_for(r"(\1{2,5})+");
         assert!(
-            ambiguous_group_fill_builders(r"(\1{2,5})+", &ctx)
+            ambiguous_group_fill_builders_with(r"(\1{2,5})+", &ctx, &run_child_request)
                 .expect("builders")
                 .is_empty()
         );
@@ -418,7 +448,7 @@ mod tests {
         let pattern = r"[^\x00-\U0010FFFF]+";
         let ctx = ctx_for(pattern);
         assert!(
-            reach_probe_prefix_builders(pattern, &ctx)
+            reach_probe_prefix_builders_with(pattern, &ctx, &run_child_request)
                 .expect("builders")
                 .is_empty()
         );
@@ -427,7 +457,8 @@ mod tests {
     #[test]
     fn literal_run_builders_are_capped_and_repeat_to_length() {
         let ctx = ctx_for(r"a\.b-prefix\dsuffix");
-        let builders = literal_run_builders(r"a\.b-prefix\dsuffix", &ctx).expect("builders");
+        let builders = literal_run_builders_with(r"a\.b-prefix\dsuffix", &ctx, &run_child_request)
+            .expect("builders");
         assert!(!builders.is_empty());
         assert!(builders.len() <= REACH_PROBE_MAX_RUN_VARIANTS);
         for builder in &builders {
@@ -440,7 +471,8 @@ mod tests {
         let pattern = r"'\s*[\);]*\s*--";
         let ctx = ctx_for(pattern);
         let builders =
-            class_intersection_builders(pattern, Flags::default(), &ctx).expect("builders");
+            class_intersection_builders_with(pattern, Flags::default(), &ctx, &run_child_request)
+                .expect("builders");
         assert!(!builders.is_empty());
         for builder in &builders {
             assert_eq!(builder(64).chars().count(), 64);
@@ -452,7 +484,8 @@ mod tests {
         // A pattern whose reaching body is long enough for all three cuts.
         let pattern = r"(?:abcdefabcdefabcdefabcdef)+(x)?y";
         let ctx = ctx_for(pattern);
-        let builders = reach_probe_prefix_builders(pattern, &ctx).expect("builders");
+        let builders =
+            reach_probe_prefix_builders_with(pattern, &ctx, &run_child_request).expect("builders");
         assert!(!builders.is_empty());
         for builder in &builders {
             assert_eq!(builder(40).chars().count(), 40);
@@ -495,5 +528,87 @@ mod tests {
         .expect("builders");
         // Every adjacent class pair contributes its fill-stray unit.
         assert!(!builders.is_empty());
+    }
+
+    /// A child runner whose every stray-verification dispatch fails.
+    fn failing_runner() -> ChildRunner<'static> {
+        &|_request: &crate::redos::child::ChildRequest,
+          _timeout: f64|
+         -> Result<crate::redos::child::ChildOutcome, crate::redos::child::ChildSpawnError> {
+            Err(crate::redos::child::ChildSpawnError::Failed(
+                "injected spawn refusal".to_owned(),
+            ))
+        }
+    }
+
+    #[test]
+    fn the_injected_child_failure_propagates_through_every_builder_family() {
+        // The event-handler shape drives every builder family (class
+        // intersections, group units, literal runs, prefix cuts), so the
+        // first injected child dispatch failure surfaces as the mapped
+        // stray-verification error.
+        let pattern = r"(?:<[^<>]*[\s/]+on\w+\s*=)";
+        let error = reach_probe_candidate_builders_with(
+            pattern,
+            Flags::ignorecase_multiline(),
+            None,
+            failing_runner(),
+        )
+        .err()
+        .expect("injected child failure");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification killable-subprocess \
+             failed to run (child failed: injected spawn refusal)"
+        );
+    }
+
+    #[test]
+    fn the_injected_child_timeout_propagates_through_the_group_unit_path() {
+        // A quantified group pattern routes the first child dispatch
+        // through choose_repeat_unit_stray; the injected timeout surfaces
+        // with the stray-verification timeout text.
+        let pattern = r"(ab)+x";
+        let run = |_request: &crate::redos::child::ChildRequest,
+                   _timeout: f64|
+         -> Result<
+            crate::redos::child::ChildOutcome,
+            crate::redos::child::ChildSpawnError,
+        > { Err(crate::redos::child::ChildSpawnError::Timeout) };
+        let error = reach_probe_candidate_builders_with(pattern, Flags::default(), None, &run)
+            .err()
+            .expect("injected child timeout");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification exceeded its \
+             killable-subprocess timeout"
+        );
+        // A runner that answers "no candidate" lets the assembly finish:
+        // every builder falls back to its complement stray.
+        let run = |_request: &crate::redos::child::ChildRequest,
+                   _timeout: f64|
+         -> Result<
+            crate::redos::child::ChildOutcome,
+            crate::redos::child::ChildSpawnError,
+        > { Ok(crate::redos::child::ChildOutcome::Stray(None)) };
+        let builders = reach_probe_candidate_builders_with(r"(ab)+x", Flags::default(), None, &run)
+            .expect("builders");
+        assert!(!builders.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_group_fill_builders_propagate_the_injected_failure() {
+        // `(a?)+` carries an ambiguous group whose fill unit is verified
+        // in the child; the injected failure surfaces before any builder
+        // is returned.
+        let ctx = ctx_for(r"(a?)+");
+        let error = ambiguous_group_fill_builders_with(r"(a?)+", &ctx, failing_runner())
+            .err()
+            .expect("injected child failure");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification killable-subprocess \
+             failed to run (child failed: injected spawn refusal)"
+        );
     }
 }

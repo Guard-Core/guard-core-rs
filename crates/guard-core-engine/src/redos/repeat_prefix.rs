@@ -464,11 +464,34 @@ mod tests {
     }
 
     #[test]
+    fn a_capturing_lookahead_witness_replaces_the_group_capture() {
+        // The positive lookahead's witness carries its own capture, which
+        // replaces the live capture of the same group before the literal.
+        let (_prefixes, states) = walk(r"(a)(?=(b))b", false, false).expect("walk");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text, "ab");
+        // The lookahead's witness capture replaces its own group number.
+        assert_eq!(
+            states[0].captures,
+            vec![(1, "a".to_owned()), (2, "b".to_owned())]
+        );
+    }
+
+    #[test]
+    fn positive_lookbehind_witnesses_prepend_their_text() {
+        // The positive lookbehind rewrites the state text with the
+        // witness before the following literal is consumed.
+        let (_prefixes, states) = walk(r"(?<=xy)z", false, false).expect("walk");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text, "xyz");
+    }
+
+    #[test]
     fn single_bound_repeats_never_record_or_collect() {
         // `a?` has high == Some(1): no prefix candidates, no repeat collect.
         let (prefixes, states) = walk("xa?", true, false).expect("walk");
         assert!(
-            !prefixes.iter().any(|prefix| prefix == "x"),
+            prefixes.is_empty(),
             "high == 1 records nothing: {prefixes:?}"
         );
         assert_eq!(states.len(), 1);
@@ -599,6 +622,35 @@ mod tests {
     fn backreferences_consume_the_captured_text() {
         let (_prefixes, states) = walk(r"(xy)\1", false, false).expect("walk");
         assert_eq!(states[0].text, "xyxy");
+    }
+
+    #[test]
+    fn a_backreference_without_a_capture_consumes_nothing() {
+        // The second alternative's `\1` never sees a captured group 1
+        // (the branch runs on states where the first branch never ran),
+        // so the backreference contributes no state.
+        let (_prefixes, states) = walk(r"(a)|\1", false, false).expect("walk");
+        let texts: Vec<String> = states.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(texts, vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn a_single_char_forbidden_word_narrows_the_available_set() {
+        // The multi-atom lookahead body pends the single-char witness as
+        // a forbidden word; consuming the next atom must subtract it from
+        // the available set, which kills the walk here.
+        let (_prefixes, states) = walk(r"(?!x$)x", false, false).expect("walk");
+        assert!(states.is_empty(), "{states:?}");
+    }
+
+    #[test]
+    fn a_multi_char_forbidden_word_stays_out_of_the_narrowing() {
+        // The multi-char witness is forbidden as a whole word, so the
+        // per-character narrowing does not subtract it from the available
+        // set and the following literal consumes normally.
+        let (_prefixes, states) = walk(r"(?!xy)z", false, false).expect("walk");
+        let texts: Vec<String> = states.iter().map(|s| s.text.clone()).collect();
+        assert_eq!(texts, vec!["z".to_owned()]);
     }
 
     #[test]
@@ -754,5 +806,25 @@ mod tests {
         // the replay loop detects no progress and stops.
         let (_prefixes, states) = walk(r"(?:(?=x))+", true, false).expect("walk");
         assert_eq!(states.len(), 1);
+    }
+
+    #[test]
+    fn an_unbounded_optional_repeat_replays_its_pending_states() {
+        // `(?=x)*y`: the low-0 repeat walks its body, the pending witness
+        // survives the canonical check (the lookahead pends), and the
+        // replay ladder resolves it before the following literal.
+        let (_prefixes, states) = walk(r"(?=x)*y", true, false).expect("walk");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text, "y");
+    }
+
+    #[test]
+    fn a_bounded_optional_repeat_keeps_a_finite_replay_budget() {
+        // `{0,3}`: the low-0 walk pends the lookahead witness and the
+        // remaining-repeats budget for the replay ladder is the bounded
+        // high minus the already-taken zero passes.
+        let (_prefixes, states) = walk(r"(?:x(?=y)){0,3}z", true, false).expect("walk");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].text, "z");
     }
 }
