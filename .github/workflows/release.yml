@@ -62,6 +62,9 @@ jobs:
         with:
           rustflags: ""
 
+      - name: Build the pattern-probe child
+        run: cargo build -p guard-core-engine --bins
+
       - name: Ledger integrity
         run: cargo test -p guard-core-conformance --test ledger_integrity -- --nocapture
 
