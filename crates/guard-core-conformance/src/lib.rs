@@ -6,6 +6,7 @@ pub mod knobs;
 pub mod ledger;
 pub mod pipeline;
 pub mod report;
+pub mod safety;
 
 use serde_json::Value;
 

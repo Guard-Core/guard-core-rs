@@ -257,13 +257,9 @@ fn structural_reason_direct(pattern: &str) -> Option<StructuralRule> {
         );
     }
     if let Some(finding) = detect_adjacent_broad_unbounded_quantifiers(pattern) {
-        return Some(
-            if finding == super::structure::nesting_depth_rejection_reason() {
-                StructuralRule::NestingDepthExceeded
-            } else {
-                StructuralRule::AdjacentBroadUnboundedQuantifiers(finding)
-            },
-        );
+        // The nesting-depth rejection cannot reach this detector: the
+        // nested rule runs first in the chain and claims deep patterns.
+        return Some(StructuralRule::AdjacentBroadUnboundedQuantifiers(finding));
     }
     if let Some(finding) = detect_unreachable_terminator_scan(pattern) {
         return Some(StructuralRule::UnreachableTerminatorScan(finding));
@@ -272,13 +268,7 @@ fn structural_reason_direct(pattern: &str) -> Option<StructuralRule> {
         return Some(StructuralRule::LiteralAbsorbedByQuantifiedClass(finding));
     }
     if let Some(finding) = detect_ambiguous_optional_tail_in_quantified_group(pattern) {
-        return Some(
-            if finding == super::structure::nesting_depth_rejection_reason() {
-                StructuralRule::NestingDepthExceeded
-            } else {
-                StructuralRule::AmbiguousOptionalTail(finding)
-            },
-        );
+        return Some(StructuralRule::AmbiguousOptionalTail(finding));
     }
     None
 }

@@ -105,15 +105,6 @@ pub enum At {
     NonBoundary,
 }
 
-impl At {
-    /// Whether the anchor observes match history (the reference checks for
-    /// `BOUNDARY` in the node text).
-    #[must_use]
-    pub fn observes_history(self) -> bool {
-        matches!(self, Self::Boundary | Self::NonBoundary)
-    }
-}
-
 /// Repeat greediness kinds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepeatKind {
@@ -571,10 +562,9 @@ impl Parser {
                 seen.push(item);
             }
         }
-        if seen.len() == 1 && matches!(seen[0], ClassItem::Literal(_)) {
-            let ClassItem::Literal(cp) = seen.remove(0) else {
-                unreachable!("single literal guarded above");
-            };
+        if seen.len() == 1
+            && let ClassItem::Literal(cp) = seen[0]
+        {
             if negate {
                 return Ok(Op::NotLiteral(cp));
             }
@@ -589,44 +579,43 @@ impl Parser {
     }
 
     fn parse_repeat(&mut self, ops: &mut Vec<Op>, marker: char) -> Result<(), ParseError> {
-        let (low, high) = match marker {
-            '?' => (0u32, Some(1u32)),
-            '*' => (0u32, None),
-            '+' => (1u32, None),
-            '{' => {
-                // The '{' itself was consumed by the caller.
-                let brace_pos = self.pos - 1;
-                if self.peek() == Some('}') {
-                    ops.push(Op::Literal(u32::from('{')));
-                    return Ok(());
-                }
-                let lo = self.get_while(is_digit);
-                let hi = if self.match_char(',') {
-                    Some(self.get_while(is_digit))
-                } else {
-                    None // hi = lo
-                };
-                if !self.match_char('}') {
-                    // Not a quantifier: literal '{', re-reading the digit
-                    // run from just after the brace (the reference seeks).
-                    ops.push(Op::Literal(u32::from('{')));
-                    self.pos = brace_pos + 1;
-                    return Ok(());
-                }
-                let mut min = 0u32;
-                let mut max = high_from(lo.as_str(), hi.as_deref())?;
-                if !lo.is_empty() {
-                    min = parse_repeat_count(lo.as_str())?;
-                }
-                if let Some(mx) = max {
-                    if mx < min {
-                        return Err(ParseError("min repeat greater than max repeat".into()));
-                    }
-                    max = Some(mx);
-                }
-                (min, max)
+        // The caller only ever passes the reference `REPEAT_CHARS`.
+        let (low, high) = if marker == '?' {
+            (0u32, Some(1u32))
+        } else if marker == '*' || marker == '+' {
+            (u32::from(marker == '+'), None)
+        } else {
+            // The '{' itself was consumed by the caller.
+            let brace_pos = self.pos - 1;
+            if self.peek() == Some('}') {
+                ops.push(Op::Literal(u32::from('{')));
+                return Ok(());
             }
-            _ => unreachable!("caller supplies a repeat marker"),
+            let lo = self.get_while(is_digit);
+            let hi = if self.match_char(',') {
+                Some(self.get_while(is_digit))
+            } else {
+                None // hi = lo
+            };
+            if !self.match_char('}') {
+                // Not a quantifier: literal '{', re-reading the digit
+                // run from just after the brace (the reference seeks).
+                ops.push(Op::Literal(u32::from('{')));
+                self.pos = brace_pos + 1;
+                return Ok(());
+            }
+            let mut min = 0u32;
+            let mut max = high_from(lo.as_str(), hi.as_deref())?;
+            if !lo.is_empty() {
+                min = parse_repeat_count(lo.as_str())?;
+            }
+            if let Some(mx) = max {
+                if mx < min {
+                    return Err(ParseError("min repeat greater than max repeat".into()));
+                }
+                max = Some(mx);
+            }
+            (min, max)
         };
         let Some(last) = ops.last() else {
             return Err(ParseError("nothing to repeat".into()));

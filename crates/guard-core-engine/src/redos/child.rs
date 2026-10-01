@@ -220,27 +220,46 @@ fn parse_outcome(stdout: &str) -> Result<ChildOutcome, ChildSpawnError> {
 /// Locate the probe child binary.
 #[must_use]
 pub fn child_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("GUARD_PATTERN_PROBE_BIN") {
+    let env_override = std::env::var("GUARD_PATTERN_PROBE_BIN").ok();
+    resolve_child_path(
+        env_override.as_deref(),
+        std::env::current_exe().ok().as_deref(),
+    )
+}
+
+/// The pure half of [`child_path`], testable without process state.
+#[must_use]
+fn resolve_child_path(
+    env_override: Option<&str>,
+    exe: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = env_override {
         let path = PathBuf::from(path);
         if path.exists() {
             return Some(path);
         }
     }
-    let exe = std::env::current_exe().ok()?;
+    let exe = exe?;
     let exe_name = exe.file_name()?.to_str()?;
     if exe_name.starts_with("guard-pattern-probe") {
-        return Some(exe);
+        return Some(exe.to_path_buf());
     }
     let dir = exe.parent()?;
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for name in ["guard-pattern-probe", "guard-pattern-probe.exe"] {
-        candidates.push(dir.join(name));
-    }
-    if let Some(parent) = dir.parent() {
+    for base in core::iter::once(dir).chain(dir.parent()) {
         // Unit tests run from target/debug/deps; the sibling binary is in
         // target/debug.
         for name in ["guard-pattern-probe", "guard-pattern-probe.exe"] {
-            candidates.push(parent.join(name));
+            candidates.push(base.join(name));
+        }
+    }
+    // Doctests run from a temp directory, so the executable-relative search
+    // cannot find the probe binary. The workspace-relative location is
+    // compile-time known (crates/guard-core-engine -> <workspace>/target).
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace) = manifest.parent().and_then(|crates| crates.parent()) {
+        for name in ["guard-pattern-probe", "guard-pattern-probe.exe"] {
+            candidates.push(workspace.join("target/debug").join(name));
         }
     }
     candidates.into_iter().find(|candidate| candidate.exists())
@@ -432,19 +451,33 @@ fn child_reach_timing(payload: &Value) -> Value {
     let reference = reference_times.first().copied().unwrap_or(0.0);
     let mut results: Vec<Vec<f64>> = Vec::with_capacity(probes.len());
     for probe in probes {
-        let mut probe_times = vec![compiled.timed_search(probe)];
-        if probe_times[0] >= trigger {
-            for _ in 0..samples.saturating_sub(1) {
-                probe_times.push(compiled.timed_search(probe));
-                if *probe_times.last().expect("just pushed") > LARGE_SAMPLE_SECONDS {
-                    break;
-                }
-            }
-        }
+        let mut probe_times = sample_probe(probe, samples, trigger, &mut |text| {
+            compiled.timed_search(text)
+        });
         probe_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         results.push(probe_times);
     }
     json!({ "results": results, "reference": reference })
+}
+
+/// Reference sampling: one first pass, then more only while the first met
+/// the trigger, stopping early on a large sample.
+fn sample_probe(
+    probe: &str,
+    samples: usize,
+    trigger: f64,
+    timed_search: &mut dyn FnMut(&str) -> f64,
+) -> Vec<f64> {
+    let mut probe_times = vec![timed_search(probe)];
+    if probe_times[0] >= trigger {
+        for _ in 0..samples.saturating_sub(1) {
+            probe_times.push(timed_search(probe));
+            if *probe_times.last().expect("just pushed") > LARGE_SAMPLE_SECONDS {
+                break;
+            }
+        }
+    }
+    probe_times
 }
 
 fn child_reference_load() -> Value {
@@ -492,21 +525,27 @@ pub fn child_main(args: &[String]) -> Option<i32> {
     if std::io::stdin().read_to_string(&mut payload).is_err() {
         return Some(1);
     }
-    let Ok(value) = serde_json::from_str::<Value>(&payload) else {
-        return Some(1);
-    };
-    let output = match value["op"].as_str() {
-        Some("test_strings") => child_test_strings(&value),
-        Some("reach_timing") => child_reach_timing(&value),
-        Some("reference_load") => child_reference_load(),
-        Some("stray_verify") => child_stray_verify(&value),
-        _ => Value::Null,
+    let output = match serde_json::from_str::<Value>(&payload) {
+        Ok(value) => dispatch_payload(&value),
+        Err(_) => return Some(1),
     };
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(output.to_string().as_bytes());
     let _ = stdout.write_all(b"\n");
     let _ = stdout.flush();
     Some(0)
+}
+
+/// The pure child dispatch, testable without stdin.
+#[must_use]
+pub fn dispatch_payload(value: &Value) -> Value {
+    match value["op"].as_str() {
+        Some("test_strings") => child_test_strings(value),
+        Some("reach_timing") => child_reach_timing(value),
+        Some("reference_load") => child_reference_load(),
+        Some("stray_verify") => child_stray_verify(value),
+        _ => Value::Null,
+    }
 }
 
 #[cfg(test)]
