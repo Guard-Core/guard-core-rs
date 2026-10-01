@@ -3,15 +3,6 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 use regex::Regex;
 
-const DANGEROUS_PATTERNS: &[&str] = &[
-    r"\(\.\*\)\+",
-    r"\(\.\+\)\+",
-    r"\([^)]*\*\)\+",
-    r"\([^)]*\+\)\+",
-    r"(?:\.\*){2,}",
-    r"(?:\.\+){2,}",
-];
-
 /// LRU cache for compiled regex patterns.
 ///
 /// Capacity is clamped to 1..=5000. Patterns are compiled with
@@ -63,23 +54,18 @@ pub fn compile(pattern: &str) -> Result<Regex, regex::Error> {
     Regex::new(&format!("(?im){pattern}"))
 }
 
-/// Check if a pattern contains constructs that cause catastrophic
-/// backtracking in PCRE/Python `re`.
+/// Check whether a pattern is safe from catastrophic backtracking with the
+/// full reference safety chain (dangerous constructs, compile check,
+/// structural detectors, probe synthesis, and the empirical cost arbiter).
 ///
-/// Rust's `regex` crate uses finite automata and is inherently ReDoS-safe,
-/// but this flags patterns that would be dangerous in other engines.
-/// On match, the returned reason names the specific dangerous construct.
-#[must_use]
-pub fn validate_pattern_safety(pattern: &str) -> (bool, &'static str) {
-    for &dangerous in DANGEROUS_PATTERNS {
-        if let Ok(checker) = Regex::new(dangerous)
-            && checker.is_match(pattern)
-        {
-            return (false, dangerous);
-        }
-    }
-
-    (true, "pattern appears safe")
+/// The `regex` crate is linear-time, so this certifies the pattern source
+/// the way the reference engine does: the reasons name the specific
+/// finding and match the reference's human-readable prefixes.
+///
+/// Prefer [`crate::redos::validate_pattern_safety`] for the structured
+/// verdict; this compat shim keeps the historic two-tuple shape.
+pub fn validate_pattern_safety(pattern: &str) -> (bool, String) {
+    crate::redos::validate_pattern_safety_compat(pattern)
 }
 
 /// Compile multiple patterns, skipping invalid ones. When `validate` is
@@ -163,7 +149,7 @@ mod tests {
     fn safe_patterns_pass() {
         let (safe, msg) = validate_pattern_safety(r"test\d+");
         assert!(safe);
-        assert_eq!(msg, "pattern appears safe");
+        assert_eq!(msg, "Pattern appears safe");
 
         for pat in [r"<script[^>]*>", r"\d{3}-\d{3}-\d{4}", r"[a-zA-Z0-9]+"] {
             assert!(validate_pattern_safety(pat).0, "should pass: {pat}");

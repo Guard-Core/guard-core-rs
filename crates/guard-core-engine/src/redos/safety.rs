@@ -1,0 +1,395 @@
+//! The pattern-safety verdict API.
+//!
+//! Replaces the engine's 6-regex stub with the full reference chain:
+//! dangerous constructs, compile check, structural detectors, reach-probe
+//! synthesis, and the empirical cost arbiter over killable children.
+
+use super::ast;
+use super::cost_arbiter::{
+    reach_probe_cost_reason, reach_probe_unreachable_reason, run_pattern_safety_probe,
+    CostOutcome, TestStringsOutcome,
+};
+use super::prefilters::{dangerous_construct_violation, first_structural_safety_violation};
+
+/// Which validation run to perform (the reference's two modes).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SafetyMode {
+    /// Search the given strings under the per-string threshold after the
+    /// structural check (reference `test_strings` argument).
+    TestStrings(Vec<String>),
+    /// Synthesize probes and arbitrate extrapolated cost (reference
+    /// `max_content_length` argument).
+    CostVerdict {
+        max_content_length: Option<usize>,
+    },
+}
+
+/// The five structural rules plus the nesting-depth rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StructuralRule {
+    NestedUnboundedQuantifier(String),
+    AdjacentBroadUnboundedQuantifiers(String),
+    UnreachableTerminatorScan(String),
+    LiteralAbsorbedByQuantifiedClass(String),
+    AmbiguousOptionalTail(String),
+    NestingDepthExceeded,
+}
+
+/// Why a pattern was rejected or accepted.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SafetyReason {
+    /// One of the three dangerous backtracking constructs.
+    DangerousConstruct(String),
+    /// Neither engine can compile the pattern.
+    CompileFailed(String),
+    /// A structural detector flagged the pattern.
+    Structural(StructuralRule),
+    /// A test string exceeded the per-string threshold.
+    ProbeStringTimeout(usize),
+    /// The test-strings child was killed by its deadline.
+    ProbeSubprocessTimeout,
+    /// The timing child failed to spawn or exited unexpectedly.
+    ProbeSpawnFailed(String),
+    /// No reaching probe could be synthesized.
+    UnreachableProbe,
+    /// Extrapolated cost exceeds the budget at the cap.
+    OverBudget {
+        cap: usize,
+        extrapolated: f64,
+        ratio: f64,
+        min_32: f64,
+        median_32: f64,
+        load_factor: f64,
+    },
+    /// Probe construction exceeded its deadline or a builder budget.
+    BuilderDeadline(String),
+    /// No adversarial trigger found; certified safe.
+    Safe,
+}
+
+impl SafetyReason {
+    /// The stable reason class token (the corpus pins these).
+    #[must_use]
+    pub fn reason_class(&self) -> &'static str {
+        match self {
+            Self::DangerousConstruct(_) => "dangerous_construct",
+            Self::CompileFailed(_) => "compile_failed",
+            Self::Structural(rule) => rule.reason_class(),
+            Self::ProbeStringTimeout(_) => "probe_string_timeout",
+            Self::ProbeSubprocessTimeout
+            | Self::ProbeSpawnFailed(_) => "probe_subprocess_timeout",
+            Self::UnreachableProbe => "unreachable_probe",
+            Self::OverBudget { .. } => "over_budget",
+            Self::BuilderDeadline(_) => "builder_deadline",
+            Self::Safe => "safe",
+        }
+    }
+}
+
+impl StructuralRule {
+    /// The stable reason class token per structural rule.
+    #[must_use]
+    pub fn reason_class(&self) -> &'static str {
+        match self {
+            Self::NestedUnboundedQuantifier(_) => "structural_nested_unbounded",
+            Self::AdjacentBroadUnboundedQuantifiers(_) => "structural_adjacent_broad",
+            Self::UnreachableTerminatorScan(_) => "structural_unreachable_terminator",
+            Self::LiteralAbsorbedByQuantifiedClass(_) => "structural_literal_absorb",
+            Self::AmbiguousOptionalTail(_) => "structural_ambiguous_tail",
+            Self::NestingDepthExceeded => "structural_nesting_depth",
+        }
+    }
+}
+
+impl std::fmt::Display for SafetyReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DangerousConstruct(construct) => {
+                write!(f, "Pattern contains dangerous construct: {construct}")
+            }
+            Self::CompileFailed(error) => {
+                write!(f, "Pattern validation failed: {error}")
+            }
+            Self::Structural(rule) => write!(f, "{}", structural_rule_text(rule)),
+            Self::ProbeStringTimeout(length) => {
+                write!(f, "Pattern timed out on test string of length {length}")
+            }
+            Self::ProbeSubprocessTimeout => write!(
+                f,
+                "Pattern validation probe exceeded the {}s killable-subprocess timeout",
+                super::cost_arbiter::PATTERN_SAFETY_PROBE_TIMEOUT_SECONDS
+            ),
+            Self::ProbeSpawnFailed(detail) => {
+                write!(f, "Pattern validation probe failed to run: {detail}")
+            }
+            Self::UnreachableProbe => {
+                write!(f, "{}", reach_probe_unreachable_reason(None))
+            }
+            Self::OverBudget {
+                cap,
+                extrapolated,
+                ratio,
+                min_32,
+                median_32,
+                load_factor,
+            } => write!(
+                f,
+                "{}",
+                reach_probe_cost_reason(
+                    None,
+                    &super::cost_arbiter::OverBudget {
+                        cap: *cap,
+                        extrapolated: *extrapolated,
+                        ratio: *ratio,
+                        min_32: *min_32,
+                        median_32: *median_32,
+                        load_factor: *load_factor,
+                    },
+                )
+            ),
+            Self::BuilderDeadline(message) => write!(f, "{message}"),
+            Self::Safe => write!(f, "Pattern appears safe"),
+        }
+    }
+}
+
+fn structural_rule_text(rule: &StructuralRule) -> String {
+    match rule {
+        StructuralRule::NestedUnboundedQuantifier(finding) => format!(
+            "Pattern contains nested unbounded quantifier: {finding}"
+        ),
+        StructuralRule::AdjacentBroadUnboundedQuantifiers(finding) => format!(
+            "Pattern contains adjacent broad unbounded quantifiers: {finding}"
+        ),
+        StructuralRule::UnreachableTerminatorScan(finding) => format!(
+            "Pattern contains a broad scan whose terminator cannot be reached \
+             by repeating its own prefix: {finding}"
+        ),
+        StructuralRule::LiteralAbsorbedByQuantifiedClass(finding) => format!(
+            "Pattern contains a quantified class that can absorb the mandatory \
+             literal immediately following it: {finding}"
+        ),
+        StructuralRule::AmbiguousOptionalTail(finding) => format!(
+            "Pattern contains an ambiguous optional tail inside an unbounded \
+             quantified group: {finding}"
+        ),
+        StructuralRule::NestingDepthExceeded => super::structure::nesting_depth_rejection_reason(),
+    }
+}
+
+/// The full validation verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SafetyVerdict {
+    pub safe: bool,
+    pub reason: SafetyReason,
+}
+
+impl SafetyVerdict {
+    fn unsafe_reason(reason: SafetyReason) -> Self {
+        Self {
+            safe: false,
+            reason,
+        }
+    }
+
+    /// The stable reason class token.
+    #[must_use]
+    pub fn reason_class(&self) -> &'static str {
+        self.reason.reason_class()
+    }
+}
+
+impl std::fmt::Display for SafetyVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+/// The reference's default flags: IGNORECASE | MULTILINE.
+pub fn default_flags() -> super::ast::Flags {
+    super::ast::Flags::ignorecase_multiline()
+}
+
+fn compile_failed(pattern: &str, flags: super::ast::Flags) -> Result<(), String> {
+    let prefix = if flags.ignorecase || flags.multiline || flags.dotall || flags.ascii {
+        let mut prefix = String::from("(?");
+        if flags.ignorecase {
+            prefix.push('i');
+        }
+        if flags.multiline {
+            prefix.push('m');
+        }
+        if flags.dotall {
+            prefix.push('s');
+        }
+        if flags.ascii {
+            prefix.push('a');
+        }
+        prefix.push(')');
+        prefix
+    } else {
+        String::new()
+    };
+    // The compile check mirrors the oracle's `re.compile` (the reference
+    // `compile_pattern_sync`): Python-syntax validity only. The
+    // Python-syntax floor the oracle pins rejects lookalike syntax the
+    // `regex` crate would take (and vice versa); the timing child still
+    // falls back to `fancy-regex` for patterns the crate cannot compile.
+    let _ = prefix;
+    ast::parse(pattern, flags).map(|_| ()).map_err(|e| e.0)
+}
+
+fn structural_reason(pattern: &str) -> Option<StructuralRule> {
+    structural_reason_direct(pattern)
+}
+
+fn structural_reason_direct(pattern: &str) -> Option<StructuralRule> {
+    use super::ambiguous_tail::detect_ambiguous_optional_tail_in_quantified_group;
+    use super::literal_in_wildcard::detect_ambiguous_literal_boundary;
+    use super::structure::{
+        detect_adjacent_broad_unbounded_quantifiers, detect_nested_unbounded_quantifier,
+    };
+    use super::unreachable_terminator::detect_unreachable_terminator_scan;
+    if let Some(finding) = detect_nested_unbounded_quantifier(pattern) {
+        return Some(if finding == super::structure::nesting_depth_rejection_reason() {
+            StructuralRule::NestingDepthExceeded
+        } else {
+            StructuralRule::NestedUnboundedQuantifier(finding)
+        });
+    }
+    if let Some(finding) = detect_adjacent_broad_unbounded_quantifiers(pattern) {
+        return Some(if finding == super::structure::nesting_depth_rejection_reason() {
+            StructuralRule::NestingDepthExceeded
+        } else {
+            StructuralRule::AdjacentBroadUnboundedQuantifiers(finding)
+        });
+    }
+    if let Some(finding) = detect_unreachable_terminator_scan(pattern) {
+        return Some(StructuralRule::UnreachableTerminatorScan(finding));
+    }
+    if let Some(finding) = detect_ambiguous_literal_boundary(pattern) {
+        return Some(StructuralRule::LiteralAbsorbedByQuantifiedClass(finding));
+    }
+    if let Some(finding) = detect_ambiguous_optional_tail_in_quantified_group(pattern) {
+        return Some(if finding == super::structure::nesting_depth_rejection_reason() {
+            StructuralRule::NestingDepthExceeded
+        } else {
+            StructuralRule::AmbiguousOptionalTail(finding)
+        });
+    }
+    None
+}
+
+/// Validate a pattern with the full safety chain under `flags`.
+#[must_use]
+pub fn validate_pattern_safety_with_flags(
+    pattern: &str,
+    mode: &SafetyMode,
+    flags: super::ast::Flags,
+) -> SafetyVerdict {
+    if let Some(construct) = dangerous_construct_violation(pattern) {
+        return SafetyVerdict::unsafe_reason(SafetyReason::DangerousConstruct(construct));
+    }
+    if let Err(error) = compile_failed(pattern, flags) {
+        return SafetyVerdict::unsafe_reason(SafetyReason::CompileFailed(error));
+    }
+    match mode {
+        SafetyMode::TestStrings(test_strings) => {
+            if let Some(rule) = structural_reason(pattern) {
+                return SafetyVerdict::unsafe_reason(SafetyReason::Structural(rule));
+            }
+            match run_pattern_safety_probe(pattern, test_strings.clone(), flags) {
+                TestStringsOutcome::Safe => SafetyVerdict {
+                    safe: true,
+                    reason: SafetyReason::Safe,
+                },
+                TestStringsOutcome::SlowString(length) => SafetyVerdict::unsafe_reason(
+                    SafetyReason::ProbeStringTimeout(length),
+                ),
+                TestStringsOutcome::CompileFailed(message) => {
+                    SafetyVerdict::unsafe_reason(SafetyReason::CompileFailed(message))
+                }
+                TestStringsOutcome::SubprocessTimeout => SafetyVerdict::unsafe_reason(
+                    SafetyReason::ProbeSubprocessTimeout,
+                ),
+                TestStringsOutcome::SpawnFailed(detail) => SafetyVerdict::unsafe_reason(
+                    SafetyReason::ProbeSpawnFailed(detail),
+                ),
+            }
+        }
+        SafetyMode::CostVerdict { max_content_length } => {
+            match super::cost_arbiter::reach_probe_cost_verdict(
+                pattern,
+                *max_content_length,
+                flags,
+            ) {
+                CostOutcome::Safe => SafetyVerdict {
+                    safe: true,
+                    reason: SafetyReason::Safe,
+                },
+                CostOutcome::Over(over) => {
+                    let reason = SafetyReason::OverBudget {
+                        cap: over.cap,
+                        extrapolated: over.extrapolated,
+                        ratio: over.ratio,
+                        min_32: over.min_32,
+                        median_32: over.median_32,
+                        load_factor: over.load_factor,
+                    };
+                    SafetyVerdict::unsafe_reason(reason)
+                }
+                CostOutcome::Unreachable => SafetyVerdict::unsafe_reason(
+                    SafetyReason::UnreachableProbe,
+                ),
+                CostOutcome::Structural => {
+                    match structural_reason(pattern) {
+                        Some(rule) => SafetyVerdict::unsafe_reason(SafetyReason::Structural(rule)),
+                        None => SafetyVerdict::unsafe_reason(SafetyReason::BuilderDeadline(
+                            // Unreachable: the arbiter only echoes a
+                            // structural violation that exists.
+                            "structural violation".into(),
+                        )),
+                    }
+                }
+                CostOutcome::BuilderDeadline(message) => {
+                    // A builder timeout echoes the structural violation when
+                    // one exists (reference behavior).
+                    if message == super::structure::nesting_depth_rejection_reason() {
+                        return SafetyVerdict::unsafe_reason(
+                            SafetyReason::Structural(StructuralRule::NestingDepthExceeded),
+                        );
+                    }
+                    if first_structural_safety_violation(pattern).is_some() {
+                        return match structural_reason(pattern) {
+                            Some(rule) => {
+                                SafetyVerdict::unsafe_reason(SafetyReason::Structural(rule))
+                            }
+                            None => SafetyVerdict::unsafe_reason(
+                                SafetyReason::BuilderDeadline(message),
+                            ),
+                        };
+                    }
+                    SafetyVerdict::unsafe_reason(SafetyReason::BuilderDeadline(message))
+                }
+            }
+        }
+    }
+}
+
+/// Validate a pattern with the full safety chain under the reference's
+/// default flags (IGNORECASE | MULTILINE).
+#[must_use]
+pub fn validate_pattern_safety(pattern: &str, mode: &SafetyMode) -> SafetyVerdict {
+    validate_pattern_safety_with_flags(pattern, mode, default_flags())
+}
+
+/// Compat shim preserving the old two-tuple shape for existing consumers
+/// (the pyo3 facade and config paths): cost-verdict mode under default
+/// flags.
+#[must_use]
+pub fn validate_pattern_safety_compat(pattern: &str) -> (bool, String) {
+    let verdict = validate_pattern_safety(pattern, &SafetyMode::CostVerdict {
+        max_content_length: None,
+    });
+    (verdict.safe, verdict.reason.to_string())
+}

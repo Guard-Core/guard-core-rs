@@ -1,0 +1,447 @@
+//! Reaching probe synthesis: build a concrete string that reaches every
+//! quantified region of the pattern.
+//!
+//! Port of the reference `_redos_reach_probe.py`.
+
+use std::collections::HashSet;
+
+use super::ambiguous_tail::representative_char_for_atom;
+use super::parse_slots::candidate_chars_for_atom_text;
+use super::structure::{
+    find_group_end, skip_char_class, split_top_level_alternations, MAX_GROUP_NESTING_DEPTH,
+};
+
+const PROBE_REACH_STRESS_LEN: usize = 4000;
+const PROBE_REACH_BOUNDED_CAP: usize = 4000;
+const PROBE_REACH_TOTAL_BUDGET: usize = 12000;
+const PROBE_REACH_MAX_LENGTH: usize = 2 * PROBE_REACH_TOTAL_BUDGET;
+const PROBE_REACH_GROUP_REPEAT_CAP: usize = 3;
+const PROBE_REACH_BREAK_CHAR_CANDIDATES: &[char] =
+    &['\u{1}', '\u{2}', '\u{3}', '\u{4}', '\u{5}', '\u{6}', '\u{7}', '\u{8}'];
+const PROBE_REACH_ZERO_WIDTH_ESCAPES: &str = "AZbB";
+const PROBE_REACH_LOOKAROUND_PREFIXES: &[&str] = &["?=", "?!", "?<=", "?<!"];
+
+/// Synthesis failure: either the reference `OverflowError` (mandatory
+/// repeat exceeds the budget) or an unrepresentable construct.
+#[derive(Debug)]
+struct SynthError;
+
+struct BudgetCell(i64);
+
+impl BudgetCell {
+    fn take(&mut self, amount: i64) {
+        self.0 -= amount;
+    }
+}
+
+fn reach_budget_clamped_count(
+    budget: &BudgetCell,
+    unit_len: usize,
+    low: usize,
+    high: usize,
+) -> Result<usize, SynthError> {
+    if unit_len == 0 {
+        return Ok(high);
+    }
+    let unit_len_i = unit_len as i64;
+    if low as i64 > PROBE_REACH_MAX_LENGTH as i64 / unit_len_i {
+        return Err(SynthError);
+    }
+    let affordable = (budget.0.max(0) as usize) / unit_len;
+    Ok(low.max(high.min(affordable)))
+}
+
+fn reach_symbol_quantifier_range(text: &[char], k: usize, c: char) -> (usize, usize, usize) {
+    let mut end = k + 1;
+    if end < text.len() && text[end] == '?' {
+        end += 1;
+    }
+    match c {
+        '*' => (0, PROBE_REACH_STRESS_LEN, end),
+        '+' => (1, PROBE_REACH_STRESS_LEN, end),
+        _ => (0, 1, end),
+    }
+}
+
+fn reach_brace_quantifier_high(parts: &[&str]) -> Option<usize> {
+    if parts.len() == 1 {
+        return parts[0].parse().ok();
+    }
+    if parts[1].is_empty() {
+        return Some(PROBE_REACH_STRESS_LEN);
+    }
+    if parts[1].chars().all(|c| c.is_ascii_digit()) {
+        return parts[1].parse().ok();
+    }
+    None
+}
+
+fn reach_brace_quantifier_range(text: &[char], k: usize) -> Option<(usize, usize, usize)> {
+    let offset = text[k..].iter().position(|c| *c == '}')?;
+    let end_brace = k + offset;
+    let inner: String = text[k + 1..end_brace].iter().collect();
+    let parts: Vec<&str> = inner.split(',').collect();
+    if !parts[0].chars().all(|c| c.is_ascii_digit()) || parts[0].is_empty() {
+        return None;
+    }
+    let low: usize = parts[0].parse().ok()?;
+    let high = reach_brace_quantifier_high(&parts)?;
+    let mut end = end_brace + 1;
+    if end < text.len() && text[end] == '?' {
+        end += 1;
+    }
+    Some((low, low.max(high.min(PROBE_REACH_BOUNDED_CAP)), end))
+}
+
+fn reach_quantifier_repeat_range(text: &[char], k: usize) -> (usize, usize, usize) {
+    if k >= text.len() {
+        return (1, 1, k);
+    }
+    let c = text[k];
+    if matches!(c, '*' | '+' | '?') {
+        return reach_symbol_quantifier_range(text, k, c);
+    }
+    if c != '{' {
+        return (1, 1, k);
+    }
+    reach_brace_quantifier_range(text, k).unwrap_or((1, 1, k))
+}
+
+fn is_flag_letter(c: char) -> bool {
+    matches!(c, 'a' | 'i' | 'L' | 'm' | 's' | 'u' | 'x')
+}
+
+/// Parse `?flags` / `?flags:head` / `?flags-flags:head` shapes. Returns
+/// `Some((consumed_including_colon, scoped))` when the head is an inline
+/// flag group, else `None`.
+fn parse_inline_flags_head(raw_inner: &str) -> Option<(usize, bool)> {
+    let chars: Vec<char> = raw_inner.chars().collect();
+    let mut i = 1usize;
+    while i < chars.len() && is_flag_letter(chars[i]) {
+        i += 1;
+    }
+    if i < chars.len() && chars[i] == '-' {
+        i += 1;
+        let start = i;
+        while i < chars.len() && is_flag_letter(chars[i]) {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+    }
+    if i < chars.len() && chars[i] == ':' {
+        return Some((i + 1, true));
+    }
+    if i == chars.len() {
+        return Some((i, false));
+    }
+    None
+}
+
+fn reach_group_walk_target(raw_inner: &str) -> (Option<String>, bool) {
+    let chars: Vec<char> = raw_inner.chars().collect();
+    if !raw_inner.starts_with('?') {
+        return (Some(raw_inner.to_owned()), false);
+    }
+    if raw_inner.starts_with("?:") {
+        return (Some(raw_inner[2..].to_owned()), false);
+    }
+    if raw_inner.starts_with("?P<") {
+        return match chars.iter().position(|c| *c == '>') {
+            Some(close) => (Some(chars[close + 1..].iter().collect()), false),
+            None => (None, false),
+        };
+    }
+    if PROBE_REACH_LOOKAROUND_PREFIXES
+        .iter()
+        .any(|prefix| raw_inner.starts_with(prefix))
+    {
+        return (None, true);
+    }
+    if raw_inner.starts_with("?#") {
+        return (None, true);
+    }
+    match parse_inline_flags_head(raw_inner) {
+        Some((consumed, true)) => {
+            let rest: String = chars[consumed..].iter().collect();
+            (Some(rest), false)
+        }
+        Some((_, false)) => (None, true),
+        None => (None, false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reach_stress_fill(
+    text: &[char],
+    token_end: usize,
+    rep: &str,
+    chars_seen: &mut HashSet<char>,
+    budget: &mut BudgetCell,
+) -> Result<(String, usize), SynthError> {
+    let (low, high, next_i) = reach_quantifier_repeat_range(text, token_end);
+    let count = reach_budget_clamped_count(budget, rep.chars().count(), low, high)?;
+    budget.take((rep.chars().count() * count) as i64);
+    if let Some(first) = rep.chars().next() {
+        chars_seen.insert(first);
+    }
+    Ok((rep.repeat(count), next_i))
+}
+
+fn is_hex(c: char) -> bool {
+    c.is_ascii_hexdigit()
+}
+
+struct SynthContext<'a> {
+    chars_seen: &'a mut HashSet<char>,
+    budget: &'a mut BudgetCell,
+    group_texts: &'a mut Vec<(u32, String)>,
+    group_counter: &'a mut u32,
+}
+
+fn synth_escape_atom(
+    text: &[char],
+    i: usize,
+    ctx: &mut SynthContext,
+) -> Result<Option<(String, usize)>, SynthError> {
+    if i + 1 >= text.len() {
+        return Ok(None);
+    }
+    let letter = text[i + 1];
+    let hex_second = text.get(i + 2).copied();
+    let hex_third = text.get(i + 3).copied();
+    let is_hex_escape = letter == 'x'
+        && i + 3 < text.len()
+        && hex_second.is_some_and(is_hex)
+        && hex_third.is_some_and(is_hex);
+    let token_end = if is_hex_escape { i + 4 } else { i + 2 };
+    if PROBE_REACH_ZERO_WIDTH_ESCAPES.contains(letter) {
+        return Ok(Some((String::new(), token_end)));
+    }
+    if letter.is_ascii_digit() {
+        let backref = ctx
+            .group_texts
+            .iter()
+            .find(|(group, _)| *group == u32::from(letter) - u32::from('0'))
+            .map(|(_, text)| text.clone());
+        let Some(backref) = backref else {
+            return Ok(None);
+        };
+        return reach_stress_fill(text, token_end, &backref, ctx.chars_seen, ctx.budget)
+            .map(Some);
+    }
+    let rep = if is_hex_escape {
+        let hex: String = text[i + 2..i + 4].iter().collect();
+        u32::from_str_radix(&hex, 16)
+            .ok()
+            .and_then(char::from_u32)
+            .map(String::from)
+    } else {
+        let atom: String = text[i..token_end].iter().collect();
+        representative_char_for_atom(&atom).map(String::from)
+    };
+    let Some(rep) = rep else {
+        return Ok(None);
+    };
+    reach_stress_fill(text, token_end, &rep, ctx.chars_seen, ctx.budget).map(Some)
+}
+
+fn synth_char_class_atom(
+    text: &[char],
+    i: usize,
+    ctx: &mut SynthContext,
+) -> Result<Option<(String, usize)>, SynthError> {
+    let end = skip_char_class(text, i);
+    let atom: String = text[i..end].iter().collect();
+    let Some(rep) = representative_char_for_atom(&atom) else {
+        return Ok(None);
+    };
+    reach_stress_fill(text, end, &rep.to_string(), ctx.chars_seen, ctx.budget).map(Some)
+}
+
+fn synth_dot_atom(
+    text: &[char],
+    i: usize,
+    ctx: &mut SynthContext,
+) -> Result<(String, usize), SynthError> {
+    reach_stress_fill(text, i + 1, "a", ctx.chars_seen, ctx.budget)
+}
+
+fn synth_group_atom(
+    text: &[char],
+    i: usize,
+    depth: usize,
+    ctx: &mut SynthContext,
+) -> Result<Option<(String, usize)>, SynthError> {
+    let Some(group_end) = find_group_end(text, i) else {
+        return Ok(None);
+    };
+    let raw_inner: String = text[i + 1..group_end - 1].iter().collect();
+    let mut reserved_number: Option<u32> = None;
+    if !raw_inner.starts_with('?') || raw_inner.starts_with("?P<") {
+        *ctx.group_counter += 1;
+        reserved_number = Some(*ctx.group_counter);
+    }
+    let (walk_inner, skip) = reach_group_walk_target(&raw_inner);
+    if skip {
+        return Ok(Some((String::new(), group_end)));
+    }
+    let Some(walk_inner) = walk_inner else {
+        return Ok(None);
+    };
+    let walk_chars: Vec<char> = walk_inner.chars().collect();
+    let Some(first_branch) = split_top_level_alternations(&walk_chars).into_iter().next()
+    else {
+        return Ok(None);
+    };
+    let first_branch_chars: Vec<char> = first_branch.chars().collect();
+    let (sub_text, sub_ok) = synthesize_segment(
+        &first_branch_chars,
+        depth + 1,
+        ctx,
+    )?;
+    if !sub_ok {
+        return Ok(None);
+    }
+    if let Some(number) = reserved_number {
+        ctx.group_texts.push((number, sub_text.clone()));
+    }
+    let (low, high, next_i) = reach_quantifier_repeat_range(text, group_end);
+    let high = low.max(high.min(PROBE_REACH_GROUP_REPEAT_CAP));
+    let count = reach_budget_clamped_count(ctx.budget, sub_text.chars().count(), low, high)?;
+    ctx.budget.take((sub_text.chars().count() * count) as i64);
+    Ok(Some((sub_text.repeat(count), next_i)))
+}
+
+fn synth_next_atom(
+    text: &[char],
+    i: usize,
+    depth: usize,
+    ctx: &mut SynthContext,
+) -> Result<Option<(String, usize)>, SynthError> {
+    match text[i] {
+        '\\' => synth_escape_atom(text, i, ctx),
+        '[' => synth_char_class_atom(text, i, ctx),
+        '.' => synth_dot_atom(text, i, ctx).map(Some),
+        '(' => synth_group_atom(text, i, depth, ctx),
+        c => reach_stress_fill(text, i + 1, &c.to_string(), ctx.chars_seen, ctx.budget)
+            .map(Some),
+    }
+}
+
+fn synthesize_segment(
+    text: &[char],
+    depth: usize,
+    ctx: &mut SynthContext,
+) -> Result<(String, bool), SynthError> {
+    if depth > MAX_GROUP_NESTING_DEPTH {
+        return Ok((String::new(), false));
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut length = 0usize;
+    let mut i = 0usize;
+    let n = text.len();
+    while i < n {
+        if text[i] == '^' || text[i] == '$' {
+            i += 1;
+            continue;
+        }
+        let Ok(result) = synth_next_atom(text, i, depth, ctx) else {
+            return Ok((String::new(), false));
+        };
+        let Some((piece, next_i)) = result else {
+            return Ok((String::new(), false));
+        };
+        length += piece.chars().count();
+        if length > PROBE_REACH_MAX_LENGTH {
+            return Ok((String::new(), false));
+        }
+        out.push(piece);
+        i = next_i;
+    }
+    Ok((out.concat(), true))
+}
+
+/// Reference `_synthesize_reaching_probe`.
+#[must_use]
+pub fn synthesize_reaching_probe(pattern: &str) -> Option<String> {
+    let mut chars_seen: HashSet<char> = HashSet::new();
+    let mut budget = BudgetCell(PROBE_REACH_TOTAL_BUDGET as i64);
+    let mut group_texts: Vec<(u32, String)> = Vec::new();
+    let mut group_counter: u32 = 0;
+    let text: Vec<char> = pattern.chars().collect();
+    let mut ctx = SynthContext {
+        chars_seen: &mut chars_seen,
+        budget: &mut budget,
+        group_texts: &mut group_texts,
+        group_counter: &mut group_counter,
+    };
+    let Ok((body, ok)) = synthesize_segment(&text, 0, &mut ctx) else {
+        return None;
+    };
+    if !ok {
+        return None;
+    }
+    let breaking = PROBE_REACH_BREAK_CHAR_CANDIDATES
+        .iter()
+        .find(|c| !chars_seen.contains(c))?;
+    Some(format!("{body}{breaking}"))
+}
+
+/// Representative char for an escape-or-class atom plus the span end,
+/// reference `_representative_char_and_end_for_escape_or_class`.
+#[must_use]
+pub fn representative_char_and_end_for_escape_or_class(
+    pattern: &str,
+    i: usize,
+) -> Option<(usize, Option<char>)> {
+    let chars: Vec<char> = pattern.chars().collect();
+    if chars[i] == '\\' && i + 1 < chars.len() {
+        let atom_end = i + 2;
+        let atom: String = chars[i..atom_end].iter().collect();
+        return Some((atom_end, representative_char_for_atom(&atom)));
+    }
+    if chars[i] == '[' {
+        let atom_end = skip_char_class(&chars, i);
+        let atom: String = chars[i..atom_end].iter().collect();
+        return Some((atom_end, representative_char_for_atom(&atom)));
+    }
+    None
+}
+
+/// Reference `_extract_literal_chars`.
+#[must_use]
+pub fn extract_literal_chars(pattern: &str) -> Vec<char> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut extracted: Vec<char> = Vec::new();
+    let mut i = 0usize;
+    let n = chars.len();
+    while i < n {
+        if let Some((next_i, rep)) = representative_char_and_end_for_escape_or_class(pattern, i) {
+            i = next_i;
+            if let Some(rep) = rep {
+                extracted.push(rep);
+            }
+            continue;
+        }
+        let c = chars[i];
+        if c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '~' | ' ') {
+            extracted.push(c);
+        }
+        i += 1;
+    }
+    extracted
+}
+
+/// Exposed for parity tests of the walk-target classifier.
+#[must_use]
+pub fn reach_group_walk_target_probe(raw_inner: &str) -> (Option<String>, bool) {
+    reach_group_walk_target(raw_inner)
+}
+
+/// Exposed for parity tests of the candidate-char helper.
+#[must_use]
+pub fn probe_candidate_chars(atom_text: &str) -> Vec<char> {
+    candidate_chars_for_atom_text(atom_text, super::ast::Flags::default())
+}

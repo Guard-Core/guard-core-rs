@@ -21,6 +21,7 @@ pub mod patterns;
 pub mod performance_monitor;
 pub mod preprocessor;
 pub mod rate_limit;
+pub mod redos;
 pub mod redis_schema;
 pub mod referrer;
 pub mod request_limits;

@@ -194,7 +194,7 @@ fn detect_obfuscation(content: &str) -> bool {
 /// tuple[bool, str]
 ///     (is_safe, reason) pair.
 #[pyfunction]
-fn validate_pattern_safety(pattern: &str) -> (bool, &'static str) {
+fn validate_pattern_safety(pattern: &str) -> (bool, String) {
     guard_core_engine::compiler::validate_pattern_safety(pattern)
 }
 

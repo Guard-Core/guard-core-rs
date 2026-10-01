@@ -231,12 +231,13 @@ mod tests {
 
     #[test]
     fn new_fails_closed_on_an_uncompilable_pattern() {
+        // The full safety chain validates every entry first, so an
+        // uncompilable pattern is rejected there (the validator subsumes
+        // the compile check).
         let error = UserAgentFilter::new(["(unclosed"]).unwrap_err();
         assert_eq!(error.entry, "(unclosed");
         assert!(
-            error
-                .reason
-                .starts_with("expected a compilable regular expression"),
+            error.reason.starts_with("rejected by ReDoS validator ("),
             "unexpected reason: {}",
             error.reason
         );
