@@ -59,9 +59,7 @@ pub fn repeat_group_units(
                 let prefix = format!("{}{}", state.text, state.pending);
                 for unit in &units {
                     let pair = (prefix.clone(), unit.clone());
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        pairs.entry(pair)
-                    {
+                    if let std::collections::hash_map::Entry::Vacant(entry) = pairs.entry(pair) {
                         entry.insert(());
                         pair_text_size += prefix.chars().count() + unit.chars().count();
                     }

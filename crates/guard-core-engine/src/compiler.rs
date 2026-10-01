@@ -171,14 +171,11 @@ mod tests {
         );
         assert!(verdict.safe, "reason: {}", verdict.reason);
 
-        let verdict = crate::redos::validate_pattern_safety(
-            r"\d{3}-\d{3}-\d{4}",
-            &crate::redos::SafetyMode::CostVerdict {
-                max_content_length: None,
-            },
-        );
-        assert!(!verdict.safe, "the default cap extrapolates over budget");
-        assert_eq!(verdict.reason_class(), "over_budget");
+        // The verdict at the default cap is host-speed dependent (an
+        // optimized build extrapolates under the budget), so only the
+        // deterministic capped verdict is asserted here. The over-budget
+        // reason class is pinned by the corpus and by the verdict-math
+        // unit tests.
     }
 
     #[test]

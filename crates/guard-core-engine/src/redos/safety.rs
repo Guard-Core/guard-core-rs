@@ -584,6 +584,24 @@ mod tests {
     }
 
     #[test]
+    fn over_budget_reason_class_and_display() {
+        let reason = SafetyReason::OverBudget {
+            cap: 262144,
+            extrapolated: 0.2,
+            ratio: 2.0,
+            min_32: 0.025,
+            median_32: 0.026,
+            load_factor: 2.5,
+        };
+        assert_eq!(reason.reason_class(), "over_budget");
+        assert!(
+            reason
+                .to_string()
+                .starts_with("Pattern extrapolated CPU cost at cap (262144 chars)")
+        );
+    }
+
+    #[test]
     fn probe_subprocess_reason_shapes() {
         let reason = SafetyReason::ProbeStringTimeout(42).to_string();
         assert_eq!(reason, "Pattern timed out on test string of length 42");
