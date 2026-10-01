@@ -17,5 +17,21 @@
 #   - failing case NOT listed here -> gate fails (unbaselined failure)
 #   - listed case that now PASSES  -> gate fails (stale baseline; remove the entry)
 #   - failing case listed here     -> xfail (tolerated, reported four-way)
+# pattern_safety suite (safety_gates.json, added with the pattern-safety
+# chain port): cost-verdict-mode cases whose reference rejection is a
+# REFERENCE-ENGINE fact, not a Rust one. The corpus oracle is Python re +
+# the reference synthesizer; the Rust arbiter certifies what THIS engine
+# executes (regex-crate NFA for plain patterns: linear by construction;
+# fancy-regex only where the pattern needs backtracking constructs). The
+# deterministic layers (dangerous constructs, compile, all five structural
+# detectors, test-strings probes) match the reference byte-for-byte and
+# carry NO entries here.
 spec_version = '4.1.0'
-cases = []
+cases = [
+    { case = 'safety_gates::safety_cost_verdict_over_budget_01', reason = 'reference over-budget is a Python-re timing fact: (\d|\w)*; extrapolates past the budget on the reference engine while the regex-crate NFA the Rust engine executes is linear; the Rust arbiter timed it under budget at the same cap' },
+    { case = 'safety_gates::safety_cost_verdict_structural_nested_unbounded_01', reason = 'reference rejects (a|aa)+$ because its probe timing on Python re crosses the budget; the Rust synthesizer reaches the pattern and the regex-crate NFA executes it linear, so the per-engine cost verdict accepts' },
+    { case = 'safety_gates::safety_cost_verdict_structural_ambiguous_tail_01', reason = 'reference rejects (?:\w+\s?)+$ on Python-re probe timing; Rust regex-crate NFA is linear on the same probes; structural layer itself matches (the test-strings pin for this class passes)' },
+    { case = 'safety_gates::safety_cost_verdict_structural_literal_absorb_01', reason = 'reference rejects [\w-]*-- via reference probe timing/synthesis in cost mode; the Rust synthesizer builds reaching probes and the regex-crate NFA times linear' },
+    { case = 'safety_gates::safety_cost_verdict_structural_literal_absorb_02', reason = 'reference rejects [a-z]+abc via reference probe timing/synthesis in cost mode; the Rust synthesizer builds reaching probes and the regex-crate NFA times linear' },
+    { case = 'safety_gates::safety_cost_verdict_structural_unreachable_terminator_01', reason = 'reference rejects foo.*bar because its synthesizer cannot build a probe reaching every quantified region (fail-closed); the Rust synthesizer can, and the timed probes are linear; synthesis capability divergence, not a detection divergence' },
+]

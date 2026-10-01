@@ -1,11 +1,13 @@
 use serde_json::Value;
 
+#[derive(Debug)]
 pub struct UnmappedKnob {
     pub name: String,
     pub recorded: Value,
     pub reason: &'static str,
 }
 
+#[derive(Debug)]
 pub struct Knobs {
     pub max_content_length: usize,
     pub max_truncate_bytes: usize,
@@ -190,6 +192,40 @@ mod edge_tests {
         assert!(
             map_knobs(&config(json!(2.5))).is_err(),
             "a fraction is rejected"
+        );
+    }
+
+    #[test]
+    fn the_knob_container_must_be_an_object() {
+        assert_eq!(
+            map_knobs(&json!(["not", "an", "object"])).expect_err("array knobs"),
+            "config_knobs must be an object"
+        );
+        assert_eq!(
+            map_knobs(&json!("text")).expect_err("string knobs"),
+            "config_knobs must be an object"
+        );
+    }
+
+    #[test]
+    fn missing_knobs_name_the_first_missing_key() {
+        assert_eq!(
+            map_knobs(&json!({})).expect_err("empty knobs"),
+            "config_knobs missing 'detection_max_content_length'"
+        );
+        assert_eq!(
+            map_knobs(&json!({ "detection_max_content_length": 1 }))
+                .expect_err("missing inspect bytes"),
+            "config_knobs missing 'detection_max_body_inspect_bytes'"
+        );
+        assert_eq!(
+            map_knobs(&json!({
+                "detection_max_content_length": 1,
+                "detection_max_body_inspect_bytes": 2,
+                "detection_semantic_threshold": 0.5,
+            }))
+            .expect_err("missing threat threshold"),
+            "config_knobs missing 'detection_threat_score_threshold'"
         );
     }
 

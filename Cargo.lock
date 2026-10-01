@@ -909,6 +909,7 @@ version = "4.2.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+ "fancy-regex",
  "html-escape",
  "lru",
  "percent-encoding",

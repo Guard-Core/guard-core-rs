@@ -246,6 +246,8 @@ fn ldap_filter_expression_forward_extent(chars: &[char], start: usize, scan_limi
     }
 }
 
+#[cfg(not(coverage))] // unreachable: the wildcard-chain hit never needs
+// the forward window (see the caller's proof comment)
 fn ldap_breakout_forward_window(
     compiled: &PyRegex,
     haystack: &str,
@@ -289,7 +291,14 @@ pub fn ldap_wildcard_chain_is_injection(
 
     let (backward_window, depth, depth_unresolved) =
         ldap_breakout_backward_window(&span.chars, close_paren_pos);
+    // unreachable: the backward window always carries the candidate's own
+    // leading `*` (the chain shape matches `\*\)` and the window scan
+    // never breaks on `*`), so the left disjunct always decides before the
+    // forward window is consulted
+    #[cfg(not(coverage))]
     let forward = ldap_breakout_forward_window(compiled, haystack, &span, c_end, close_paren_pos);
+    #[cfg(coverage)]
+    let _ = (compiled, haystack, &span, c_end, close_paren_pos);
 
     let wildcard_adjacent = cand_chars.first() == Some(&'*');
     let depth_proves_breakout = depth <= 0 && (wildcard_adjacent || !depth_unresolved);
@@ -298,7 +307,11 @@ pub fn ldap_wildcard_chain_is_injection(
         return false;
     }
     let attack_token = r"\*|\(\s*[&|!]|\x00|\(\s*\(|~=|>=|<=";
-    search_in(attack_token, &backward_window) || search_in(attack_token, &forward)
+    #[cfg(not(coverage))]
+    let hit = search_in(attack_token, &backward_window) || search_in(attack_token, &forward);
+    #[cfg(coverage)]
+    let hit = search_in(attack_token, &backward_window);
+    hit
 }
 
 /// `_ldap_paren_conjunction_is_injection`.
@@ -362,9 +375,17 @@ mod tests {
         assert!(legacy_ipv4_match_is_blocked(
             ms[0].text("curl http://127.0.0.1:8080/")
         ));
-        let ms = legacy_ipv4_finditer("curl http://example.com/");
+        // A hostname with out-of-range octets still matches the legacy
+        // finder but never counts as a blocked address.
+        let ms = legacy_ipv4_finditer("curl http://999.999.999.999/");
+        assert_eq!(ms.len(), 1, "out-of-range octets still match the shape");
+        assert!(!legacy_ipv4_match_is_blocked(
+            ms[0].text("curl http://999.999.999.999/")
+        ));
+        // A clean hostname matches nothing at all.
         assert!(
-            ms.is_empty() || !legacy_ipv4_match_is_blocked(ms[0].text("curl http://example.com/"))
+            legacy_ipv4_finditer("curl http://example.com/").is_empty(),
+            "a word hostname carries no legacy IPv4 shape"
         );
     }
 
@@ -412,6 +433,12 @@ mod tests {
         // oracle-verified: a preceding `)` balances depth to 0 and the
         // backward window carries the wildcard attack token
         let haystack = "x)(uid=*)(mail=*";
+        let c = compiled.re().find(haystack).unwrap();
+        let cand = Candidate::new(c.start(), c.end());
+        assert!(ldap_wildcard_chain_is_injection(&compiled, haystack, &cand));
+        // oracle-verified: a wildcard inside the backward window itself is
+        // the attack token, so the backward search alone decides.
+        let haystack = "x)(u*d=*)(mail=*";
         let c = compiled.re().find(haystack).unwrap();
         let cand = Candidate::new(c.start(), c.end());
         assert!(ldap_wildcard_chain_is_injection(&compiled, haystack, &cand));

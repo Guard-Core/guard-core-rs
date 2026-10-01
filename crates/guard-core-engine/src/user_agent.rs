@@ -116,7 +116,15 @@ impl UserAgentFilter {
         let mut compiled = Vec::new();
         for pattern in patterns {
             let pattern = pattern.as_ref();
-            let (is_safe, reason) = compiler::validate_pattern_safety(pattern);
+            let verdict = crate::redos::validate_pattern_safety(
+                pattern,
+                &crate::redos::SafetyMode::CostVerdict {
+                    // The reference validates UA rules against the max
+                    // user-agent match length (512).
+                    max_content_length: Some(MAX_USER_AGENT_MATCH_LENGTH),
+                },
+            );
+            let (is_safe, reason) = (verdict.safe, verdict.reason.to_string());
             if !is_safe {
                 return Err(UserAgentConfigError {
                     entry: pattern.to_owned(),
@@ -231,12 +239,13 @@ mod tests {
 
     #[test]
     fn new_fails_closed_on_an_uncompilable_pattern() {
+        // The full safety chain validates every entry first, so an
+        // uncompilable pattern is rejected there (the validator subsumes
+        // the compile check).
         let error = UserAgentFilter::new(["(unclosed"]).unwrap_err();
         assert_eq!(error.entry, "(unclosed");
         assert!(
-            error
-                .reason
-                .starts_with("expected a compilable regular expression"),
+            error.reason.starts_with("rejected by ReDoS validator ("),
             "unexpected reason: {}",
             error.reason
         );
@@ -278,5 +287,20 @@ mod tests {
         let clone = filter.clone();
         assert!(clone.is_blocked("SQLMAP"));
         assert_eq!(clone.len(), filter.len());
+    }
+
+    #[test]
+    fn a_chain_safe_pattern_the_engine_cannot_compile_is_rejected() {
+        // Lookarounds pass the Python-syntax safety chain but the concrete
+        // engine compiler rejects them, so the config constructor fails.
+        let error = UserAgentFilter::new(["(?=x)a"]).expect_err("rejected");
+        assert_eq!(error.entry, "(?=x)a");
+        assert!(
+            error
+                .reason
+                .starts_with("expected a compilable regular expression"),
+            "{}",
+            error.reason
+        );
     }
 }

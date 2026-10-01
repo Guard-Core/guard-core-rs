@@ -54,3 +54,39 @@ fn first_diff(diffs: &[String], reason: &str) -> String {
         format!("{diff} [{reason}]")
     }
 }
+
+#[test]
+fn safety_gates_gate_against_spec_4_1_0() {
+    let cases = guard_core_conformance::safety::load_safety_cases()
+        .unwrap_or_else(|e| panic!("safety_gates load failed: {e}"));
+    assert!(
+        cases.len() >= 90,
+        "the vendored safety_gates suite must be the reference suite (got {} cases)",
+        cases.len()
+    );
+    let baseline = baseline::load_baseline()
+        .unwrap_or_else(|e| panic!("baseline load failed ({BASELINE_FILE}): {e}"));
+    let baselined = baseline_keys(&baseline);
+
+    let results: Vec<guard_core_conformance::report::CaseResult> = cases
+        .iter()
+        .map(guard_core_conformance::safety::run_safety_case)
+        .collect();
+
+    match evaluate(&results, &baselined) {
+        Ok(report) => {
+            println!(
+                "safety_gates gate: {} passed, {} failed, {} xfail (of {} cases)",
+                report.passed.len(),
+                report.failed.len(),
+                report.xfail.len(),
+                results.len()
+            );
+            for r in &report.xfail {
+                let reason = baseline::baseline_reason(&baseline, &r.case).unwrap_or("");
+                println!("  xfail {} :: {}", r.case, first_diff(&r.diffs, reason));
+            }
+        }
+        Err(drift) => panic!("{}", drift.describe()),
+    }
+}

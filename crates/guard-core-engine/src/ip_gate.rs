@@ -579,6 +579,8 @@ mod tests {
         ] {
             assert_eq!(parse_entry(junk), None, "{junk} must not parse");
         }
+        // The network parser demands the `addr/prefix` form outright.
+        assert_eq!(IpNet::parse("203.0.113.7"), None);
     }
 
     #[test]
@@ -661,10 +663,10 @@ mod tests {
             "IP is blacklisted"
         );
         // A blacklisted range does not leak onto its neighbors.
-        assert!(matches!(
+        assert_eq!(
             gate.evaluate(ip("198.51.200.1")),
-            IpGateVerdict::Allowed(_)
-        ));
+            IpGateVerdict::Allowed(IpGateDecision::default())
+        );
     }
 
     #[test]
@@ -723,47 +725,44 @@ mod tests {
     fn ipv4_mapped_parity_across_all_list_forms() {
         // v4-mapped request against an exact v4 entry.
         let gate = IpGateConfig::new(["::ffff:203.0.113.7"], NIL, NIL).unwrap();
-        assert!(matches!(
+        assert_eq!(
             gate.evaluate(ip("203.0.113.7")),
             IpGateVerdict::Allowed(IpGateDecision {
                 is_whitelisted: true,
-                ..
+                is_exempt: false
             })
-        ));
+        );
         // v4-mapped request against a v4 CIDR entry.
         let gate = IpGateConfig::new(["203.0.113.0/24"], NIL, NIL).unwrap();
-        assert!(matches!(
+        assert_eq!(
             gate.evaluate(ip("::ffff:203.0.113.99")),
             IpGateVerdict::Allowed(IpGateDecision {
                 is_whitelisted: true,
-                ..
+                is_exempt: false
             })
-        ));
+        );
         // A v6-mapped CIDR entry still matches the raw v6 form.
         let gate = IpGateConfig::new(["::ffff:0:0/96"], NIL, NIL).unwrap();
-        assert!(matches!(
+        assert_eq!(
             gate.evaluate(ip("::ffff:203.0.113.99")),
             IpGateVerdict::Allowed(IpGateDecision {
                 is_whitelisted: true,
-                ..
+                is_exempt: false
             })
-        ));
-        assert!(!matches!(
+        );
+        assert_eq!(
             gate.evaluate(ip("2001:db8::1")),
-            IpGateVerdict::Allowed(IpGateDecision {
-                is_whitelisted: true,
-                ..
-            })
-        ));
+            IpGateVerdict::Denied(IpGateDenial::NotInWhitelist)
+        );
     }
 
     #[test]
     fn exempt_flag_is_only_set_after_the_deny_checks_pass() {
         let gate = IpGateConfig::new(NIL, ["198.51.100.7"], ["198.51.100.7"]).unwrap();
-        assert!(matches!(
+        assert_eq!(
             gate.evaluate(ip("198.51.100.7")),
             IpGateVerdict::Denied(IpGateDenial::Blacklisted)
-        ));
+        );
     }
 
     impl IpGateVerdict {

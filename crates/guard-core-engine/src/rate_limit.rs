@@ -1717,6 +1717,33 @@ mod tests {
     }
 
     #[test]
+    fn a_store_error_propagates_from_the_route_tier() {
+        let store = Arc::new(MemoryStore::default());
+        let route = RouteRateLimits::new(Some(3), Some(60), None).expect("valid route");
+        let limiter = RateLimiter::with_config_and_clock(
+            RateLimitConfig {
+                enable_rate_limiting: true,
+                ..RateLimitConfig::default()
+            },
+            FakeClock::default().clock(),
+        )
+        .expect("config")
+        .with_distributed_store(
+            Arc::clone(&store) as Arc<dyn crate::distributed::SlidingWindowStore>,
+            "gc:",
+            false,
+        );
+        store.fail.store(true, std::sync::atomic::Ordering::Relaxed);
+        // no endpoint entry: the route tier's limit records and the
+        // backend-down error surfaces
+        assert!(
+            limiter
+                .check_tiers_distributed(ip("192.0.2.59"), Some("/r"), Some(&route), None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn a_store_error_propagates_from_the_geo_tier() {
         let store = Arc::new(MemoryStore::default());
         let geo_limits = HashMap::from([("RU".to_owned(), RateLimitEntry::new(2, 60).unwrap())]);

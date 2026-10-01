@@ -806,6 +806,8 @@ mod tests {
             ])
         );
         assert_eq!(decode_json_object("[]"), None);
+        assert_eq!(decode_json_object("not json at all"), None);
+        assert_eq!(decode_json_object(r"{\Broken"), None);
     }
 
     #[test]
@@ -993,6 +995,179 @@ mod tests {
             !admin.has("guard_core:banned_ips:192.0.2.7"),
             "a persistent legacy ban is dropped, not carried over"
         );
+    }
+
+    /// A store whose calls fail one stage at a time, so every `?` in the
+    /// migration propagates a real backend error in a test.
+    struct FailingAdmin {
+        stage: &'static str,
+    }
+
+    impl RedisAdminStore for FailingAdmin {
+        fn scan_match(
+            &self,
+            _pattern: &str,
+        ) -> Result<Vec<String>, crate::distributed::StoreError> {
+            if self.stage == "scan" {
+                return Err(crate::distributed::StoreError("scan down".into()));
+            }
+            Ok(vec!["guard_core:banned_ips:::ffff:192.0.2.9".to_owned()])
+        }
+
+        fn pttl_ms(&self, key: &str) -> Result<i64, crate::distributed::StoreError> {
+            if self.stage == "pttl" {
+                return Err(crate::distributed::StoreError("pttl down".into()));
+            }
+            // The canonical key sits lower than the legacy row, so the
+            // copy-on-longer-expiry write always runs.
+            if key.contains("ffff") {
+                if self.stage == "persistent_delete" {
+                    return Ok(-1);
+                }
+                Ok(60_000)
+            } else {
+                if self.stage == "pttl_canonical" {
+                    return Err(crate::distributed::StoreError("canonical pttl down".into()));
+                }
+                Ok(10_000)
+            }
+        }
+
+        fn set_px(
+            &self,
+            _key: &str,
+            _value: &str,
+            _ttl_ms: i64,
+        ) -> Result<(), crate::distributed::StoreError> {
+            if self.stage == "set_px" {
+                return Err(crate::distributed::StoreError("set_px down".into()));
+            }
+            Ok(())
+        }
+
+        fn delete_keys(&self, _keys: &[String]) -> Result<(), crate::distributed::StoreError> {
+            if self.stage == "delete" || self.stage == "persistent_delete" {
+                return Err(crate::distributed::StoreError("delete down".into()));
+            }
+            Ok(())
+        }
+
+        fn get_key(
+            &self,
+            _prefix: &str,
+            _namespace: &str,
+            _key: &str,
+        ) -> Result<Option<String>, crate::distributed::StoreError> {
+            if self.stage == "get" {
+                return Err(crate::distributed::StoreError("get down".into()));
+            }
+            Ok(Some("1735689600.5".to_owned()))
+        }
+    }
+
+    #[test]
+    fn migration_backend_failures_propagate_from_their_stage() {
+        let error = migrate_legacy_ban_keys(&FailingAdmin { stage: "scan" }, "guard_core:")
+            .expect_err("scan failure");
+        assert_eq!(error.0, "scan down");
+        // A legacy key routes the value read, the two pttl reads, the
+        // copy-on-longer-expiry write, and the delete through the store.
+        let error = migrate_one_ban_key(
+            &FailingAdmin { stage: "get" },
+            "guard_core:",
+            "guard_core:banned_ips:::ffff:192.0.2.9",
+        )
+        .expect_err("value read failure");
+        assert_eq!(error.0, "get down");
+        let error = migrate_one_ban_key(
+            &FailingAdmin { stage: "pttl" },
+            "guard_core:",
+            "guard_core:banned_ips:::ffff:192.0.2.9",
+        )
+        .expect_err("pttl failure");
+        assert_eq!(error.0, "pttl down");
+        let error = migrate_one_ban_key(
+            &FailingAdmin { stage: "set_px" },
+            "guard_core:",
+            "guard_core:banned_ips:::ffff:192.0.2.9",
+        )
+        .expect_err("copy failure");
+        assert_eq!(error.0, "set_px down");
+        let error = migrate_one_ban_key(
+            &FailingAdmin { stage: "delete" },
+            "guard_core:",
+            "guard_core:banned_ips:::ffff:192.0.2.9",
+        )
+        .expect_err("delete failure");
+        assert_eq!(error.0, "delete down");
+    }
+
+    #[test]
+    fn a_healthy_failing_admin_migrates_end_to_end() {
+        let admin = FailingAdmin { stage: "ok" };
+        assert!(
+            migrate_one_ban_key(
+                &admin,
+                "guard_core:",
+                "guard_core:banned_ips:::ffff:192.0.2.9"
+            )
+            .expect("migrates")
+        );
+    }
+
+    #[test]
+    fn migration_backend_failures_propagate_from_the_later_stages() {
+        // A persistent legacy row routes its delete through the store.
+        let error = migrate_one_ban_key(
+            &FailingAdmin {
+                stage: "persistent_delete",
+            },
+            "guard_core:",
+            "guard_core:banned_ips:::ffff:192.0.2.9",
+        )
+        .expect_err("persistent delete failure");
+        assert_eq!(error.0, "delete down");
+        // The canonical key's own pttl read is a separate store call.
+        let error = migrate_one_ban_key(
+            &FailingAdmin {
+                stage: "pttl_canonical",
+            },
+            "guard_core:",
+            "guard_core:banned_ips:::ffff:192.0.2.9",
+        )
+        .expect_err("canonical pttl failure");
+        assert_eq!(error.0, "canonical pttl down");
+        // A per-key failure inside the scan loop is swallowed by design.
+        let result = migrate_legacy_ban_keys(&FailingAdmin { stage: "get" }, "guard_core:");
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn a_persistent_legacy_key_is_deleted_without_a_copy() {
+        let admin = MemoryAdmin::default();
+        // pttl -1: the legacy row never expires, so the migration simply
+        // drops it after carrying nothing over.
+        admin.seed("guard_core:banned_ips:::ffff:192.0.2.9", "1735689600.5", -1);
+        assert!(
+            migrate_one_ban_key(
+                &admin,
+                "guard_core:",
+                "guard_core:banned_ips:::ffff:192.0.2.9"
+            )
+            .expect("migrates")
+        );
+        assert!(!admin.has("guard_core:banned_ips:::ffff:192.0.2.9"));
+        // An expired (-2) legacy row lands in the same branch.
+        admin.seed("guard_core:banned_ips:::ffff:192.0.2.7", "1735689600.5", -2);
+        assert!(
+            migrate_one_ban_key(
+                &admin,
+                "guard_core:",
+                "guard_core:banned_ips:::ffff:192.0.2.7"
+            )
+            .expect("migrates")
+        );
+        assert!(!admin.has("guard_core:banned_ips:::ffff:192.0.2.7"));
     }
 
     #[test]

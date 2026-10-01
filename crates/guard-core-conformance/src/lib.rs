@@ -6,6 +6,7 @@ pub mod knobs;
 pub mod ledger;
 pub mod pipeline;
 pub mod report;
+pub mod safety;
 
 use serde_json::Value;
 
@@ -159,7 +160,7 @@ mod run_tests {
         let corpus = corpus_case("clean_case", serde_json::json!({"is_threat": true}));
         let results = run_corpus(&corpus, &knobs());
         assert_eq!(results.len(), 1);
-        assert!(matches!(results[0].status, Status::Failed));
+        assert_eq!(results[0].status, Status::Failed);
         assert!(!results[0].diffs.is_empty());
     }
 
@@ -180,7 +181,7 @@ mod run_tests {
         let results = run_corpus(&corpus, &knobs());
         let status = results[0].status;
         let diffs = format!("{:?}", results[0].diffs);
-        assert!(matches!(status, Status::Passed), "diffs: {diffs}");
+        assert_eq!(status, Status::Passed, "diffs: {diffs}");
         assert!(diffs == "[]", "no diffs on a matching case: {diffs}");
     }
 

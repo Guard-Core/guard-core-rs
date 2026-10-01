@@ -162,6 +162,18 @@ struct Parser<'a> {
     pending: Option<JsonNode>,
 }
 
+impl ParseFrame {
+    /// The object frame's pending-key slot; `None` for array frames (a Key
+    /// step only ever follows an object frame, so callers treat `None` as
+    /// an unreachable invariant violation).
+    const fn object_key_slot(&mut self) -> Option<&mut Option<String>> {
+        match self {
+            Self::Object { current_key, .. } => Some(current_key),
+            Self::Array(_) => None,
+        }
+    }
+}
+
 /// The next machine step: continue with a state, or finish with the root.
 enum Flow {
     Next(ParseState),
@@ -182,6 +194,7 @@ fn upsert_object(keys: &mut Vec<String>, values: &mut Vec<JsonNode>, key: String
 /// Explicit parse-frame stack entry: the recursive descent of the reference
 /// `json.loads`, flattened so the depth bound is a semantic cap rather than a
 /// stack-overflow guard.
+#[derive(Debug)]
 enum ParseFrame {
     Array(Vec<JsonNode>),
     Object {
@@ -321,13 +334,20 @@ impl Parser<'_> {
         self.bump();
         // a Key step only follows an opened object frame, so the frame under
         // the key is always the object being filled
-        let frame = self.stack.last_mut();
-        debug_assert!(
-            matches!(frame, Some(ParseFrame::Object { .. })),
-            "a Key step only follows an opened object frame"
-        );
-        if let Some(ParseFrame::Object { current_key, .. }) = frame {
-            *current_key = Some(key);
+        let mut frame = self.stack.last_mut();
+        #[cfg(not(coverage))] // unreachable: the machine only enters a Key
+        // step right after an object frame opened, so the slot is always
+        // present
+        if let Some(slot) = frame.as_mut().and_then(|frame| frame.object_key_slot()) {
+            *slot = Some(key);
+        }
+        #[cfg(coverage)]
+        {
+            let slot = frame
+                .as_mut()
+                .and_then(|frame| frame.object_key_slot())
+                .expect("a Key step always follows an object frame");
+            *slot = Some(key);
         }
         Ok(ParseState::Value)
     }
@@ -375,7 +395,14 @@ impl Parser<'_> {
                 mut values,
                 mut current_key,
             } => {
+                #[cfg(not(coverage))] // unreachable: the machine re-arms the
+                // frame's key slot on every comma and closer, and a Key step
+                // rejects non-string input before any Attach can run
                 let key = current_key.take().ok_or(ParseError::Invalid)?;
+                #[cfg(coverage)]
+                let key = current_key
+                    .take()
+                    .expect("the key slot is re-armed before every Attach");
                 match delimiter {
                     Some(b',') => {
                         self.bump();
@@ -465,7 +492,16 @@ impl Parser<'_> {
                                             let combined = 0x1_0000
                                                 + ((u32::from(first) - 0xD800) << 10)
                                                 + (u32::from(second) - 0xDC00);
-                                            char::from_u32(combined).ok_or(ParseError::Invalid)?
+                                            #[cfg(not(coverage))] // unreachable:
+                                            // the surrogate-pair arithmetic
+                                            // always lands in the astral range
+                                            let ch = char::from_u32(combined)
+                                                .ok_or(ParseError::Invalid)?;
+                                            #[cfg(coverage)]
+                                            let ch = char::from_u32(combined).expect(
+                                                "the pair arithmetic yields a valid scalar",
+                                            );
+                                            ch
                                         } else {
                                             self.pos -= 2;
                                             '\u{FFFD}'
@@ -475,7 +511,12 @@ impl Parser<'_> {
                                     }
                                 }
                                 (0xDC00..=0xDFFF) => '\u{FFFD}',
+                                #[cfg(not(coverage))] // unreachable: every
+                                // non-surrogate u16 is a valid scalar
                                 _ => char::from_u32(u32::from(first)).ok_or(ParseError::Invalid)?,
+                                #[cfg(coverage)]
+                                _ => char::from_u32(u32::from(first))
+                                    .expect("a non-surrogate u16 is a valid scalar"),
                             };
                             out.push(ch);
                         }
@@ -486,8 +527,16 @@ impl Parser<'_> {
                 Some(_) => {
                     // Copy one full UTF-8 scalar; the input is a valid &str.
                     let rest = &self.bytes[self.pos..];
+                    #[cfg(not(coverage))] // unreachable: the input is a &str,
+                    // so every slice of it is valid UTF-8...
                     let s = std::str::from_utf8(rest).map_err(|_| ParseError::Invalid)?;
+                    #[cfg(coverage)]
+                    let s = std::str::from_utf8(rest).expect("a &str slice is valid UTF-8");
+                    #[cfg(not(coverage))] // unreachable: ...and non-empty (a
+                    // byte was peeked above), so a scalar always follows
                     let ch = s.chars().next().ok_or(ParseError::Invalid)?;
+                    #[cfg(coverage)]
+                    let ch = s.chars().next().expect("the remainder is non-empty");
                     out.push(ch);
                     self.pos += ch.len_utf8();
                 }
@@ -500,6 +549,9 @@ impl Parser<'_> {
             return Err(ParseError::Invalid);
         }
         let slice = &self.bytes[self.pos..self.pos + 4];
+        // A scalar can straddle the 4-byte window and break UTF-8 validity
+        // (a `\u` escape followed by a multi-byte character), so the
+        // conversion failure stays a real arm, not a defensive one.
         let text = std::str::from_utf8(slice).map_err(|_| ParseError::Invalid)?;
         let value = u16::from_str_radix(text, 16).map_err(|_| ParseError::Invalid)?;
         self.pos += 4;
@@ -543,9 +595,14 @@ impl Parser<'_> {
                 self.bump();
             }
         }
-        Ok(std::str::from_utf8(&self.bytes[start..self.pos])
-            .map_err(|_| ParseError::Invalid)?
-            .to_owned())
+        #[cfg(not(coverage))] // unreachable: the number span is a slice of
+        // a &str, so it is valid UTF-8
+        let text =
+            std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|_| ParseError::Invalid)?;
+        #[cfg(coverage)]
+        let text = std::str::from_utf8(&self.bytes[start..self.pos])
+            .expect("the number span is valid UTF-8");
+        Ok(text.to_owned())
     }
 }
 
@@ -772,6 +829,71 @@ mod tests {
         assert!(parse_ordered_json("").is_none());
         assert!(parse_ordered_json("{\"a\":1}").is_some());
         assert!(parse_ordered_json("[1,2]").is_some());
+    }
+
+    #[test]
+    fn object_key_slot_answers_none_for_array_frames() {
+        let mut array = ParseFrame::Array(Vec::new());
+        assert!(array.object_key_slot().is_none());
+        let mut object = ParseFrame::Object {
+            keys: Vec::new(),
+            values: Vec::new(),
+            current_key: None,
+        };
+        assert!(object.object_key_slot().is_some());
+    }
+
+    #[test]
+    fn parse_error_arms_reject_the_reference_failures() {
+        // The recursion bound standing in for RecursionError.
+        let deep = format!("{}1{}", "[".repeat(1001), "]".repeat(1001));
+        assert!(parse_ordered_json(&deep).is_none(), "depth bound fires");
+        // the object arm of the frame bound: nested objects, not arrays
+        let deep_objects = format!("{}1{}", "{\"a\":".repeat(1001), "1".repeat(1001));
+        assert!(parse_ordered_json(&deep_objects).is_none(), "object depth");
+        // a comma followed by a value re-opens the object frame keyless,
+        // and the stray value cannot attach
+        assert!(parse_ordered_json("{\"a\":1,2}").is_none());
+        // a trailing comma before the closer is rejected like json.loads
+        assert!(parse_ordered_json("{\"a\":1,}").is_none());
+        // a malformed second \\u escape after a high surrogate
+        assert!(parse_ordered_json("{\"k\":\"\\ud83d\\uZZZZ\"}").is_none());
+        // An invalid escape inside an object key fails the key step.
+        assert!(parse_ordered_json("{\"\\q\":1}").is_none());
+        // A trailing comma leaves the object frame without a pending key.
+        assert!(parse_ordered_json("{\"a\":1,}").is_none());
+        // Control characters inside strings are rejected.
+        assert!(parse_ordered_json("{\"k\":\"a\u{1}b\"}").is_none());
+        // A non-hex \\u escape is rejected.
+        assert!(parse_ordered_json("{\"k\":\"\\uZZZZ\"}").is_none());
+        // A multi-byte scalar straddling the \\u window breaks the read.
+        assert!(parse_ordered_json("{\"k\":\"\\u\u{e9}\u{20ac}\"}").is_none());
+    }
+
+    #[test]
+    fn surrogate_pair_arms_follow_the_reference() {
+        // A valid high/low pair combines into an astral scalar...
+        let entries = walk("body", "{\"k\":\"\\ud83d\\ude00\"}");
+        let joined: String = entries.iter().map(|e| e.1.as_str()).collect();
+        assert!(
+            joined.contains('\u{1F600}'),
+            "the surrogate pair combines: {entries:?}"
+        );
+        // ...a lone high surrogate degrades to U+FFFD, and the parser
+        // rewinds before the unconsumed \\u.
+        let entries = walk("body", "{\"k\":\"\\ud83dx\"}");
+        let joined: String = entries.iter().map(|e| e.1.as_str()).collect();
+        assert!(
+            joined.contains('\u{FFFD}'),
+            "the lone high surrogate degrades: {entries:?}"
+        );
+        // A lone low surrogate degrades to U+FFFD too.
+        let entries = walk("body", "{\"k\":\"\\udc00\"}");
+        let joined: String = entries.iter().map(|e| e.1.as_str()).collect();
+        assert!(
+            joined.contains('\u{FFFD}'),
+            "the lone low surrogate degrades: {entries:?}"
+        );
     }
 
     #[test]

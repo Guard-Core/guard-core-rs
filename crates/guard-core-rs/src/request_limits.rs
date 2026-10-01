@@ -422,6 +422,14 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body(), &"inner");
         assert_eq!(inner.call_count(), 1);
+        // a request without a content-length header rides the None arm
+        let response = block_on(service.call(request_to("/other", None, None))).expect("ready");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            inner.call_count(),
+            2,
+            "the header-less request passes through"
+        );
     }
 
     #[test]
@@ -535,9 +543,8 @@ mod tests {
             .service(Inner::new());
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
-        assert!(matches!(
-            ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx),
-            Poll::Ready(Ok(()))
-        ));
+        let polled = ::tower::Service::<Request<&'static str>>::poll_ready(&mut service, &mut cx);
+        assert!(polled.is_ready());
+        assert_eq!(polled.map(|result| result.is_ok()), Poll::Ready(true));
     }
 }

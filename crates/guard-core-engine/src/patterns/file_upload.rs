@@ -321,6 +321,46 @@ mod tests {
     const DECODED_TRUNC: &str = "DECODED_TRUNC";
 
     #[test]
+    fn unterminated_or_absent_quotes_yield_no_candidate() {
+        // The content ends right after `filename=`: no opening quote.
+        assert!(
+            file_upload_scan_matches(
+                "; filename=",
+                DANGEROUS,
+                DANGEROUS,
+                DOUBLE,
+                TRUNC,
+                DECODED_TRUNC
+            )
+            .is_empty()
+        );
+        // An opening quote with no closing quote before the end.
+        assert!(
+            file_upload_scan_matches(
+                "; filename=\"shell.php",
+                DANGEROUS,
+                DANGEROUS,
+                DOUBLE,
+                TRUNC,
+                DECODED_TRUNC
+            )
+            .is_empty()
+        );
+        // A non-quoted filename token is not a quoted candidate at all.
+        assert!(
+            file_upload_scan_matches(
+                "; filename=shell.php",
+                DANGEROUS,
+                DANGEROUS,
+                DOUBLE,
+                TRUNC,
+                DECODED_TRUNC
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn dangerous_extension_fires() {
         let ms = file_upload_scan_matches(
             "; filename=\"shell.php\"",

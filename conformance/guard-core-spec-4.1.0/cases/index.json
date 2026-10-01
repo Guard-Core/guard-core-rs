@@ -1,8 +1,8 @@
 {
   "spec_version": "4.1.0",
   "engine_version": "4.2.0",
-  "engine_commit": "0122af0223a6c0d88299ccd528f4c551ae2d762b",
-  "generated_at": "2026-09-27T03:15:23.691432+00:00",
+  "engine_commit": "13436664e53e7329d5f2587a01ddb9a0fd95873f",
+  "generated_at": "2026-10-01T02:02:25.923544+00:00",
   "fixed_ip": "203.0.113.7",
   "config_knobs": {
     "detection_compiler_timeout": 2.0,
@@ -158,7 +158,8 @@
         "python",
         "go",
         "php",
-        "ts"
+        "ts",
+        "rust"
       ]
     },
     "pipeline_rate_limits": {
@@ -168,7 +169,8 @@
         "python",
         "go",
         "php",
-        "ts"
+        "ts",
+        "rust"
       ]
     },
     "pipeline_detection_response": {
@@ -178,7 +180,8 @@
         "python",
         "go",
         "php",
-        "ts"
+        "ts",
+        "rust"
       ]
     },
     "pipeline_headers_cors": {
@@ -188,7 +191,8 @@
         "python",
         "go",
         "php",
-        "ts"
+        "ts",
+        "rust"
       ]
     },
     "pipeline_behavior_rules": {
@@ -198,7 +202,41 @@
         "python",
         "go",
         "php",
-        "ts"
+        "ts",
+        "rust"
+      ]
+    },
+    "event_stream": {
+      "case_count": 39,
+      "kind": "events",
+      "consumers": [
+        "python",
+        "go",
+        "php",
+        "ts",
+        "rust"
+      ]
+    },
+    "redis_interop": {
+      "case_count": 14,
+      "kind": "redis_interop",
+      "consumers": [
+        "python",
+        "go",
+        "php",
+        "ts",
+        "rust"
+      ]
+    },
+    "safety_gates": {
+      "case_count": 94,
+      "kind": "pattern_safety",
+      "consumers": [
+        "python",
+        "go",
+        "php",
+        "ts",
+        "rust"
       ]
     }
   },
@@ -208,6 +246,16 @@
       "execution_time"
     ],
     "float_precision": 6,
-    "pipeline_records": "compare only the keys present in each expected record; a runner that cannot observe the engine event bus skips the events key instead of failing it"
+    "pipeline_records": "compare only the keys present in each expected record; a runner that cannot observe the engine event bus skips the events key instead of failing it",
+    "events_envelopes": "compare only the keys present in each expected envelope (envelopes from different emitter seams carry different key sets); volatile fields are dropped recursively and listed in events_volatile_fields; xfail cases are advisory and carry no expectations",
+    "events_volatile_fields": [
+      "execution_time",
+      "execution_time_ms",
+      "idempotency_key",
+      "response_time",
+      "timestamp"
+    ],
+    "redis_interop": "byte equality: keys, static string values and TTL semantics are exact; zset members the engine generates at write time (uuid4 hex, epoch floats) and ban expiry floats are pinned by SHAPE (regex), not value; zset scores are compared as floats at 6-decimal precision",
+    "pattern_safety_records": "compare expected.safe and expected.reason_class; the numeric parts of over-budget reason strings are host-measured and never compared; a runner whose safety chain cannot produce a reason_class yet maps the case to that class's documented divergence instead of failing silently"
   }
 }

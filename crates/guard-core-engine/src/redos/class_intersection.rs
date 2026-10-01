@@ -1,0 +1,1006 @@
+//! Cross-atom class-intersection probe units.
+//!
+//! Port of the reference `_redos_class_intersection.py`. Fill
+//! confirmation is derived from the parsed intervals (the reference
+//! re-verifies with `re.fullmatch` predicates built from the same parse,
+//! so the two can never disagree there).
+
+use super::child::run_child_request;
+use super::exact_state::{
+    exact_overlap_fill_raw as exact_overlap_fill, isolated_group_exact_state,
+    narrow_exact_state_raw as narrow_exact_state,
+};
+use super::intervals::IntervalSet;
+use super::parse_slots::{NonPairingSlot, PairingAtom, Slot, pattern_slots};
+use super::stray_chooser::{
+    StrayContext, build_stray_context, choose_class_intersection_stray_with,
+};
+use super::timeout::BuilderTimeout;
+
+const MAX_GROUP_CROSSING_DEPTH: usize = super::exact_state::MAX_GROUP_CROSSING_DEPTH;
+
+fn crossing_slot_narrows(slot: &Slot, shared: &IntervalSet, depth: usize) -> Option<IntervalSet> {
+    match slot {
+        Slot::Pairing(atom) => {
+            if atom.allows_zero {
+                return Some(shared.clone());
+            }
+            let overlap = shared.intersection(&atom.intervals);
+            if overlap.is_empty() {
+                None
+            } else {
+                Some(overlap)
+            }
+        }
+        Slot::NonPairing(non) => {
+            if !non.is_boundary {
+                return Some(shared.clone());
+            }
+            let inner = non.inner.as_ref()?;
+            crossing_group_result(inner, shared, depth + 1).map(|_| shared.clone())
+        }
+    }
+}
+
+fn alternative_crossing(
+    alt_slots: &[Slot],
+    shared: &IntervalSet,
+    depth: usize,
+) -> Option<IntervalSet> {
+    let mut local = shared.clone();
+    for slot in alt_slots {
+        let narrowed = crossing_slot_narrows(slot, &local, depth)?;
+        local = narrowed;
+    }
+    Some(local)
+}
+
+fn crossing_group_result(
+    alternatives: &[Vec<Slot>],
+    shared: &IntervalSet,
+    depth: usize,
+) -> Option<IntervalSet> {
+    if depth > MAX_GROUP_CROSSING_DEPTH {
+        return None;
+    }
+    let mut combined: Option<IntervalSet> = None;
+    for alt in alternatives {
+        let Some(result) = alternative_crossing(alt, shared, depth) else {
+            continue;
+        };
+        combined = Some(match combined {
+            None => result,
+            Some(existing) => existing.union(&result),
+        });
+    }
+    combined
+}
+
+struct CrossedNonPairing {
+    shared: IntervalSet,
+    fill: Option<String>,
+    group_state: Option<IntervalSet>,
+}
+
+fn cross_non_pairing_slot(
+    slot: &NonPairingSlot,
+    shared: &IntervalSet,
+    exact_state: Option<&IntervalSet>,
+) -> Option<CrossedNonPairing> {
+    let Some(inner) = &slot.inner else {
+        if slot.is_boundary {
+            return None;
+        }
+        return Some(CrossedNonPairing {
+            shared: shared.clone(),
+            fill: None,
+            group_state: None,
+        });
+    };
+    let crossing = crossing_group_result(inner, shared, 0);
+    let group_state = isolated_group_exact_state(inner, 0);
+    if crossing.is_none() {
+        let fill = if slot.unbounded {
+            exact_overlap_fill(exact_state, group_state.as_ref()).map(String::from)
+        } else {
+            None
+        };
+        if slot.is_boundary {
+            // unreachable: a failed crossing implies every alternative is
+            // disjoint from `shared`, and `exact_state` equals `shared`
+            // here, so the exact fill is always `None` on this path
+            #[cfg(not(coverage))]
+            {
+                let fill = fill?;
+                return Some(CrossedNonPairing {
+                    shared: IntervalSet::empty(),
+                    fill: Some(fill),
+                    group_state,
+                });
+            }
+            #[cfg(coverage)]
+            {
+                let _ = fill;
+                return None;
+            }
+        }
+        return Some(CrossedNonPairing {
+            shared: shared.clone(),
+            fill,
+            group_state,
+        });
+    }
+    let fill = if slot.unbounded {
+        crossing
+            .as_ref()
+            .and_then(|set| set.first_member())
+            .and_then(char::from_u32)
+            .map(String::from)
+    } else {
+        None
+    };
+    let result_shared = if slot.is_boundary {
+        crossing.expect("crossing checked above")
+    } else {
+        shared.clone()
+    };
+    Some(CrossedNonPairing {
+        shared: result_shared,
+        fill,
+        group_state,
+    })
+}
+
+fn tail_pairing_intervals(slots: &[Slot], start: usize) -> Vec<IntervalSet> {
+    slots[start..]
+        .iter()
+        .filter_map(|slot| match slot {
+            Slot::Pairing(atom) => Some(atom.intervals.clone()),
+            Slot::NonPairing(_) => None,
+        })
+        .collect()
+}
+
+fn fill_confirmed(left: &PairingAtom, right: &PairingAtom, fill: &str) -> bool {
+    let Some(first) = fill.chars().next() else {
+        return false;
+    };
+    left.intervals.contains(u32::from(first)) && right.intervals.contains(u32::from(first))
+}
+
+fn left_confirms_fill(left: &PairingAtom, fill: &str) -> bool {
+    fill.chars()
+        .next()
+        .is_some_and(|first| left.intervals.contains(u32::from(first)))
+}
+
+struct ChainUnit {
+    fill: String,
+    stray: String,
+}
+
+/// The pairing-chain unit appender: verifies the fill's stray in the
+/// killable child before recording the unit (the runner is injected so
+/// tests can force stray-verification failures deterministically).
+fn append_pairing_unit_with(
+    units: &mut Vec<ChainUnit>,
+    left: &PairingAtom,
+    right: &PairingAtom,
+    fill: &str,
+    tail: &[IntervalSet],
+    ctx: &StrayContext,
+    run: crate::redos::cost_arbiter::ChildRunner<'_>,
+) -> Result<(), BuilderTimeout> {
+    // unreachable: `exact_state` starts at the left atom's intervals and
+    // every later narrowing keeps it inside `left`, so a fill that
+    // survived the exact check is always a member of `left`
+    #[cfg(not(coverage))]
+    if !fill_confirmed(left, right, fill) {
+        return Ok(());
+    }
+    #[cfg(coverage)]
+    let _ = fill_confirmed(left, right, fill);
+    let stray = choose_class_intersection_stray_with(
+        ctx,
+        fill,
+        &left.intervals,
+        &right.intervals,
+        tail,
+        run,
+    )?;
+    units.push(ChainUnit {
+        fill: fill.to_owned(),
+        stray,
+    });
+    Ok(())
+}
+
+/// The pairing-chain stepper: the child runner is injected so tests can
+/// force stray-verification failures deterministically.
+#[allow(clippy::too_many_arguments)]
+fn advance_pairing_chain_with(
+    units: &mut Vec<ChainUnit>,
+    left: &PairingAtom,
+    shared: &IntervalSet,
+    slot: &PairingAtom,
+    exact_state: &Option<IntervalSet>,
+    tail: &[IntervalSet],
+    ctx: &StrayContext,
+    run: crate::redos::cost_arbiter::ChildRunner<'_>,
+) -> Result<(IntervalSet, Option<IntervalSet>, bool), BuilderTimeout> {
+    let overlap = shared.intersection(&slot.intervals);
+    if !overlap.is_empty() {
+        if slot.unbounded
+            && let Some(member) = overlap.first_member()
+            && let Some(fill) = char::from_u32(member)
+        {
+            append_pairing_unit_with(units, left, slot, &fill.to_string(), tail, ctx, run)?;
+        }
+        if !slot.allows_zero {
+            return Ok((
+                overlap,
+                narrow_exact_state(exact_state.as_ref(), Some(&slot.intervals)),
+                false,
+            ));
+        }
+        return Ok((shared.clone(), exact_state.clone(), false));
+    }
+    let Some(exact_fill) = exact_overlap_fill(exact_state.as_ref(), Some(&slot.intervals)) else {
+        return Ok((shared.clone(), exact_state.clone(), !slot.allows_zero));
+    };
+    if slot.unbounded {
+        append_pairing_unit_with(units, left, slot, &exact_fill.to_string(), tail, ctx, run)?;
+    }
+    if !slot.allows_zero {
+        return Ok((overlap, None, false));
+    }
+    Ok((shared.clone(), exact_state.clone(), false))
+}
+
+/// The per-start-slot unit walk: the child runner is injected so tests
+/// can force stray-verification failures deterministically.
+fn pairing_units_from_with(
+    slots: &[Slot],
+    start: usize,
+    ctx: &StrayContext,
+    run: crate::redos::cost_arbiter::ChildRunner<'_>,
+) -> Result<Vec<ChainUnit>, BuilderTimeout> {
+    let Slot::Pairing(left) = &slots[start] else {
+        return Ok(Vec::new());
+    };
+    let mut shared = left.intervals.clone();
+    let mut exact_state: Option<IntervalSet> = Some(left.intervals.clone());
+    let mut units: Vec<ChainUnit> = Vec::new();
+    for index in start + 1..slots.len() {
+        let slot = &slots[index];
+        let tail = tail_pairing_intervals(slots, index + 1);
+        match slot {
+            Slot::NonPairing(non) => {
+                let Some(crossed) = cross_non_pairing_slot(non, &shared, exact_state.as_ref())
+                else {
+                    break;
+                };
+                shared = crossed.shared;
+                if non.is_boundary {
+                    exact_state =
+                        narrow_exact_state(exact_state.as_ref(), crossed.group_state.as_ref());
+                }
+                if let Some(fill) = crossed.fill
+                    && left_confirms_fill(left, &fill)
+                {
+                    let stray = choose_class_intersection_stray_with(
+                        ctx,
+                        &fill,
+                        &left.intervals,
+                        &shared,
+                        &tail,
+                        run,
+                    )?;
+                    units.push(ChainUnit { fill, stray });
+                }
+            }
+            Slot::Pairing(pairing) => {
+                let (new_shared, new_exact, should_stop) = advance_pairing_chain_with(
+                    &mut units,
+                    left,
+                    &shared,
+                    pairing,
+                    &exact_state,
+                    &tail,
+                    ctx,
+                    run,
+                )?;
+                shared = new_shared;
+                exact_state = new_exact;
+                if should_stop {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(units)
+}
+
+fn flatten_alternatives(alternatives: &[Vec<Slot>]) -> Vec<Slot> {
+    if alternatives.len() == 1 {
+        return alternatives[0].clone();
+    }
+    let mut flat: Vec<Slot> = Vec::new();
+    for (index, alt) in alternatives.iter().enumerate() {
+        if index > 0 {
+            flat.push(Slot::NonPairing(NonPairingSlot {
+                is_boundary: true,
+                inner: None,
+                unbounded: false,
+                max_repeat: None,
+                variable_bounded: false,
+            }));
+        }
+        flat.extend(alt.iter().cloned());
+    }
+    flat
+}
+
+/// The slot walker: the child runner is injected so tests can force
+/// stray-verification failures deterministically.
+fn units_in_slots_with(
+    slots: &[Slot],
+    ctx: &StrayContext,
+    run: crate::redos::cost_arbiter::ChildRunner<'_>,
+) -> Result<Vec<ChainUnit>, BuilderTimeout> {
+    let mut units: Vec<ChainUnit> = Vec::new();
+    for (index, slot) in slots.iter().enumerate() {
+        match slot {
+            Slot::NonPairing(non) => {
+                if let Some(inner) = &non.inner {
+                    let flat = flatten_alternatives(inner);
+                    units.extend(units_in_slots_with(&flat, ctx, run)?);
+                }
+            }
+            Slot::Pairing(atom) => {
+                if atom.unbounded {
+                    units.extend(pairing_units_from_with(slots, index, ctx, run)?);
+                }
+            }
+        }
+    }
+    Ok(units)
+}
+
+fn include_bounded_repeats(slots: &[Slot]) -> Vec<Slot> {
+    slots
+        .iter()
+        .map(|slot| match slot {
+            Slot::Pairing(atom) => Slot::Pairing(PairingAtom {
+                unbounded: atom.unbounded || atom.max_repeat.is_some_and(|max| max > 1),
+                ..atom.clone()
+            }),
+            Slot::NonPairing(non) => Slot::NonPairing(NonPairingSlot {
+                inner: non.inner.as_ref().map(|inner| {
+                    inner
+                        .iter()
+                        .map(|alt| include_bounded_repeats(alt))
+                        .collect()
+                }),
+                unbounded: non.unbounded || non.max_repeat.is_some_and(|max| max > 1),
+                ..non.clone()
+            }),
+        })
+        .collect()
+}
+
+/// Reference `_class_intersection_probe_units`.
+pub fn class_intersection_probe_units(
+    pattern: &str,
+    flags: super::ast::Flags,
+    ctx: Option<&StrayContext>,
+    include_bounded: bool,
+) -> Result<Vec<(String, String)>, BuilderTimeout> {
+    class_intersection_probe_units_with(pattern, flags, ctx, include_bounded, &run_child_request)
+}
+
+/// The pure half of [`class_intersection_probe_units`]: the child runner
+/// is injected so tests can force stray-verification failures
+/// deterministically.
+pub(crate) fn class_intersection_probe_units_with(
+    pattern: &str,
+    flags: super::ast::Flags,
+    ctx: Option<&StrayContext>,
+    include_bounded: bool,
+    run: crate::redos::cost_arbiter::ChildRunner<'_>,
+) -> Result<Vec<(String, String)>, BuilderTimeout> {
+    let Some(slots) = pattern_slots(pattern, flags) else {
+        return Ok(Vec::new());
+    };
+    let owned_ctx;
+    let ctx = match ctx {
+        Some(ctx) => ctx,
+        None => {
+            owned_ctx = build_stray_context(pattern, flags, None);
+            &owned_ctx
+        }
+    };
+    let slots = if include_bounded {
+        include_bounded_repeats(&slots)
+    } else {
+        slots
+    };
+    Ok(units_in_slots_with(&slots, ctx, run)?
+        .into_iter()
+        .map(|unit| (unit.fill, unit.stray))
+        .collect())
+}
+
+/// Reference `_class_intersection_fills`.
+pub fn class_intersection_fills(
+    pattern: &str,
+    flags: super::ast::Flags,
+) -> Result<Vec<String>, BuilderTimeout> {
+    Ok(class_intersection_probe_units(pattern, flags, None, false)?
+        .into_iter()
+        .map(|(fill, _stray)| fill)
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    use crate::redos::ast::Flags;
+    use crate::redos::parse_slots::{NonPairingSlot, PairingAtom};
+
+    /// Destructure a non-pairing slot; panics on any other variant.
+    fn expect_non_pairing(slot: &Slot) -> &NonPairingSlot {
+        match slot {
+            Slot::NonPairing(non) => non,
+            other => panic!("expected non-pairing, got {other:?}"),
+        }
+    }
+
+    /// Destructure a pairing slot; panics on any other variant.
+    fn expect_pairing(slot: &Slot) -> &PairingAtom {
+        match slot {
+            Slot::Pairing(atom) => atom,
+            other => panic!("expected pairing, got {other:?}"),
+        }
+    }
+
+    fn im_flags() -> Flags {
+        Flags::ignorecase_multiline()
+    }
+
+    #[test]
+    fn event_handler_pair_finds_whitespace_and_slash_fills() {
+        let pattern = r"(?:<[^<>]*[\s/]+on\w+\s*=)";
+        let fills = class_intersection_fills(pattern, im_flags()).expect("builders");
+        assert!(!fills.is_empty());
+        assert!(fills.iter().all(|c| " \t\n\r\u{b}\u{c}/".contains(c)));
+    }
+
+    #[test]
+    fn disjoint_adjacent_classes_produce_no_fill() {
+        assert_eq!(
+            class_intersection_fills("[a-c]+[x-z]+", Flags::default()).expect("builders"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn alternation_boundaries_block_pairing() {
+        assert_eq!(
+            class_intersection_fills("[a-z]+|[a-z]+", Flags::default()).expect("builders"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn zero_admitting_middles_are_crossed() {
+        // Fills are interval first-members: tab (0x09) sorts below space
+        // (0x20), so the \s intersection fill is a tab.
+        let first = "\t".to_owned();
+        assert_eq!(
+            class_intersection_fills(r"'\s*[\);]*\s*--", Flags::default()).expect("builders"),
+            vec![first.clone()]
+        );
+        assert_eq!(
+            class_intersection_fills(r"'\s*(?:ab)*\s*--", Flags::default()).expect("builders"),
+            vec![first]
+        );
+    }
+
+    #[test]
+    fn mandatory_middles_block_or_cross_by_overlap() {
+        assert_eq!(
+            class_intersection_fills(r"\s*[\);]+\s*", Flags::default()).expect("builders"),
+            Vec::<String>::new()
+        );
+        // One fill per unbounded repeat site the walk can start from.
+        assert_eq!(
+            class_intersection_fills(r"'\s*(?:\s+)\s*--", Flags::default()).expect("builders"),
+            vec!["\t".to_owned(), "\t".to_owned(), "\t".to_owned()]
+        );
+    }
+
+    #[test]
+    fn multi_char_alternation_group_crossing() {
+        assert_eq!(
+            class_intersection_fills(r"^[c-w]*(?:[g-z][g-z]|[g-z][g-z][g-z])*$", Flags::default())
+                .expect("builders"),
+            vec!["g".to_owned()]
+        );
+        assert_eq!(
+            class_intersection_fills(r"^[a-f]*(?:[g-z][g-z]|[g-z][g-z][g-z])*$", Flags::default())
+                .expect("builders"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn ignorecase_folds_disjoint_case_pairs() {
+        assert_eq!(
+            class_intersection_probe_units(r"[a-z]*[A-Z]+", Flags::default(), None, false)
+                .expect("builders"),
+            Vec::<(String, String)>::new()
+        );
+        let units = class_intersection_probe_units(r"[a-z]*[A-Z]+", im_flags(), None, false)
+            .expect("builders");
+        assert!(!units.is_empty());
+        assert!(units[0].0 == "a" || units[0].0 == "A");
+    }
+
+    #[test]
+    fn parse_failures_yield_no_units() {
+        assert_eq!(
+            class_intersection_probe_units("[oops", Flags::default(), None, false)
+                .expect("builders"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn include_bounded_rewrites_bounded_repeats() {
+        // \d{3}\d{3} only crosses once the bounded repeats read unbounded.
+        let units = class_intersection_probe_units(r"\d{3}\d{3}", Flags::default(), None, true)
+            .expect("builders");
+        assert!(!units.is_empty());
+        // The rewrite also descends into grouped alternatives and marks
+        // their bounded digits unbounded.
+        let slots = pattern_slots_for(r"x(\d{2,3})+y");
+        let rewritten = include_bounded_repeats(&slots);
+        let non = expect_non_pairing(&rewritten[1]);
+        assert!(non.unbounded);
+        let inner = non.inner.as_ref().expect("inner").last().expect("branch");
+        let atom = expect_pairing(&inner[0]);
+        assert!(atom.unbounded);
+    }
+
+    #[test]
+    fn a_succeeding_boundary_crossing_maps_back_to_the_shared_set() {
+        // A nested boundary whose own crossing overlaps the shared set
+        // keeps the shared set unchanged (the success maps onto it).
+        let nested = Slot::NonPairing(NonPairingSlot {
+            is_boundary: true,
+            inner: Some(vec![vec![Slot::Pairing(PairingAtom {
+                intervals: IntervalSet::single(u32::from('a')),
+                allows_zero: false,
+                unbounded: false,
+                max_repeat: None,
+                variable_bounded: false,
+            })]]),
+            unbounded: true,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        let shared = IntervalSet::single(u32::from('a'));
+        let narrowed = crossing_slot_narrows(&nested, &shared, 0).expect("crossing");
+        assert_eq!(narrowed, shared);
+    }
+
+    #[test]
+    fn crossing_helpers_reject_past_the_depth_cap() {
+        let atom = Slot::Pairing(PairingAtom {
+            intervals: IntervalSet::single(u32::from('a')),
+            allows_zero: false,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        });
+        let alternatives = vec![vec![atom]];
+        assert_eq!(
+            crossing_group_result(&alternatives, &IntervalSet::single(u32::from('a')), 999),
+            None
+        );
+    }
+
+    #[test]
+    fn tail_pairing_intervals_collect_only_pairing_atoms_from_start() {
+        let slots = pattern_slots_for("a[b]c(d)");
+        let tail = tail_pairing_intervals(&slots, 1);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0], IntervalSet::single(u32::from('b')));
+        assert_eq!(tail[1], IntervalSet::single(u32::from('c')));
+        assert!(tail_pairing_intervals(&slots, slots.len()).is_empty());
+    }
+
+    #[test]
+    fn fill_confirmation_requires_interval_membership_on_both_sides() {
+        let left = PairingAtom {
+            intervals: IntervalSet::single(u32::from('a')),
+            allows_zero: false,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        };
+        let right = left.clone();
+        assert!(fill_confirmed(&left, &right, "a"));
+        assert!(!fill_confirmed(&left, &right, "b"));
+        assert!(!fill_confirmed(&left, &right, ""));
+        assert!(left_confirms_fill(&left, "a"));
+        assert!(!left_confirms_fill(&left, "b"));
+    }
+
+    fn pattern_slots_for(pattern: &str) -> Vec<Slot> {
+        crate::redos::parse_slots::pattern_slots(pattern, Flags::default()).expect("pattern parses")
+    }
+
+    #[test]
+    fn pairing_units_need_a_pairing_start_slot() {
+        let ctx = build_stray_context("a*z", Flags::default(), None);
+        let slots = vec![Slot::NonPairing(NonPairingSlot {
+            is_boundary: true,
+            inner: None,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        })];
+        let units = pairing_units_from_with(&slots, 0, &ctx, &run_child_request).expect("walk");
+        assert!(units.is_empty());
+    }
+
+    #[test]
+    fn flatten_alternatives_inserts_boundaries_between_branches() {
+        let atom = |c: char| {
+            Slot::Pairing(PairingAtom {
+                intervals: IntervalSet::single(u32::from(c)),
+                allows_zero: false,
+                unbounded: false,
+                max_repeat: None,
+                variable_bounded: false,
+            })
+        };
+        let flat = flatten_alternatives(&[vec![atom('a')], vec![atom('b')]]);
+        assert_eq!(flat.len(), 3);
+        assert!(matches!(&flat[1], Slot::NonPairing(non) if non.is_boundary));
+        assert_eq!(flatten_alternatives(&[vec![atom('a')]]).len(), 1);
+    }
+
+    #[test]
+    fn include_bounded_marks_bounded_group_alternations_unbounded() {
+        // A bounded quantifier on an alternation group makes the
+        // non-pairing slot count as repeatable for the crossing walk.
+        let slots = pattern_slots_for(r"a+(?:ab|cd){2,3}");
+        let rewritten = include_bounded_repeats(&slots);
+        let non = expect_non_pairing(&rewritten[1]);
+        assert!(non.unbounded);
+    }
+
+    #[test]
+    fn bounded_flag_propagates_into_nested_groups() {
+        let slots = pattern_slots_for(r"(\d{2})+");
+        let rewritten = include_bounded_repeats(&slots);
+        let non = expect_non_pairing(&rewritten[0]);
+        assert!(non.unbounded);
+        let inner = non.inner.as_ref().expect("inner").last().expect("branch");
+        let atom = expect_pairing(&inner[0]);
+        assert!(atom.unbounded);
+    }
+
+    #[test]
+    fn zero_width_lookahead_crossings_stay_transparent() {
+        let flags = Flags::default();
+        // The lookahead's `a*` allows zero width, so the crossing keeps the
+        // shared set untouched and the chain still confirms its fill.
+        assert_eq!(
+            class_intersection_probe_units("a+(?=a*)a+", flags, None, false).expect("units"),
+            vec![("a".to_owned(), "\0".to_owned())]
+        );
+        // A nested boundary inside the crossing recurses one level deeper.
+        assert_eq!(
+            class_intersection_probe_units("a+(?=(?=b)c)a+", flags, None, false).expect("units"),
+            vec![("a".to_owned(), "\0".to_owned())]
+        );
+        // A nested boundary whose own crossing succeeds keeps the shared
+        // set (the crossing result is mapped back onto it).
+        assert_eq!(
+            class_intersection_probe_units("a+(?=(?=a)a)a+", flags, None, false).expect("units"),
+            vec![("a".to_owned(), "\0".to_owned())]
+        );
+    }
+
+    #[test]
+    fn boundary_crossings_map_their_outcomes() {
+        let flags = Flags::default();
+        // A crossing whose inner class cannot overlap the shared set is
+        // unbounded and misses, so it confirms nothing.
+        assert_eq!(
+            class_intersection_probe_units("a+(?=b)a+b", flags, None, false).expect("units"),
+            vec![("a".to_owned(), "\0".to_owned())]
+        );
+        // A non-unbounded boundary crossing never yields a fill.
+        assert_eq!(
+            class_intersection_probe_units("a+(?=a)ab+", flags, None, false).expect("units"),
+            Vec::<(String, String)>::new()
+        );
+        // A bounded group is invisible to the default (unbounded-only) walk.
+        assert_eq!(
+            class_intersection_probe_units("a+(a*)b+", flags, None, false).expect("units"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn pairing_chains_and_alternation_groups_produce_units() {
+        let flags = Flags::default();
+        // Two overlapping unbounded classes confirm their shared fill.
+        assert_eq!(
+            class_intersection_probe_units("a+a+", flags, None, false).expect("units"),
+            vec![("a".to_owned(), "\0".to_owned())]
+        );
+        // A transparent group between pairings crosses as a non-boundary.
+        assert_eq!(
+            class_intersection_probe_units("a+(?:a|b)+b", flags, None, false).expect("units"),
+            vec![("a".to_owned(), "\0".to_owned())]
+        );
+        // A quantified boundary crossing stays unconfirmed.
+        assert_eq!(
+            class_intersection_probe_units("a+(?=b)*a+b", flags, None, false).expect("units"),
+            vec![("a".to_owned(), "\0".to_owned())]
+        );
+        // Negated classes chain two independent fill units.
+        assert_eq!(
+            class_intersection_probe_units("a+[^x]*b+", flags, None, false).expect("units"),
+            vec![
+                ("a".to_owned(), "\0".to_owned()),
+                ("b".to_owned(), "x".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn boundary_crossings_recurse_into_their_alternatives() {
+        let flags = Flags::default();
+        // A repeat-wrapped group is a hard boundary for the crossing; the
+        // crossing walks its alternatives one level deeper and the chain
+        // still confirms its fill through the surviving overlap.
+        assert_eq!(
+            class_intersection_probe_units("a+(?=(?:b|c)+)a+", flags, None, false).expect("units"),
+            vec![("a".to_owned(), "\0".to_owned())]
+        );
+        // A boundary group that cannot overlap the shared set stops the
+        // chain: the crossing fails and no exact fill can rescue it.
+        assert_eq!(
+            class_intersection_probe_units("a+(?:b)+c+", flags, None, false).expect("units"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn the_exact_fill_path_appends_units_when_the_overlap_is_empty() {
+        let flags = Flags::default();
+        let ctx = build_stray_context("a+a+", flags, None);
+        let slots = pattern_slots("a+a+", flags).expect("slots");
+        let left = expect_pairing(&slots[0]);
+        let slot = expect_pairing(&slots[1]);
+        // An empty overlap with a live exact fill still appends the unit.
+        let (shared, exact, should_stop) = advance_pairing_chain_with(
+            &mut Vec::new(),
+            left,
+            &IntervalSet::empty(),
+            slot,
+            &Some(left.intervals.clone()),
+            &[],
+            &ctx,
+            &run_child_request,
+        )
+        .expect("advance");
+        assert!(shared.is_empty());
+        assert_eq!(exact, None);
+        // The exhausted exact state does not stop the walk on its own.
+        assert!(!should_stop);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected non-pairing")]
+    fn expect_non_pairing_rejects_other_variants() {
+        let _ = expect_non_pairing(&Slot::Pairing(PairingAtom {
+            intervals: IntervalSet::empty(),
+            allows_zero: false,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        }));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected pairing")]
+    fn expect_pairing_rejects_other_variants() {
+        let _ = expect_pairing(&Slot::NonPairing(NonPairingSlot {
+            is_boundary: false,
+            inner: None,
+            unbounded: false,
+            max_repeat: None,
+            variable_bounded: false,
+        }));
+    }
+
+    #[test]
+    fn multi_atom_boundary_groups_cross_and_fail_together() {
+        let flags = Flags::default();
+        // A repeat-wrapped two-atom group is a hard boundary whose body
+        // cannot overlap the shared set: the crossing fails and the chain
+        // stops without units.
+        assert_eq!(
+            class_intersection_probe_units("a+(?:bc)+d+", flags, None, false).expect("units"),
+            Vec::<(String, String)>::new()
+        );
+    }
+
+    #[test]
+    fn advance_pairing_chain_maps_bounded_and_zero_admitting_slots() {
+        let flags = Flags::default();
+        let ctx = build_stray_context("aa", flags, None);
+        let slots = pattern_slots("aa", flags).expect("slots");
+        let left = expect_pairing(&slots[0]);
+        // A bounded slot with a live exact fill appends its unit and stops
+        // the chain on its mandatory membership.
+        let slots_bounded = pattern_slots("a[ab]", flags).expect("slots");
+        let bounded = expect_pairing(&slots_bounded[1]);
+        let (shared, exact, should_stop) = advance_pairing_chain_with(
+            &mut Vec::new(),
+            left,
+            &IntervalSet::empty(),
+            bounded,
+            &Some(left.intervals.clone()),
+            &[],
+            &ctx,
+            &run_child_request,
+        )
+        .expect("advance");
+        assert!(shared.is_empty());
+        assert_eq!(exact, None);
+        // The exhausted exact state does not stop the walk on its own.
+        assert!(!should_stop);
+        // A zero-admitting slot with an empty overlap leaves everything
+        // untouched and lets the walk continue.
+        let slots_zero = pattern_slots("aa*", flags).expect("slots");
+        let zero = expect_pairing(&slots_zero[1]);
+        let (shared, exact, should_stop) = advance_pairing_chain_with(
+            &mut Vec::new(),
+            left,
+            &IntervalSet::empty(),
+            zero,
+            &Some(left.intervals.clone()),
+            &[],
+            &ctx,
+            &run_child_request,
+        )
+        .expect("advance");
+        assert!(shared.is_empty());
+        assert!(exact.is_some());
+        assert!(!should_stop);
+    }
+
+    #[test]
+    fn an_expired_deadline_surfaces_through_the_unit_chain() {
+        let ctx = build_stray_context(
+            "a+a+",
+            Flags::default(),
+            Some(Instant::now() - std::time::Duration::from_secs(1)),
+        );
+        let slots = pattern_slots("a+a+", Flags::default()).expect("slots");
+        let left = expect_pairing(&slots[0]);
+        let slot = expect_pairing(&slots[1]);
+        let error = advance_pairing_chain_with(
+            &mut Vec::new(),
+            left,
+            &left.intervals.clone(),
+            slot,
+            &Some(left.intervals.clone()),
+            &[],
+            &ctx,
+            &run_child_request,
+        )
+        .expect_err("expired");
+        assert_eq!(
+            error.0,
+            "Pattern validation probe construction exceeded its deadline"
+        );
+    }
+
+    #[test]
+    fn an_expired_deadline_surfaces_through_both_chain_paths() {
+        let ctx = build_stray_context(
+            "a+a+",
+            Flags::default(),
+            Some(Instant::now() - std::time::Duration::from_secs(1)),
+        );
+        // The pairing-advance path propagates the builder error.
+        let error = class_intersection_probe_units("a+a+", Flags::default(), Some(&ctx), false)
+            .expect_err("expired");
+        assert_eq!(
+            error.0,
+            "Pattern validation probe construction exceeded its deadline"
+        );
+        // The non-pairing fill path propagates it the same way.
+        let error =
+            class_intersection_probe_units("a+(?:a|b)+b+", Flags::default(), Some(&ctx), false)
+                .expect_err("expired");
+        assert_eq!(
+            error.0,
+            "Pattern validation probe construction exceeded its deadline"
+        );
+    }
+
+    /// A child runner whose every stray-verification dispatch times out.
+    fn timing_out_runner() -> crate::redos::cost_arbiter::ChildRunner<'static> {
+        &|_request: &crate::redos::child::ChildRequest,
+          _timeout: f64|
+         -> Result<crate::redos::child::ChildOutcome, crate::redos::child::ChildSpawnError> {
+            Err(crate::redos::child::ChildSpawnError::Timeout)
+        }
+    }
+
+    #[test]
+    fn the_injected_child_failure_propagates_through_the_pairing_chain() {
+        // `a+a+` confirms its fill through advance_pairing_chain, so the
+        // injected child failure surfaces as the mapped stray-verification
+        // timeout instead of a unit list.
+        let ctx = build_stray_context("a+a+", Flags::default(), None);
+        let error = class_intersection_probe_units_with(
+            "a+a+",
+            Flags::default(),
+            Some(&ctx),
+            false,
+            timing_out_runner(),
+        )
+        .expect_err("injected child failure");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification exceeded its \
+             killable-subprocess timeout"
+        );
+    }
+
+    #[test]
+    fn the_injected_child_failure_propagates_through_the_group_crossing() {
+        // The `(?:a|b)+` crossing confirms its fill on the non-pairing
+        // path; the same injected failure surfaces there too.
+        let ctx = build_stray_context("a+(?:a|b)+b", Flags::default(), None);
+        let error = class_intersection_probe_units_with(
+            "a+(?:a|b)+b",
+            Flags::default(),
+            Some(&ctx),
+            false,
+            timing_out_runner(),
+        )
+        .expect_err("injected child failure");
+        assert_eq!(
+            error.0,
+            "Pattern validation stray verification exceeded its \
+             killable-subprocess timeout"
+        );
+        // A parse failure still short-circuits before any child dispatch.
+        assert!(
+            class_intersection_probe_units_with(
+                "[oops",
+                Flags::default(),
+                None,
+                false,
+                timing_out_runner(),
+            )
+            .expect("no units")
+            .is_empty()
+        );
+    }
+}

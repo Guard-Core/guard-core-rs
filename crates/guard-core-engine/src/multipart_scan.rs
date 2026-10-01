@@ -283,6 +283,10 @@ mod tests {
         let body = "--B0\r\nContent-Disposition: form-data;\r\n name=\"a\"\r\n\r\nx\r\n--B0--\r\n";
         let parts = parse_multipart_parts(body, "B0");
         assert_eq!(parts[0].headers[0].value, "form-data;\r\n name=\"a\"");
+        // The same fold over bare-LF breaks keeps the LF break verbatim.
+        let body = "--B0\nContent-Disposition: form-data;\n name=\"a\"\n\nx\n--B0--\n";
+        let parts = parse_multipart_parts(body, "B0");
+        assert_eq!(parts[0].headers[0].value, "form-data;\n name=\"a\"");
     }
 
     #[test]

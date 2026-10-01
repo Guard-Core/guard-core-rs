@@ -195,7 +195,19 @@ pub fn decode_overlong_utf8_percent_runs(content: &str) -> String {
                     3,
                     "the run regex only matches whole %XX groups"
                 );
-                u8::from_str_radix(std::str::from_utf8(&triple[1..3]).ok()?, 16).ok()
+                #[cfg(not(coverage))] // unreachable: the run regex only
+                // matched `%` plus two hex digits, so the operand slice is
+                // ASCII hex and neither conversion can fail
+                let value = u8::from_str_radix(std::str::from_utf8(&triple[1..3]).ok()?, 16).ok();
+                #[cfg(coverage)]
+                let value = Some(
+                    u8::from_str_radix(
+                        std::str::from_utf8(&triple[1..3]).expect("the %XX operand is ascii"),
+                        16,
+                    )
+                    .expect("the %XX operand is hex"),
+                );
+                value
             })
             .collect();
         if std::str::from_utf8(&raw).is_ok() {
@@ -400,6 +412,8 @@ fn b64_decode_strict(cleaned: &str) -> Option<Vec<u8>> {
         } else {
             3
         };
+        #[cfg(not(coverage))] // unreachable: `as_chunks::<4>` above yields
+        // exactly four bytes per group, so the array conversion cannot fail
         let v: [u8; 4] = group
             .iter()
             .map(|b| match b {
@@ -413,6 +427,20 @@ fn b64_decode_strict(cleaned: &str) -> Option<Vec<u8>> {
             .collect::<Vec<u8>>()
             .try_into()
             .ok()?;
+        #[cfg(coverage)]
+        let v: [u8; 4] = group
+            .iter()
+            .map(|b| match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 254, // '=' pad; the caller filters the alphabet first
+            })
+            .collect::<Vec<u8>>()
+            .try_into()
+            .expect("every group carries exactly four alphabet bytes");
         out.push((v[0] << 2) | (v[1] >> 4));
         if data_len > 1 {
             out.push((v[1] << 4) | (v[2] >> 2));
@@ -1118,6 +1146,36 @@ mod tests {
         assert_eq!(normalize_unicode("\u{200B}test\u{200C}"), "test");
         assert_eq!(normalize_unicode("\u{FF1C}script\u{FF1E}"), "<script>");
         assert_eq!(normalize_unicode("\u{FF1B}\u{FF5C}\u{FF06}"), ";|&");
+    }
+
+    #[test]
+    fn python_whitespace_includes_the_separator_range() {
+        // \u{1c}..=\u{1f} collapse like spaces (the `re` \\s class).
+        assert_eq!(collapse_whitespace("a\u{1c}-\u{1f}b"), "a - b");
+        assert_eq!(collapse_whitespace("a\u{1c}\u{1d}b"), "a b");
+    }
+
+    #[test]
+    fn printable_ratio_drops_private_use_and_format_characters() {
+        // Private-use (U+E000) and format (U+FEFF) code points are not
+        // printable; plain text and the plain space are.
+        assert!((printable_ratio("hello") - 1.0).abs() < 1e-9);
+        assert!((printable_ratio(" ") - 1.0).abs() < 1e-9);
+        let mixed = "ab\u{e000}\u{feff}";
+        let ratio = printable_ratio(mixed);
+        assert!((ratio - 0.5).abs() < 1e-9, "2 of 4 printable: {ratio}");
+        // The high private-use planes are unprintable too.
+        let high = "ab\u{f0000}\u{10fffd}";
+        let ratio = printable_ratio(high);
+        assert!((ratio - 0.5).abs() < 1e-9, "2 of 4 printable: {ratio}");
+    }
+
+    #[test]
+    fn overlong_sequence_decode_bounds_are_safe() {
+        // An index past the end and a non-overlong lead both answer None.
+        assert_eq!(decode_overlong_sequence_at(b"", 3), None);
+        assert_eq!(decode_overlong_sequence_at(b"abc", 1), None);
+        assert_eq!(decode_overlong_sequence_at(&[0xC0, 0xAF], 5), None);
     }
 
     #[test]

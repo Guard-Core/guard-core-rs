@@ -860,6 +860,36 @@ mod tests {
         assert_eq!(unquote_header_param("\"a"), "\"a");
         assert_eq!(unquote_header_param("a"), "a");
     }
+
+    #[test]
+    fn unquote_plus_decodes_lowercase_hex_and_stray_escapes() {
+        // Lowercase hex digits ride the same nibble table.
+        assert_eq!(unquote_plus("%2f%2F"), "//");
+        assert_eq!(unquote_plus("a+ b"), "a  b");
+        // A truncated or non-hex escape keeps its percent verbatim.
+        assert_eq!(unquote_plus("100%"), "100%");
+        assert_eq!(unquote_plus("%zz"), "%zz");
+        assert_eq!(unquote_plus("%2"), "%2");
+    }
+
+    #[test]
+    fn media_type_params_skip_pieces_without_an_equals() {
+        let (main, params) = parse_media_type_params("multipart/form-data; boundary=x; junk");
+        assert_eq!(main, "multipart/form-data");
+        assert_eq!(
+            params,
+            vec![(String::from("boundary"), String::from("x"))],
+            "a param piece without '=' is dropped"
+        );
+    }
+
+    #[test]
+    fn unquote_header_param_only_unescapes_quotes_and_backslashes() {
+        // An escaped backslash and quote unescape; any other escaped char
+        // keeps its backslash verbatim.
+        assert_eq!(unquote_header_param("\"a\\\\b\\\"c\""), "a\\b\"c");
+        assert_eq!(unquote_header_param("\"a\\nb\""), "a\\nb");
+    }
 }
 
 #[cfg(test)]

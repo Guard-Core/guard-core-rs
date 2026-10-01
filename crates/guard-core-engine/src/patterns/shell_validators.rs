@@ -899,6 +899,14 @@ mod unit_twins {
     }
 
     #[test]
+    fn a_dollar_substitution_after_an_operator_opens_the_window() {
+        // `$(cmd)` and `${var}` after an operator both read as a command
+        // opening, not just the backtick and word-token forms.
+        assert!(shell_metacharacter_window("; $(cmd)"));
+        assert!(shell_metacharacter_window("|| ${VAR}"));
+    }
+
+    #[test]
     fn an_unrecognized_post_operator_token_keeps_scanning() {
         // after the `;` the window holds `@x`: no token alternative matches,
         // so the scan advances past the operator and reports no window

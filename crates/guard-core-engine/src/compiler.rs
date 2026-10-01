@@ -3,15 +3,6 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 use regex::Regex;
 
-const DANGEROUS_PATTERNS: &[&str] = &[
-    r"\(\.\*\)\+",
-    r"\(\.\+\)\+",
-    r"\([^)]*\*\)\+",
-    r"\([^)]*\+\)\+",
-    r"(?:\.\*){2,}",
-    r"(?:\.\+){2,}",
-];
-
 /// LRU cache for compiled regex patterns.
 ///
 /// Capacity is clamped to 1..=5000. Patterns are compiled with
@@ -63,23 +54,20 @@ pub fn compile(pattern: &str) -> Result<Regex, regex::Error> {
     Regex::new(&format!("(?im){pattern}"))
 }
 
-/// Check if a pattern contains constructs that cause catastrophic
-/// backtracking in PCRE/Python `re`.
+/// Check whether a pattern is safe from catastrophic backtracking with the
+/// full reference safety chain.
 ///
-/// Rust's `regex` crate uses finite automata and is inherently ReDoS-safe,
-/// but this flags patterns that would be dangerous in other engines.
-/// On match, the returned reason names the specific dangerous construct.
+/// The chain runs dangerous constructs, the compile check, the structural
+/// detectors, probe synthesis, and the empirical cost arbiter. The `regex`
+/// crate is linear-time, so this certifies the pattern source the way the
+/// reference engine does: the reasons name the specific finding and match
+/// the reference's human-readable prefixes.
+///
+/// Prefer [`crate::redos::validate_pattern_safety`] for the structured
+/// verdict; this compat shim keeps the historic two-tuple shape.
 #[must_use]
-pub fn validate_pattern_safety(pattern: &str) -> (bool, &'static str) {
-    for &dangerous in DANGEROUS_PATTERNS {
-        if let Ok(checker) = Regex::new(dangerous)
-            && checker.is_match(pattern)
-        {
-            return (false, dangerous);
-        }
-    }
-
-    (true, "pattern appears safe")
+pub fn validate_pattern_safety(pattern: &str) -> (bool, String) {
+    crate::redos::validate_pattern_safety_compat(pattern)
 }
 
 /// Compile multiple patterns, skipping invalid ones. When `validate` is
@@ -163,11 +151,31 @@ mod tests {
     fn safe_patterns_pass() {
         let (safe, msg) = validate_pattern_safety(r"test\d+");
         assert!(safe);
-        assert_eq!(msg, "pattern appears safe");
+        assert_eq!(msg, "Pattern appears safe");
 
-        for pat in [r"<script[^>]*>", r"\d{3}-\d{3}-\d{4}", r"[a-zA-Z0-9]+"] {
+        for pat in [r"<script[^>]*>", r"[a-zA-Z0-9]+"] {
             assert!(validate_pattern_safety(pat).0, "should pass: {pat}");
         }
+    }
+
+    #[test]
+    fn bounded_cost_pattern_passes_at_the_configured_cap() {
+        // At the default cap the zero-fill probes extrapolate over budget,
+        // so callers cap the cost verdict at their content limit (the
+        // corpus pins 10000 for this exact pattern).
+        let verdict = crate::redos::validate_pattern_safety(
+            r"\d{3}-\d{3}-\d{4}",
+            &crate::redos::SafetyMode::CostVerdict {
+                max_content_length: Some(10000),
+            },
+        );
+        assert!(verdict.safe, "reason: {}", verdict.reason);
+
+        // The verdict at the default cap is host-speed dependent (an
+        // optimized build extrapolates under the budget), so only the
+        // deterministic capped verdict is asserted here. The over-budget
+        // reason class is pinned by the corpus and by the verdict-math
+        // unit tests.
     }
 
     #[test]

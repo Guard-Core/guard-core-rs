@@ -146,6 +146,30 @@ mod coverage_tests {
     }
 
     #[test]
+    fn a_prefix_window_that_cannot_complete_returns_none_and_is_abandoned() {
+        let compiled = PyRegex::compile(r"<script[^>]*>[^<]*<\/script\s*>", false).unwrap();
+        let prefix = PyRegex::compile("<script", false).unwrap();
+        let terminator = PyRegex::compile(r"<\/script\s*>", false).unwrap();
+        // The `b` element breaks the `[^<]*` run before the ceiling, so
+        // `find_at` inside the truncated window finds nothing.
+        let text = "<script><b></script> tail";
+        assert!(bounded_finditer(text, &compiled, &prefix, &terminator).is_empty());
+    }
+
+    #[test]
+    fn a_zero_width_window_match_advances_one_char() {
+        // `z*` matches the empty string at the prefix position: the scan
+        // must step forward instead of looping in place.
+        let compiled = PyRegex::compile("z*", false).unwrap();
+        let prefix = PyRegex::compile("x", false).unwrap();
+        let terminator = PyRegex::compile("b", false).unwrap();
+        let ms = bounded_finditer("xb", &compiled, &prefix, &terminator);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].start, 0);
+        assert_eq!(ms[0].end, 0);
+    }
+
+    #[test]
     fn prefix_candidates_at_or_past_the_last_terminator_are_skipped() {
         let compiled = PyRegex::compile(r"<script[^>]*>[^<]*<\/script\s*>", false).unwrap();
         let prefix = PyRegex::compile("<script", false).unwrap();

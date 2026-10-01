@@ -689,7 +689,9 @@ mod tests {
         // poll_ready delegates to the inner service.
         let waker = std::task::Waker::noop();
         let mut cx = Context::from_waker(waker);
-        assert!(matches!(service.poll_ready(&mut cx), Poll::Ready(Ok(()))));
+        let polled = service.poll_ready(&mut cx);
+        assert!(polled.is_ready());
+        assert_eq!(polled.map(|result| result.is_ok()), Poll::Ready(true));
 
         let mut blocked = Request::builder().uri("/x").body("b").expect("req");
         blocked
