@@ -634,12 +634,26 @@ mod tests {
 
     #[test]
     fn run_child_request_kills_a_runaway_child() {
-        // A deadline under the process-spawn floor deterministically
-        // exercises the kill path: the parent polls, kills, waits, and
+        // A fancy-regex backtracking pattern over a 32000-char probe is
+        // catastrophically slow on every host, so the 50ms deadline is
+        // guaranteed to fire mid-run: the parent polls, kills, waits, and
         // reports a timeout instead of blocking forever on a child that
-        // cannot be interrupted in-process.
+        // cannot be interrupted in-process. (A sub-millisecond deadline on
+        // ReferenceLoad raced the child's completion on fast runners.)
+        let pattern = "(?!x)(?:a|aa)+$";
+        // The trailing b forces the match to fail after the greedy run,
+        // sending the backtracker through the exponential split space.
+        let probes = vec![format!("{}b", "a".repeat(32_000))];
+        let request = ChildRequest::ReachTiming {
+            pattern: pattern.to_owned(),
+            probes,
+            samples: 1,
+            deadline: 1.0,
+            flags: Flags::default(),
+            trigger: f64::MAX,
+        };
         let start = Instant::now();
-        let outcome = run_child_request(&ChildRequest::ReferenceLoad, 0.0005);
+        let outcome = run_child_request(&request, 0.05);
         assert!(
             matches!(outcome, Err(ChildSpawnError::Timeout)),
             "expected a killed child, got {outcome:?}"
