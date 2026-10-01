@@ -931,4 +931,47 @@ mod tests {
         let compiled = CompiledProbe::compile("abc", &Flags::default()).expect("compile");
         let _ = expect_fancy(&compiled);
     }
+
+    #[test]
+    fn child_compilation_covers_the_parser_surface() {
+        // Each request makes the child compile (or reject) a different
+        // pattern shape, so the child's own engine instance exercises the
+        // same breadth the in-process suite does.
+        for pattern in [
+            r"[a-z]+",
+            r"(?i)(?:\d{2,4}|\w+-\w+)+$",
+            r"(?P<name>x)(?P=name)",
+            r"(a|b|c)*d",
+            r"[\x41-\x5a]+\u00e9",
+            r"a{2,5}b{2,}",
+            r"(?=look)a+less",
+            r"\b(?:one|two)\s+three\b",
+        ] {
+            let request = ChildRequest::TestStrings {
+                pattern: pattern.to_owned(),
+                test_strings: vec!["probe".to_owned()],
+                threshold: 1.0,
+                flags: Flags::default(),
+            };
+            let outcome = run_child_request(&request, 2.0);
+            assert!(outcome.is_ok(), "{pattern}: {outcome:?}");
+        }
+        // A rejected pattern drives the child's compile-failure payload.
+        let request = ChildRequest::TestStrings {
+            pattern: "[invalid".to_owned(),
+            test_strings: vec![],
+            threshold: 1.0,
+            flags: Flags::default(),
+        };
+        let outcome = run_child_request(&request, 2.0).expect("rejected payload");
+        assert_eq!(
+            outcome,
+            ChildOutcome::Safety {
+                safe: false,
+                reason: "Pattern validation failed: Parsing error at position 8: \
+                         Invalid character class"
+                    .to_owned(),
+            }
+        );
+    }
 }

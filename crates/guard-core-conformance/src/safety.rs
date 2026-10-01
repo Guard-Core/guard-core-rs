@@ -146,6 +146,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn decode_case_rejects_malformed_suite_entries() {
+        let missing_id = serde_json::json!({ "input": {}, "expected": {} });
+        assert_eq!(
+            decode_case(&missing_id).expect_err("missing id"),
+            "missing case id"
+        );
+        let missing_input = serde_json::json!({ "id": "c", "expected": {} });
+        assert_eq!(
+            decode_case(&missing_input).expect_err("missing input"),
+            "c: missing input"
+        );
+        let missing_pattern = serde_json::json!({ "id": "c", "input": {}, "expected": {} });
+        assert_eq!(
+            decode_case(&missing_pattern).expect_err("missing pattern"),
+            "c: missing input.pattern"
+        );
+        let bad_mode = serde_json::json!({
+            "id": "c",
+            "input": { "pattern": "a", "mode": "nope" },
+            "expected": {},
+        });
+        assert_eq!(
+            decode_case(&bad_mode).expect_err("bad mode"),
+            "c: unknown input.mode \"nope\""
+        );
+        let missing_expected = serde_json::json!({
+            "id": "c",
+            "input": {
+                "pattern": "a",
+                "mode": "test_strings",
+                "test_strings": ["a"],
+            },
+        });
+        assert_eq!(
+            decode_case(&missing_expected).expect_err("missing expected"),
+            "c: missing expected"
+        );
+        let missing_safe = serde_json::json!({
+            "id": "c",
+            "input": {
+                "pattern": "a",
+                "mode": "test_strings",
+                "test_strings": ["a"],
+            },
+            "expected": { "reason_class": "safe" },
+        });
+        assert_eq!(
+            decode_case(&missing_safe).expect_err("missing expected.safe"),
+            "c: missing expected.safe"
+        );
+        let missing_class = serde_json::json!({
+            "id": "c",
+            "input": {
+                "pattern": "a",
+                "mode": "test_strings",
+                "test_strings": ["a"],
+            },
+            "expected": { "safe": true },
+        });
+        assert_eq!(
+            decode_case(&missing_class).expect_err("missing expected.reason_class"),
+            "c: missing expected.reason_class"
+        );
+    }
+
+    #[test]
+    fn run_safety_case_reports_expectation_drift() {
+        let drifting = SafetyCase {
+            id: "drift".to_owned(),
+            pattern: "abc".to_owned(),
+            mode: SafetyMode::TestStrings(vec![]),
+            expected_safe: false,
+            expected_reason_class: "compile_failed".to_owned(),
+        };
+        let result = run_safety_case(&drifting);
+        assert_eq!(result.status, Status::Failed);
+        assert_eq!(result.diffs.len(), 2);
+        let agreeing = SafetyCase {
+            expected_safe: true,
+            expected_reason_class: "safe".to_owned(),
+            ..drifting
+        };
+        let result = run_safety_case(&agreeing);
+        assert_eq!(result.status, Status::Passed);
+        assert!(result.diffs.is_empty());
+    }
+
+    #[test]
     fn mode_decoding_rejects_unknown_and_missing_modes() {
         let error =
             mode_from_value(&serde_json::json!({ "mode": "teleport" })).expect_err("unknown mode");
