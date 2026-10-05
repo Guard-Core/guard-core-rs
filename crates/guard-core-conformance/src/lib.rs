@@ -8,6 +8,8 @@
 pub mod baseline;
 pub mod compare;
 pub mod corpus;
+#[cfg(test)]
+mod cost;
 pub mod detect;
 pub mod knobs;
 pub mod ledger;
