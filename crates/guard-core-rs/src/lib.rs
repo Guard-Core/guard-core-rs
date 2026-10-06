@@ -81,13 +81,18 @@ pub mod geo;
 pub mod headers_auth;
 pub mod https_enforcement;
 pub mod logging;
+pub mod metrics;
+pub mod mmdb;
 pub mod process_response;
 pub mod redact;
+#[cfg(feature = "redis")]
+pub mod redis_store;
 pub mod request_limits;
 pub mod request_logging;
 pub mod responses;
 pub mod route_gates;
 pub mod stage_events;
+pub mod sus_patterns;
 pub mod tower;
 pub mod user_agent;
 
