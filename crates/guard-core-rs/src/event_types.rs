@@ -129,6 +129,25 @@ pub const EVENT_TYPE_VALUES: [&str; 39] = [
     EVENT_PATTERN_ANOMALY_STATISTICAL_ANOMALY,
 ];
 
+/// `ENRICHMENT_KEY_PROJECT_ID`: the enrichment metadata keys the
+/// [`crate::enrichment::EventEnricher`] stamps, byte-identical to the
+/// reference `event_types.py` `ENRICHMENT_KEY_*` strings.
+pub const ENRICHMENT_KEY_PROJECT_ID: &str = "guard.project_id";
+/// `ENRICHMENT_KEY_SERVICE_NAME`.
+pub const ENRICHMENT_KEY_SERVICE_NAME: &str = "guard.service.name";
+/// `ENRICHMENT_KEY_DEPLOYMENT_ENV`.
+pub const ENRICHMENT_KEY_DEPLOYMENT_ENV: &str = "guard.deployment.environment";
+/// `ENRICHMENT_KEY_THREAT_SCORE`.
+pub const ENRICHMENT_KEY_THREAT_SCORE: &str = "guard.threat_score";
+/// `ENRICHMENT_KEY_RULE_ID`.
+pub const ENRICHMENT_KEY_RULE_ID: &str = "guard.rule.id";
+/// `ENRICHMENT_KEY_RULE_VERSION`.
+pub const ENRICHMENT_KEY_RULE_VERSION: &str = "guard.rule.version";
+/// `ENRICHMENT_KEY_BEHAVIOR_KEY`.
+pub const ENRICHMENT_KEY_BEHAVIOR_KEY: &str = "guard.behavior.correlation_key";
+/// `ENRICHMENT_KEY_RECENT_EVENT_COUNT`.
+pub const ENRICHMENT_KEY_RECENT_EVENT_COUNT: &str = "guard.behavior.recent_event_count";
+
 #[cfg(test)]
 mod tests {
     use super::*;

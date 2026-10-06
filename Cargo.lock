@@ -939,6 +939,7 @@ dependencies = [
  "redis",
  "regex",
  "serde_json",
+ "sha2",
  "tower",
  "ureq",
 ]

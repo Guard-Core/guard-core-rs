@@ -43,6 +43,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::enrichment::EventEnricher;
+
 pub use crate::event_types::EVENT_TYPE_VALUES;
 
 /// A registered event sink (`agent_handler.send_event`'s Rust stand-in).
@@ -152,10 +154,16 @@ impl EventFilter {
 /// The event bus over the registered sinks. Cheaply clonable; clones made
 /// before [`SecurityEventBus::on_event`] registrations keep an empty list
 /// (fork-on-write), so build the bus before sharing it.
+///
+/// With an enricher installed ([`SecurityEventBus::with_enricher`]) the bus
+/// plays the reference `CompositeAgentHandler` role: the filter applies
+/// first, then the enrichment runs once, then every handler observes the
+/// same enriched event.
 #[derive(Clone, Default)]
 pub struct SecurityEventBus {
     enabled: bool,
     filter: Option<EventFilter>,
+    enricher: Option<Arc<EventEnricher>>,
     inner: Arc<BusInner>,
 }
 
@@ -168,6 +176,7 @@ impl SecurityEventBus {
         Self {
             enabled,
             filter: None,
+            enricher: None,
             inner: Arc::default(),
         }
     }
@@ -176,6 +185,14 @@ impl SecurityEventBus {
     #[must_use]
     pub fn with_filter(mut self, filter: EventFilter) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Install the enrichment pass (`CompositeAgentHandler(enricher=...)`):
+    /// every dispatched event is enriched once before the handlers run.
+    #[must_use]
+    pub fn with_enricher(mut self, enricher: EventEnricher) -> Self {
+        self.enricher = Some(Arc::new(enricher));
         self
     }
 
@@ -188,6 +205,7 @@ impl SecurityEventBus {
         Self {
             enabled: self.enabled,
             filter: self.filter,
+            enricher: self.enricher,
             inner: Arc::new(BusInner { handlers }),
         }
     }
@@ -203,8 +221,12 @@ impl SecurityEventBus {
         {
             return;
         }
+        let mut enriched = event.clone();
+        if let Some(enricher) = &self.enricher {
+            enricher.enrich_event(&mut enriched);
+        }
         for handler in &self.inner.handlers {
-            let _ = catch_unwind(AssertUnwindSafe(|| handler(event)));
+            let _ = catch_unwind(AssertUnwindSafe(|| handler(&enriched)));
         }
     }
 
@@ -228,6 +250,120 @@ impl SecurityEventBus {
             reason,
             MIDDLEWARE_HANDLER_NAME,
         ));
+    }
+}
+
+#[cfg(test)]
+mod enrichment_tests {
+    use super::*;
+    use crate::enrichment::{EnrichmentIdentity, EventEnricher};
+    use crate::event_types::{
+        ENRICHMENT_KEY_RECENT_EVENT_COUNT, ENRICHMENT_KEY_SERVICE_NAME,
+        ENRICHMENT_KEY_THREAT_SCORE, EVENT_IP_BLOCKED, EVENT_PENETRATION_ATTEMPT,
+    };
+    use std::sync::Mutex;
+
+    #[test]
+    fn an_installed_enricher_enriches_before_the_handlers() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let bus = SecurityEventBus::new(true)
+            .with_enricher(EventEnricher::new(EnrichmentIdentity {
+                service_name: "edge-svc".to_owned(),
+                ..EnrichmentIdentity::new()
+            }))
+            .on_event(Arc::new(move |event: &SecurityEvent| {
+                sink.lock()
+                    .expect("sink")
+                    .push(event.metadata[ENRICHMENT_KEY_SERVICE_NAME].clone());
+            }));
+        bus.send_middleware_event(
+            EVENT_PENETRATION_ATTEMPT,
+            "192.0.2.1",
+            "request_blocked",
+            "sqli",
+        );
+        let records = seen.lock().expect("sink").clone();
+        assert_eq!(records, vec![serde_json::json!("edge-svc")]);
+    }
+
+    #[test]
+    fn every_handler_observes_the_same_enriched_event_and_the_input_is_untouched() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let bus = SecurityEventBus::new(true)
+            .with_enricher(EventEnricher::new(EnrichmentIdentity::new()))
+            .on_event(Arc::new(move |event: &SecurityEvent| {
+                sink.lock().expect("sink").push(event.clone());
+            }))
+            .on_event(Arc::new(|_: &SecurityEvent| {}));
+        let event = SecurityEvent::new(
+            EVENT_IP_BLOCKED,
+            "192.0.2.9",
+            "request_blocked",
+            "r",
+            "middleware",
+        );
+        bus.send_event(&event);
+        let events = seen.lock().expect("sink").clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].metadata[ENRICHMENT_KEY_THREAT_SCORE], 50);
+        assert!(
+            !event.metadata.contains_key(ENRICHMENT_KEY_THREAT_SCORE),
+            "the caller's event stays unenriched"
+        );
+    }
+
+    #[test]
+    fn muted_events_skip_enrichment_and_disabled_buses_skip_dispatch() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let bus = SecurityEventBus::new(true)
+            .with_filter(EventFilter {
+                muted_event_types: HashSet::from([EVENT_IP_BLOCKED.to_owned()]),
+            })
+            .with_enricher(EventEnricher::new(EnrichmentIdentity::new()))
+            .on_event(Arc::new(move |event: &SecurityEvent| {
+                sink.lock().expect("sink").push(event.clone());
+            }));
+        bus.send_middleware_event(EVENT_IP_BLOCKED, "192.0.2.9", "request_blocked", "r");
+        assert!(
+            seen.lock().expect("sink").is_empty(),
+            "muted events never enrich"
+        );
+
+        let sink2 = Arc::clone(&seen);
+        let silent = SecurityEventBus::new(false)
+            .with_enricher(EventEnricher::new(EnrichmentIdentity::new()))
+            .on_event(Arc::new(move |event: &SecurityEvent| {
+                sink2.lock().expect("sink").push(event.clone());
+            }));
+        silent.send_middleware_event(EVENT_IP_BLOCKED, "192.0.2.9", "request_blocked", "r");
+        assert!(
+            seen.lock().expect("sink").is_empty(),
+            "disabled buses never dispatch"
+        );
+    }
+
+    #[test]
+    fn the_enrichment_collaborators_reach_the_bus_dispatch() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let bus = SecurityEventBus::new(true)
+            .with_enricher(
+                EventEnricher::new(EnrichmentIdentity::new())
+                    .with_recent_event_count(Arc::new(|_, _| 3)),
+            )
+            .on_event(Arc::new(move |event: &SecurityEvent| {
+                sink.lock()
+                    .expect("sink")
+                    .push(event.metadata[ENRICHMENT_KEY_RECENT_EVENT_COUNT].clone());
+            }));
+        bus.send_middleware_event(EVENT_IP_BLOCKED, "192.0.2.9", "request_blocked", "r");
+        assert_eq!(
+            seen.lock().expect("sink").as_slice(),
+            [serde_json::json!(3)]
+        );
     }
 }
 
