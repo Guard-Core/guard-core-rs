@@ -556,6 +556,29 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_event_type_skips_the_threat_score() {
+        let enricher = EventEnricher::new(EnrichmentIdentity::new());
+        let mut e = event("", "192.0.2.1");
+        enricher.enrich_event(&mut e);
+        assert_eq!(e.metadata[ENRICHMENT_KEY_SERVICE_NAME], "guard-core");
+        assert!(
+            !e.metadata.contains_key(ENRICHMENT_KEY_THREAT_SCORE),
+            "an empty type carries no score, like the reference's falsy check"
+        );
+    }
+
+    #[test]
+    fn the_enricher_renders_debug() {
+        let enricher = EventEnricher::new(EnrichmentIdentity::new())
+            .with_rule_matcher(Arc::new(|_: &SecurityEvent| None))
+            .with_recent_event_count(Arc::new(|_, _| 0));
+        let rendered = format!("{enricher:?}");
+        assert!(rendered.starts_with("EventEnricher"), "{rendered}");
+        assert!(rendered.contains("guard-core"), "{rendered}");
+        assert!(rendered.contains("true"), "{rendered}");
+    }
+
+    #[test]
     fn metric_enrichment_stamps_the_identity_tags_only() {
         let mut attributes = BTreeMap::new();
         attributes.insert("deployment.environment".to_owned(), "staging".to_owned());

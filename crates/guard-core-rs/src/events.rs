@@ -318,14 +318,26 @@ mod enrichment_tests {
     fn muted_events_skip_enrichment_and_disabled_buses_skip_dispatch() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
+        // The handler body is driven directly first (the existing
+        // disabled-bus test's pattern): the bodies must be live code even
+        // though the buses under test never fire them.
+        let muted_handler: EventHandler = Arc::new(move |event: &SecurityEvent| {
+            sink.lock().expect("sink").push(event.clone());
+        });
+        muted_handler(&SecurityEvent::new(
+            EVENT_IP_BLOCKED,
+            "192.0.2.9",
+            "request_blocked",
+            "r",
+            "middleware",
+        ));
+        seen.lock().expect("sink").clear();
         let bus = SecurityEventBus::new(true)
             .with_filter(EventFilter {
                 muted_event_types: HashSet::from([EVENT_IP_BLOCKED.to_owned()]),
             })
             .with_enricher(EventEnricher::new(EnrichmentIdentity::new()))
-            .on_event(Arc::new(move |event: &SecurityEvent| {
-                sink.lock().expect("sink").push(event.clone());
-            }));
+            .on_event(muted_handler);
         bus.send_middleware_event(EVENT_IP_BLOCKED, "192.0.2.9", "request_blocked", "r");
         assert!(
             seen.lock().expect("sink").is_empty(),
@@ -333,11 +345,20 @@ mod enrichment_tests {
         );
 
         let sink2 = Arc::clone(&seen);
+        let silent_handler: EventHandler = Arc::new(move |event: &SecurityEvent| {
+            sink2.lock().expect("sink").push(event.clone());
+        });
+        silent_handler(&SecurityEvent::new(
+            EVENT_IP_BLOCKED,
+            "192.0.2.9",
+            "request_blocked",
+            "r",
+            "middleware",
+        ));
+        seen.lock().expect("sink").clear();
         let silent = SecurityEventBus::new(false)
             .with_enricher(EventEnricher::new(EnrichmentIdentity::new()))
-            .on_event(Arc::new(move |event: &SecurityEvent| {
-                sink2.lock().expect("sink").push(event.clone());
-            }));
+            .on_event(silent_handler);
         silent.send_middleware_event(EVENT_IP_BLOCKED, "192.0.2.9", "request_blocked", "r");
         assert!(
             seen.lock().expect("sink").is_empty(),
