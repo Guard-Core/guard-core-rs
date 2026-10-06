@@ -46,6 +46,7 @@
 //! ```
 
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::redact::{SensitiveNames, redact_headers, redact_url_for_display};
 
@@ -237,13 +238,174 @@ fn capitalize(text: &str) -> String {
     })
 }
 
+/// The python-logging timestamp shape the reference formatters share
+/// (`Formatter.formatTime` default, `2026-10-06 12:34:56,789`).
+#[must_use]
+pub fn asctime(at: SystemTime) -> String {
+    let (secs, millis) = match at.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (duration.as_secs().cast_signed(), duration.subsec_millis()),
+        Err(error) => (-(error.duration().as_secs().cast_signed()), 0),
+    };
+    chrono::DateTime::from_timestamp(secs, 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+        + format!(",{millis:03}").as_str()
+}
+
+/// The `logging_utils.py` `JsonFormatter` record: exactly four fields in
+/// the reference key order.
+///
+/// `timestamp` (the asctime shape), `level` (uppercase), `logger`
+/// (channel), `message`. Hosts that want the exact reference wire shape
+/// feed this string to their logging stack instead of configuring a JSON
+/// log subscriber (the `setup_custom_logging` parity stays a host concern:
+/// the Rust facade owns no logging registry, the same split the `log`
+/// crate calls keep everywhere else).
+///
+/// # Example
+///
+/// ```
+/// use std::time::{Duration, SystemTime};
+///
+/// use guard_core_rs::logging::{LogLevel, json_record};
+///
+/// let at = SystemTime::UNIX_EPOCH + Duration::from_millis(86_400_000 + 1_234);
+/// let line = json_record(LogLevel::Warning, "blocked request", at);
+/// assert_eq!(
+///     line,
+///     r#"{"timestamp":"1970-01-02 00:00:01,234","level":"WARNING","logger":"guard_core","message":"blocked request"}"#
+/// );
+/// ```
+#[must_use]
+pub fn json_record(level: LogLevel, message: &str, at: SystemTime) -> String {
+    json_record_for(level, message, at, DEFAULT_LOG_CHANNEL)
+}
+
+/// The reference `_create_formatter` text layout:
+/// `[%(name)s] %(asctime)s - %(levelname)s - %(message)s`.
+///
+/// # Example
+///
+/// ```
+/// use std::time::{Duration, SystemTime};
+///
+/// use guard_core_rs::logging::{LogLevel, text_record};
+///
+/// let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_234);
+/// let line = text_record(LogLevel::Info, "hello", at);
+/// assert_eq!(line, "[guard_core] 1970-01-01 00:00:01,234 - INFO - hello");
+/// ```
+#[must_use]
+pub fn text_record(level: LogLevel, message: &str, at: SystemTime) -> String {
+    text_record_for(level, message, at, DEFAULT_LOG_CHANNEL)
+}
+
+/// The default channel (`logging.getLogger("guard_core")`).
+pub const DEFAULT_LOG_CHANNEL: &str = "guard_core";
+
+/// [`json_record`] over an explicit channel.
+#[must_use]
+pub fn json_record_for(level: LogLevel, message: &str, at: SystemTime, channel: &str) -> String {
+    // The reference json.dumps default escapes non-ASCII; serde_json's
+    // to_string does the same for control characters, and the record is
+    // always a string-built object so the encode cannot fail.
+    serde_json::json!({
+        "timestamp": asctime(at),
+        "level": level.as_str(),
+        "logger": channel,
+        "message": message,
+    })
+    .to_string()
+}
+
+/// [`text_record`] over an explicit channel.
+#[must_use]
+pub fn text_record_for(level: LogLevel, message: &str, at: SystemTime, channel: &str) -> String {
+    format!(
+        "[{channel}] {} - {} - {}",
+        asctime(at),
+        level.as_str(),
+        message
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::redact::SensitiveNames;
+    use std::time::Duration;
 
     fn names() -> SensitiveNames {
         SensitiveNames::default()
+    }
+
+    #[test]
+    fn the_json_record_carries_the_reference_fields_in_order() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(86_400_000 + 1_234);
+        let line = json_record(LogLevel::Warning, "blocked request", at);
+        assert_eq!(
+            line,
+            r#"{"timestamp":"1970-01-02 00:00:01,234","level":"WARNING","logger":"guard_core","message":"blocked request"}"#
+        );
+        let decoded: serde_json::Value = serde_json::from_str(&line).expect("json");
+        let keys: Vec<&str> = decoded
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["timestamp", "level", "logger", "message"]);
+    }
+
+    #[test]
+    fn the_json_record_escapes_like_the_reference_dumps() {
+        let at = SystemTime::UNIX_EPOCH;
+        let line = json_record(LogLevel::Info, "line1\nline2 \"quoted\"", at);
+        let decoded: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(decoded["message"], "line1\nline2 \"quoted\"");
+        assert_eq!(decoded["level"], "INFO");
+    }
+
+    #[test]
+    fn the_text_record_mirrors_the_reference_layout() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(1_234);
+        assert_eq!(
+            text_record(LogLevel::Info, "hello", at),
+            "[guard_core] 1970-01-01 00:00:01,234 - INFO - hello"
+        );
+        assert_eq!(
+            text_record(LogLevel::Critical, "boom", at),
+            "[guard_core] 1970-01-01 00:00:01,234 - CRITICAL - boom"
+        );
+    }
+
+    #[test]
+    fn the_explicit_channel_overrides_flow_through_both_record_shapes() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(2_000);
+        assert_eq!(
+            text_record_for(LogLevel::Debug, "dbg", at, "checkout"),
+            "[checkout] 1970-01-01 00:00:02,000 - DEBUG - dbg"
+        );
+        let line = json_record_for(LogLevel::Error, "err", at, "checkout");
+        let decoded: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(decoded["logger"], "checkout");
+        assert_eq!(decoded["timestamp"], "1970-01-01 00:00:02,000");
+    }
+
+    #[test]
+    fn the_asctime_shape_carries_millisecond_precision() {
+        let at = SystemTime::UNIX_EPOCH + Duration::new(1_700_000_000, 999_000_000);
+        assert_eq!(asctime(at), "2023-11-14 22:13:20,999");
+    }
+
+    #[test]
+    fn a_pre_epoch_clock_degrades_to_a_negative_second_without_panicking() {
+        let before = SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::from_secs(1))
+            .expect("pre-epoch instant");
+        let line = asctime(before);
+        assert!(line.ends_with(",000"), "{line}");
     }
 
     #[test]
