@@ -30,7 +30,7 @@
 //! drops, misreading 19-bit and 27-bit pointers). The decoder is verified
 //! against generated fixtures covering both paths.
 //!
-//! The reader implements [`GeoIpHandler`](guard_core_engine::geo::GeoIpHandler)
+//! The reader implements [`GeoIpHandler`]
 //! (resolving the record map's `country` ISO code), so it plugs straight
 //! into a [`GeoStage`](crate::geo::GeoStage):
 //!
@@ -608,10 +608,10 @@ mod tests {
             .lookup(ip("192.0.2.1"))
             .expect("lookup")
             .expect("record");
-        match record.get("note") {
-            Some(MmdbValue::String(value)) => assert_eq!(value.len(), 400),
-            other => panic!("expected the long string, got {other:?}"),
-        }
+        assert!(matches!(
+            record.get("note"),
+            Some(MmdbValue::String(value)) if value.len() == 400
+        ));
     }
 
     #[test]
@@ -640,6 +640,458 @@ mod tests {
         assert_eq!(
             guard_core_engine::geo::GeoIpHandler::get_country(&mmdb, ip("10.0.0.1")),
             None
+        );
+    }
+
+    #[test]
+    fn errors_render_their_message() {
+        assert_eq!(MmdbError("boom".to_owned()).to_string(), "boom");
+    }
+
+    #[test]
+    fn value_accessors_answer_none_on_the_wrong_variant() {
+        assert_eq!(MmdbValue::UInt(1).get("country"), None);
+        assert_eq!(MmdbValue::UInt(1).as_str(), None);
+        assert_eq!(
+            MmdbValue::Map(vec![(
+                "country".to_owned(),
+                MmdbValue::String("US".to_owned())
+            )])
+            .get("country")
+            .and_then(MmdbValue::as_str),
+            Some("US")
+        );
+    }
+
+    #[test]
+    fn open_reads_a_database_file_and_reports_io_failures() {
+        let path =
+            std::env::temp_dir().join(format!("guard-core-mmdb-{}.mmdb", std::process::id()));
+        std::fs::write(&path, country_fixture()).expect("write fixture");
+        let mmdb = Mmdb::open(&path).expect("open");
+        assert_eq!(
+            mmdb.lookup_country(ip("192.0.2.9")).expect("lookup"),
+            Some("US".to_owned())
+        );
+        std::fs::remove_file(&path).ok();
+
+        let missing = Mmdb::open(std::path::PathBuf::from(
+            "/nonexistent/guard-core/missing.mmdb",
+        ));
+        assert!(matches!(
+            missing,
+            Err(MmdbError(text)) if text.starts_with("unable to read MMDB file")
+        ));
+    }
+
+    // ---- hand-built minimal databases ----
+    //
+    // The generated fixtures above never emit pointer records, extended
+    // types beyond maps/strings/uint16, or unusual metadata; these helpers
+    // assemble byte buffers directly (the documented format: search tree,
+    // 16-byte separator, data section, marker, metadata map).
+
+    /// Encode one data-section string (`(2 << 5) | len <bytes>`).
+    fn enc_string(text: &str) -> Vec<u8> {
+        let mut out = vec![(2 << 5) | text.len() as u8];
+        out.extend_from_slice(text.as_bytes());
+        out
+    }
+
+    /// Encode a metadata map from `(key, uint)` pairs.
+    fn metadata_map(fields: &[(&str, u128)]) -> Vec<u8> {
+        let mut out = vec![fields.len() as u8, 0x00]; // map control: size, kind 7 - 7
+        for (key, value) in fields {
+            out.extend(enc_string(key));
+            let be = value.to_be_bytes();
+            let first = be.iter().position(|byte| *byte != 0).unwrap_or(15);
+            let payload = &be[first..];
+            let kind = match payload.len() {
+                0..=2 => 5u8,
+                3..=4 => 6,
+                5..=8 => 9,
+                _ => 10,
+            };
+            let mut field = if kind >= 7 {
+                vec![payload.len() as u8, kind - 7]
+            } else {
+                vec![(kind << 5) | payload.len() as u8]
+            };
+            field.extend_from_slice(payload);
+            out.extend(field);
+        }
+        out
+    }
+
+    /// The standard one-node metadata map.
+    fn standard_metadata() -> Vec<u8> {
+        metadata_map(&[("node_count", 1), ("record_size", 24), ("ip_version", 4)])
+    }
+
+    /// A one-node, 24-bit-record IPv4 database: the root's LEFT edge
+    /// (addresses with bit 0 = 0) resolves to `data_section` offset 0,
+    /// the right edge is the not-found sentinel.
+    fn one_edge_database(data_section: &[u8], metadata: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x00, 0x00, 0x11]); // left -> node_count + 16 + 0
+        out.extend_from_slice(&[0x00, 0x00, 0x01]); // right -> node_count (not found)
+        out.extend_from_slice(&[0u8; 16]); // separator
+        out.extend_from_slice(data_section);
+        out.extend_from_slice(super::METADATA_MARKER);
+        out.extend_from_slice(metadata);
+        out
+    }
+
+    #[test]
+    fn metadata_missing_a_required_field_is_rejected() {
+        let bytes = one_edge_database(&[], &metadata_map(&[("node_count", 1)]));
+        assert_eq!(
+            Mmdb::from_bytes(&bytes).unwrap_err(),
+            MmdbError("malformed MMDB metadata: missing record_size".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unsupported_record_size_is_rejected() {
+        let bytes = one_edge_database(
+            &[],
+            &metadata_map(&[("node_count", 1), ("record_size", 16), ("ip_version", 4)]),
+        );
+        assert_eq!(
+            Mmdb::from_bytes(&bytes).unwrap_err(),
+            MmdbError("unsupported MMDB record size 16".to_owned())
+        );
+    }
+
+    #[test]
+    fn metadata_uints_of_every_width_parse() {
+        let metadata = metadata_map(&[
+            ("node_count", 3_000_000_000),
+            ("record_size", 24),
+            ("ip_version", 4),
+            ("binary_format_major_version", 9_000_000_000),
+            ("binary_format_minor_version", u128::MAX),
+        ]);
+        let bytes = one_edge_database(&[], &metadata);
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        assert_eq!(mmdb.node_count(), 3_000_000_000);
+        assert_eq!(mmdb.ip_version(), 4);
+    }
+
+    #[test]
+    fn record_sizes_past_u32_are_rejected() {
+        let bytes = one_edge_database(
+            &[],
+            &metadata_map(&[("node_count", 1), ("record_size", u128::from(u32::MAX) + 1)]),
+        );
+        assert_eq!(
+            Mmdb::from_bytes(&bytes).unwrap_err(),
+            MmdbError("malformed MMDB metadata: record_size".to_owned())
+        );
+    }
+
+    #[test]
+    fn ip_versions_past_u32_are_rejected() {
+        let bytes = one_edge_database(
+            &[],
+            &metadata_map(&[
+                ("node_count", 1),
+                ("record_size", 24),
+                ("ip_version", u128::from(u32::MAX) + 1),
+            ]),
+        );
+        assert_eq!(
+            Mmdb::from_bytes(&bytes).unwrap_err(),
+            MmdbError("malformed MMDB metadata: ip_version".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_tree_node_past_the_file_is_a_truncated_search_tree() {
+        // node_count = 50 promises a 300-byte tree, but node 0's left edge
+        // (bit 0 = 0) points at internal node 40, whose record bytes fall
+        // past the end of the file.
+        let metadata = metadata_map(&[("node_count", 50), ("record_size", 24), ("ip_version", 4)]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x00, 0x00, 0x28]); // left -> node 40
+        bytes.extend_from_slice(&[0x00, 0x00, 0x32]); // right -> node 50 = not found
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes.extend_from_slice(super::METADATA_MARKER);
+        bytes.extend_from_slice(&metadata);
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        assert_eq!(
+            mmdb.lookup(ip("0.0.0.1")).unwrap_err(),
+            MmdbError("truncated MMDB search tree".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_string_field_is_an_error() {
+        // A two-byte string field carrying invalid UTF-8.
+        let record = [0x01, 0x00, 0x42, 0xFF, 0xFE];
+        let bytes = one_edge_database(&record, &standard_metadata());
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        assert_eq!(
+            mmdb.lookup(ip("0.0.0.1")).unwrap_err(),
+            MmdbError("invalid UTF-8 string".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_pointer_past_the_buffer_is_a_truncated_data_section() {
+        // A raw 32-bit pointer (size_bits 3) targeting data offset 100000,
+        // far past the buffer: the aliased read hits the byte_at bound.
+        let record = [0x38, 0x00, 0x01, 0x86, 0xA0];
+        let bytes = one_edge_database(&record, &standard_metadata());
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        assert_eq!(
+            mmdb.lookup(ip("0.0.0.1")).unwrap_err(),
+            MmdbError("truncated MMDB data section".to_owned())
+        );
+    }
+
+    #[test]
+    fn an_unsupported_ip_version_rejects_lookups() {
+        let bytes = one_edge_database(
+            &[],
+            &metadata_map(&[("node_count", 1), ("record_size", 24), ("ip_version", 5)]),
+        );
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        assert_eq!(
+            mmdb.lookup(ip("1.2.3.4")).unwrap_err(),
+            MmdbError("unsupported MMDB ip_version 5".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_mid_tree_walk_end_answers_not_found() {
+        // A self-referencing left edge keeps the walk on internal node 0
+        // past the 32 address bits: the `node < node_count` not-found arm.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0x00, 0x00, 0x00]); // left -> node 0 itself
+        bytes.extend_from_slice(&[0x00, 0x00, 0x01]); // right -> not found
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes.extend_from_slice(super::METADATA_MARKER);
+        bytes.extend_from_slice(&standard_metadata());
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        assert_eq!(mmdb.lookup(ip("0.0.0.0")).expect("lookup"), None);
+        assert_eq!(mmdb.lookup(ip("255.255.255.255")).expect("lookup"), None);
+    }
+
+    #[test]
+    fn the_decoder_reads_every_data_type() {
+        let mut record: Vec<u8> = vec![0x0B, 0x00]; // map, 11 entries
+        // "country": "XX" (string, kind 2)
+        record.extend(enc_string("country"));
+        record.extend(enc_string("XX"));
+        // "blob": 0x010203 (bytes, kind 4)
+        record.extend(enc_string("blob"));
+        record.extend_from_slice(&[0x83, 0x01, 0x02, 0x03]);
+        // "d": 2.5 (double, kind 3)
+        record.extend(enc_string("d"));
+        record.extend_from_slice(&[0x68]);
+        record.extend_from_slice(&2.5f64.to_be_bytes());
+        // "f": 0.5 (float, kind 15, extended)
+        record.extend(enc_string("f"));
+        record.extend_from_slice(&[0x04, 0x08]);
+        record.extend_from_slice(&0.5f32.to_be_bytes());
+        // "neg": -2 (int32, kind 8, extended)
+        record.extend(enc_string("neg"));
+        record.extend_from_slice(&[0x04, 0x01, 0xFF, 0xFF, 0xFF, 0xFE]);
+        // "list": ["a", "b"] (array, kind 11, extended)
+        record.extend(enc_string("list"));
+        record.extend_from_slice(&[0x02, 0x04]);
+        record.extend(enc_string("a"));
+        record.extend(enc_string("b"));
+        // "yes" / "no": booleans (kind 14, extended)
+        record.extend(enc_string("yes"));
+        record.extend_from_slice(&[0x01, 0x07]);
+        record.extend(enc_string("no"));
+        record.extend_from_slice(&[0x00, 0x07]);
+        // "big": u128::MAX (kind 10, extended)
+        record.extend(enc_string("big"));
+        record.extend_from_slice(&[0x10, 0x03]);
+        record.extend_from_slice(&u128::MAX.to_be_bytes());
+        // "u64": 9_000_000_000 (kind 9, extended)
+        record.extend(enc_string("u64"));
+        record.extend_from_slice(&[0x08, 0x02]);
+        record.extend_from_slice(&9_000_000_000u64.to_be_bytes());
+        // "u32": 3_000_000_000 (kind 6)
+        record.extend(enc_string("u32"));
+        record.extend_from_slice(&[0xC4]);
+        record.extend_from_slice(&3_000_000_000u32.to_be_bytes());
+
+        let bytes = one_edge_database(&record, &standard_metadata());
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        let record = mmdb.lookup(ip("0.0.0.1")).expect("lookup").expect("record");
+        assert_eq!(
+            record.get("country").and_then(MmdbValue::as_str),
+            Some("XX")
+        );
+        assert_eq!(record.get("blob"), Some(&MmdbValue::Bytes(vec![1, 2, 3])));
+        assert_eq!(record.get("d"), Some(&MmdbValue::Double(2.5)));
+        assert_eq!(record.get("f"), Some(&MmdbValue::Float(0.5)));
+        assert_eq!(record.get("neg"), Some(&MmdbValue::Int(-2)));
+        assert_eq!(
+            record.get("list"),
+            Some(&MmdbValue::Array(vec![
+                MmdbValue::String("a".to_owned()),
+                MmdbValue::String("b".to_owned())
+            ]))
+        );
+        assert_eq!(record.get("yes"), Some(&MmdbValue::Bool(true)));
+        assert_eq!(record.get("no"), Some(&MmdbValue::Bool(false)));
+        assert_eq!(record.get("big"), Some(&MmdbValue::UInt(u128::MAX)));
+        assert_eq!(record.get("u64"), Some(&MmdbValue::UInt(9_000_000_000)));
+        assert_eq!(record.get("u32"), Some(&MmdbValue::UInt(3_000_000_000)));
+    }
+
+    #[test]
+    fn an_unknown_extended_type_is_an_error() {
+        // Kind 12 (reserved): the extended marker's next byte holds 12 - 7.
+        let record = [0x00, 0x05];
+        let bytes = one_edge_database(&record, &standard_metadata());
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        assert_eq!(
+            mmdb.lookup(ip("0.0.0.1")).unwrap_err(),
+            MmdbError("unsupported MMDB data type 12".to_owned())
+        );
+    }
+
+    #[test]
+    fn pointers_of_every_width_alias_their_target() {
+        let mut map = vec![0x01, 0x00]; // map, 1 entry
+        map.extend(enc_string("country"));
+        map.extend(enc_string("US"));
+
+        // (size_bits, value offset added by the spec, pointer byte length)
+        for (size_bits, base, pointer_len) in [
+            (0u8, 0usize, 2usize),
+            (1, 2_048, 3),
+            (2, 526_336, 4),
+            (3, 0, 5),
+        ] {
+            // The map lands at data offset `target`; the pointer encodes
+            // `target - base` in `width` bytes.
+            let target = if size_bits == 3 {
+                pointer_len
+            } else {
+                base + 1
+            };
+            let stored = target - base;
+            let width = usize::from(size_bits) + 1;
+            let mut pointer = vec![0x20 | (size_bits << 3) | ((stored >> (8 * width)) as u8 & 0x7)];
+            for index in 0..width {
+                let shift = 8 * (width - 1 - index);
+                pointer.push(((stored >> shift) & 0xff) as u8);
+            }
+            let mut data = pointer;
+            data.resize(target, 0);
+            data.extend_from_slice(&map);
+
+            let bytes = one_edge_database(&data, &standard_metadata());
+            let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+            assert_eq!(
+                mmdb.lookup_country(ip("0.0.0.1")).expect("lookup"),
+                Some("US".to_owned()),
+                "pointer width {size_bits}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_extended_size_escapes_cover_all_three_widths() {
+        // 29 <= len < 285 rides the 1-byte escape (29 + byte); len >= 65821
+        // rides the 3-byte escape (65821 + u24). The 2-byte escape
+        // (285 + u16) is the shipped `large_strings` case.
+        for (label, length) in [("note", 100usize), ("huge", 65_830)] {
+            let leaked: &'static str = Box::leak("x".repeat(length).into_boxed_str());
+            let bytes = build_database(
+                24,
+                4,
+                &[(
+                    "192.0.2.0/24",
+                    vec![("country", Value::Str("US")), (label, Value::Str(leaked))],
+                )],
+            );
+            let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+            let record = mmdb
+                .lookup(ip("192.0.2.1"))
+                .expect("lookup")
+                .expect("record");
+            assert!(matches!(
+                record.get(label),
+                Some(MmdbValue::String(value)) if value.len() == length
+            ));
+        }
+    }
+
+    #[test]
+    fn uint_fields_cover_every_payload_width() {
+        let bytes = build_database(
+            24,
+            4,
+            &[(
+                "192.0.2.0/24",
+                vec![
+                    ("u32", Value::UInt(3_000_000_000)),
+                    ("u64", Value::UInt(9_000_000_000)),
+                    ("u128", Value::UInt(u128::MAX)),
+                ],
+            )],
+        );
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        let record = mmdb
+            .lookup(ip("192.0.2.1"))
+            .expect("lookup")
+            .expect("record");
+        assert_eq!(record.get("u32"), Some(&MmdbValue::UInt(3_000_000_000)));
+        assert_eq!(record.get("u64"), Some(&MmdbValue::UInt(9_000_000_000)));
+        assert_eq!(record.get("u128"), Some(&MmdbValue::UInt(u128::MAX)));
+    }
+
+    #[test]
+    fn a_route_ending_on_a_right_edge_serializes_and_resolves() {
+        // 192.0.2.1/32: the last prefix bit is 1, so the record hangs off
+        // the right edge.
+        let bytes = build_database(
+            24,
+            4,
+            &[("192.0.2.1/32", vec![("country", Value::Str("US"))])],
+        );
+        let mmdb = Mmdb::from_bytes(&bytes).expect("valid fixture");
+        assert_eq!(
+            mmdb.lookup_country(ip("192.0.2.1")).expect("lookup"),
+            Some("US".to_owned())
+        );
+        assert_eq!(mmdb.lookup_country(ip("192.0.2.2")).expect("lookup"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture routes must not overlap")]
+    fn overlapping_routes_on_a_right_edge_are_a_fixture_error() {
+        // The /1 route records on the root's right edge; the /32 route
+        // then walks into it mid-path.
+        let _ = build_database(
+            24,
+            4,
+            &[
+                ("128.0.0.0/1", vec![("country", Value::Str("US"))]),
+                ("128.0.0.1/32", vec![("country", Value::Str("DE"))]),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "fixture routes must not overlap")]
+    fn overlapping_routes_on_a_left_edge_are_a_fixture_error() {
+        let _ = build_database(
+            24,
+            4,
+            &[
+                ("0.0.0.0/1", vec![("country", Value::Str("US"))]),
+                ("0.0.0.0/8", vec![("country", Value::Str("DE"))]),
+            ],
         );
     }
 }

@@ -173,7 +173,10 @@ impl MetricsCollector {
 
     /// The reference `send_metric`: one gated emission.
     pub fn send_metric(&self, metric_type: &str, value: f64, tags: BTreeMap<String, String>) {
-        if self.handler.is_none() || !self.enabled {
+        let Some(handler) = &self.handler else {
+            return;
+        };
+        if !self.enabled {
             return;
         }
         if !self.filter.is_metric_allowed(metric_type) {
@@ -186,11 +189,9 @@ impl MetricsCollector {
             endpoint: None,
             tags,
         };
-        if let Some(handler) = &self.handler {
-            // A panicking transport cannot break the pipeline (the
-            // reference's `except Exception` guard).
-            let _ = catch_unwind(AssertUnwindSafe(|| handler(&metric)));
-        }
+        // A panicking transport cannot break the pipeline (the
+        // reference's `except Exception` guard).
+        let _ = catch_unwind(AssertUnwindSafe(|| handler(&metric)));
     }
 
     /// The reference `collect_request_metrics`: the response-time sample
@@ -247,13 +248,6 @@ mod tests {
         (collector, seen)
     }
 
-    fn tags(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
-        entries
-            .iter()
-            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-            .collect()
-    }
-
     #[test]
     fn the_seven_wire_metric_types_are_locked() {
         assert_eq!(
@@ -285,7 +279,14 @@ mod tests {
     #[test]
     fn a_disabled_collector_never_sends() {
         let (collector, seen) = recording_collector(false);
-        collector.send_metric(METRIC_REQUEST_COUNT, 1.0, tags(&[]));
+        collector.send_metric(METRIC_REQUEST_COUNT, 1.0, BTreeMap::new());
+        assert!(seen.lock().expect("sink").is_empty());
+    }
+
+    #[test]
+    fn a_disabled_collector_never_collects_request_metrics() {
+        let (collector, seen) = recording_collector(false);
+        collector.collect_request_metrics("/api", "GET", Some(0.5), 500);
         assert!(seen.lock().expect("sink").is_empty());
     }
 
@@ -293,7 +294,14 @@ mod tests {
     fn a_handlerless_collector_never_sends() {
         let collector = MetricsCollector::new(true);
         // No panic, no send (there is nowhere to send).
-        collector.send_metric(METRIC_REQUEST_COUNT, 1.0, tags(&[]));
+        collector.send_metric(METRIC_REQUEST_COUNT, 1.0, BTreeMap::new());
+    }
+
+    #[test]
+    fn a_handlerless_collector_never_collects_request_metrics() {
+        let collector = MetricsCollector::new(true);
+        // No panic, no send (there is nowhere to send).
+        collector.collect_request_metrics("/api", "GET", Some(0.5), 500);
     }
 
     #[test]
@@ -301,15 +309,23 @@ mod tests {
         let collector = MetricsCollector::new(true).with_handler(Arc::new(|_: &SecurityMetric| {
             panic!("transport exploded");
         }));
-        collector.send_metric(METRIC_REQUEST_COUNT, 1.0, tags(&[]));
+        collector.send_metric(METRIC_REQUEST_COUNT, 1.0, BTreeMap::new());
+    }
+
+    #[test]
+    fn a_panicking_transport_cannot_break_collect_request_metrics() {
+        let collector = MetricsCollector::new(true).with_handler(Arc::new(|_: &SecurityMetric| {
+            panic!("transport exploded");
+        }));
+        collector.collect_request_metrics("/api", "GET", Some(0.5), 500);
     }
 
     #[test]
     fn muted_metric_types_never_reach_the_handler() {
         let (collector, seen) = recording_collector(true);
         let collector = collector.with_filter(MetricFilter::new([METRIC_REQUEST_COUNT]));
-        collector.send_metric(METRIC_REQUEST_COUNT, 1.0, tags(&[]));
-        collector.send_metric(METRIC_ERROR_RATE, 1.0, tags(&[]));
+        collector.send_metric(METRIC_REQUEST_COUNT, 1.0, BTreeMap::new());
+        collector.send_metric(METRIC_ERROR_RATE, 1.0, BTreeMap::new());
         let seen = seen.lock().expect("sink");
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].metric_type, METRIC_ERROR_RATE);
@@ -323,10 +339,10 @@ mod tests {
         let seen = &collected;
         assert_eq!(seen.len(), 2, "response_time + request_count, no error");
         assert_eq!(seen[0].metric_type, METRIC_RESPONSE_TIME);
-        assert_eq!(seen[0].value, 0.5);
+        assert!((seen[0].value - 0.5).abs() < f64::EPSILON);
         assert_eq!(seen[0].tags.get("status").map(String::as_str), Some("200"));
         assert_eq!(seen[1].metric_type, METRIC_REQUEST_COUNT);
-        assert_eq!(seen[1].value, 1.0);
+        assert!((seen[1].value - 1.0).abs() < f64::EPSILON);
         assert_eq!(
             seen[1].tags.get("endpoint").map(String::as_str),
             Some("/api")

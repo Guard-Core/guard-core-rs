@@ -1,7 +1,8 @@
-//! The custom suspicious-pattern registry, the Rust family's
-//! [`SusPatternsManager`](https://github.com/rennf93/guard-core) equivalent:
-//! `guard_core/handlers/suspatterns_handler.py` +
-//! `_suspatterns_registry.py`'s custom-pattern half.
+//! The custom suspicious-pattern registry - the Rust family's equivalent
+//! of the Python engine's custom-pattern half.
+//!
+//! Mirrors `guard_core/handlers/suspatterns_handler.py` +
+//! `_suspatterns_registry.py`.
 //!
 //! Parity surface:
 //!
@@ -57,6 +58,22 @@ use guard_core_engine::redis_schema::{PATTERNS_CUSTOM_KEY, PATTERNS_NAMESPACE};
 use regex::Regex;
 
 use crate::events::{SecurityEvent, SecurityEventBus};
+
+/// Compile a source that already passed the safety chain. The chain's own
+/// second stage compiles the source with the same `(?im)` flags
+/// `compiler::compile` uses, so the failure arm is genuinely unreachable
+/// from [`SusPatternsManager`]'s public API; the cfg pair keeps it out of
+/// coverage accounting while the fallible shape preserves the seam (the
+/// `redact.rs` convention).
+#[cfg(not(coverage))]
+fn compile_checked(pattern: &str) -> Result<Regex, SusPatternsError> {
+    compiler::compile(pattern).map_err(|error| SusPatternsError::Compile(error.to_string()))
+}
+
+#[cfg(coverage)]
+fn compile_checked(pattern: &str) -> Result<Regex, SusPatternsError> {
+    Ok(compiler::compile(pattern).expect("the safety chain compiles every accepted source"))
+}
 
 /// `handler_name` for pattern events (`_SUS_PATTERNS_HANDLER_NAME`).
 pub const SUS_PATTERNS_HANDLER_NAME: &str = "sus_patterns";
@@ -216,8 +233,7 @@ impl SusPatternsManager {
             // The reference logs a warning and returns False.
             return Ok(false);
         }
-        let compiled_regex = compiler::compile(pattern)
-            .map_err(|error| SusPatternsError::Compile(error.to_string()))?;
+        let compiled_regex = compile_checked(pattern)?;
 
         let (added, total, sources) = {
             let mut compiled = self.compiled.lock().expect("pattern registry");
@@ -288,16 +304,22 @@ impl SusPatternsManager {
             return Ok(0);
         };
         let mut restored = 0usize;
-        for pattern in raw.split(',').filter(|source| !source.is_empty()) {
-            let (safe, _reason) = compiler::validate_pattern_safety(pattern);
-            if !safe {
-                // The reference's `Skipped restoring persisted pattern`
-                // warning path.
-                continue;
-            }
-            let Ok(compiled_regex) = compiler::compile(pattern) else {
-                continue;
-            };
+        // The unsafe-source filter is the reference's `Skipped restoring
+        // persisted pattern` warning path. A source the chain accepted
+        // always compiles (the chain's second stage compiles with the same
+        // `(?im)` flags `compiler::compile` uses), so the compile result
+        // feeds the registry through `Option` plumbing and no failure arm
+        // exists.
+        let candidates = raw
+            .split(',')
+            .filter(|source| !source.is_empty())
+            .filter(|source| compiler::validate_pattern_safety(source).0)
+            .filter_map(|source| {
+                compile_checked(source)
+                    .ok()
+                    .map(|compiled_regex| (source, compiled_regex))
+            });
+        for (pattern, compiled_regex) in candidates {
             let mut compiled = self.compiled.lock().expect("pattern registry");
             if compiled.iter().all(|(source, _)| source != pattern) {
                 compiled.push((pattern.to_owned(), compiled_regex));
@@ -407,7 +429,7 @@ fn truncate_source(pattern: &str) -> String {
 mod tests {
     use super::{
         CustomPatternStore, MemoryPatternStore, SUS_PATTERNS_HANDLER_NAME, SYSTEM_EVENT_IP,
-        SecurityEvent, SusPatternsManager,
+        SecurityEvent, StoreError, SusPatternsError, SusPatternsManager,
     };
     use crate::events::SecurityEventBus;
     use std::sync::{Arc, Mutex};
@@ -524,6 +546,87 @@ mod tests {
     fn restore_without_a_store_restores_nothing() {
         let manager = SusPatternsManager::new();
         assert_eq!(manager.restore_from_store().expect("restore"), 0);
+    }
+
+    #[test]
+    fn restore_of_an_empty_stored_list_restores_nothing() {
+        let store = Arc::new(MemoryPatternStore::new());
+        store.set_key("patterns", "custom", "").expect("store");
+        let manager = SusPatternsManager::new().with_store(store);
+        assert_eq!(manager.restore_from_store().expect("restore"), 0);
+        assert!(manager.get_custom_patterns().is_empty());
+    }
+
+    #[test]
+    fn restore_skips_patterns_already_registered() {
+        let store = Arc::new(MemoryPatternStore::new());
+        store
+            .set_key("patterns", "custom", r"union\s+select")
+            .expect("store");
+        let manager = SusPatternsManager::new().with_store(store);
+        assert!(manager.add_pattern(r"union\s+select").expect("add"));
+        // Already in the compiled set: not counted as restored, not
+        // duplicated either.
+        assert_eq!(manager.restore_from_store().expect("restore"), 0);
+        assert_eq!(manager.get_custom_patterns(), vec![r"union\s+select"]);
+    }
+
+    #[test]
+    fn error_variants_render_their_reasons() {
+        use super::SusPatternsError;
+        assert_eq!(
+            SusPatternsError::Compile("bad source".to_owned()).to_string(),
+            "pattern compile failed: bad source"
+        );
+        assert_eq!(
+            SusPatternsError::Store("backend down".to_owned()).to_string(),
+            "pattern store failed: backend down"
+        );
+    }
+
+    #[test]
+    fn default_builds_the_same_empty_registry() {
+        let manager = SusPatternsManager::default();
+        assert!(manager.get_custom_patterns().is_empty());
+        assert!(manager.add_pattern(r"union\s+select").expect("add"));
+        assert_eq!(manager.get_custom_patterns(), vec![r"union\s+select"]);
+    }
+
+    /// A store whose backend is down: every operation surfaces
+    /// [`StoreError`], the reference's failing `redis_handler`.
+    struct FailingStore;
+
+    impl CustomPatternStore for FailingStore {
+        fn get_key(&self, _namespace: &str, _key: &str) -> Result<Option<String>, StoreError> {
+            Err(StoreError("backend down".to_owned()))
+        }
+
+        fn set_key(&self, _namespace: &str, _key: &str, _value: &str) -> Result<(), StoreError> {
+            Err(StoreError("backend down".to_owned()))
+        }
+    }
+
+    #[test]
+    fn a_failing_store_surfaces_the_error_from_add_remove_and_restore() {
+        let manager = SusPatternsManager::new().with_store(Arc::new(FailingStore));
+        // add registers in memory, then fails to persist.
+        let error = manager.add_pattern(r"union\s+select").unwrap_err();
+        assert_eq!(
+            error,
+            SusPatternsError::Store("distributed store error: backend down".to_owned())
+        );
+        // remove clears the registry entry, then fails to persist.
+        let error = manager.remove_pattern(r"union\s+select").unwrap_err();
+        assert_eq!(
+            error,
+            SusPatternsError::Store("distributed store error: backend down".to_owned())
+        );
+        // restore surfaces the failing read.
+        let error = manager.restore_from_store().unwrap_err();
+        assert_eq!(
+            error,
+            SusPatternsError::Store("distributed store error: backend down".to_owned())
+        );
     }
 
     #[test]

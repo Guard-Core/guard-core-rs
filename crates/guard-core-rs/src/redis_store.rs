@@ -1,6 +1,6 @@
 //! The Redis-backed distributed store: the facade implementation of the
-//! engine's [`SlidingWindowStore`](guard_core_engine::distributed::SlidingWindowStore)
-//! and [`BanStore`](guard_core_engine::distributed::BanStore) seams over
+//! engine's [`SlidingWindowStore`]
+//! and [`BanStore`] seams over
 //! the `redis` crate (feature `redis`), plus the full section 08 namespaced
 //! surface and the legacy ban-key migration.
 //!
