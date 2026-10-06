@@ -16,6 +16,7 @@ rust-version  = { workspace = true }
 chrono            = { version = "0.4", default-features = false, features = ["clock"] }
 guard-core-engine = { workspace = true }
 html-escape       = { workspace = true }
+regex             = { workspace = true }
 http              = "1.3"
 serde_json        = { workspace = true }
 tower             = { version = "0.5", default-features = false }

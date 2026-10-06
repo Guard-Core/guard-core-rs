@@ -937,6 +937,7 @@ dependencies = [
  "html-escape",
  "http 1.5.0",
  "redis",
+ "regex",
  "serde_json",
  "tower",
  "ureq",

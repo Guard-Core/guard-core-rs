@@ -492,8 +492,14 @@ impl RateLimitStage {
     /// `log_activity` "suspicious" lines, redacted through the installed
     /// [`ObservabilityConfig`]). The request pieces arrive through
     /// `observation`; `None` composes from what the decision carries.
+    ///
+    /// The pass composes the two halves
+    /// ([`RateLimitStage::decide_bans_observed`] then
+    /// [`RateLimitStage::decide_tiers_observed`]); a host whose other
+    /// stages sit between the reference's `ip_security` and `rate_limit`
+    /// checks (`cloud_provider`, `user_agent`) calls the halves directly
+    /// to interleave them at the reference positions.
     #[must_use]
-    #[allow(clippy::too_many_lines)]
     pub fn decide_for_path_observed(
         &self,
         ip: Option<IpAddr>,
@@ -504,8 +510,27 @@ impl RateLimitStage {
         observation: Option<&RequestObservation>,
     ) -> Option<StageResponse> {
         let ip = ip?;
-        let passive = self.config.passive_mode;
+        if let Some(banned) = self.decide_bans_observed(Some(ip), observation) {
+            return Some(banned);
+        }
+        self.decide_tiers_observed(Some(ip), path, route, gate, finding, observation)
+    }
 
+    /// The ban half of [`RateLimitStage::decide_for_path_observed`] alone
+    /// (the reference `ip_security._check_banned_ip` arm): the ban
+    /// lookup, the fail-closed 503 on a store error, and the 403 banned
+    /// shape. No rate-limit tiers run and the detection feed does not
+    /// fire, so a host can interleave its own stages between this and
+    /// [`RateLimitStage::decide_tiers_observed`] at the exact reference
+    /// positions. A request without a client IP passes.
+    #[must_use]
+    pub fn decide_bans_observed(
+        &self,
+        ip: Option<IpAddr>,
+        observation: Option<&RequestObservation>,
+    ) -> Option<StageResponse> {
+        let ip = ip?;
+        let passive = self.config.passive_mode;
         // The distributed ban lookup fails secure (the reference
         // `ip_security._check_banned_ip` -> `ip_ban_manager.is_ip_banned`
         // -> `redis_handler.safe_operation` raising
@@ -514,28 +539,46 @@ impl RateLimitStage {
         // exception, not a detection). The 503 mirrors the stage's
         // rate-limit fail-closed answer and never fires `on_block`.
         match self.bans.try_is_banned(ip) {
-            Err(_) => {
-                return Some(StageResponse {
-                    status: StatusCode::SERVICE_UNAVAILABLE,
-                    body: REDIS_UNAVAILABLE_BODY,
-                    retry_after: None,
-                    custom_body: None,
-                });
-            }
+            Err(_) => Some(StageResponse {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                body: REDIS_UNAVAILABLE_BODY,
+                retry_after: None,
+                custom_body: None,
+            }),
             // The banned answer is passive-suppressed like every block.
-            Ok(true) if !passive => {
-                return Some(self.error_response(
-                    StatusCode::FORBIDDEN,
-                    BANNED_BODY,
-                    None,
-                    "ip_security",
-                    &format!("Banned IP attempted access: {ip}"),
-                    ip,
-                    observation,
-                ));
-            }
-            Ok(_) => {}
+            Ok(true) if !passive => Some(self.error_response(
+                StatusCode::FORBIDDEN,
+                BANNED_BODY,
+                None,
+                "ip_security",
+                &format!("Banned IP attempted access: {ip}"),
+                ip,
+                observation,
+            )),
+            Ok(_) => None,
         }
+    }
+
+    /// The rate-limit-tiers + detection-feed half of
+    /// [`RateLimitStage::decide_for_path_observed`], with the ban lookup
+    /// NOT running (the other half lives in
+    /// [`RateLimitStage::decide_bans_observed`]). The reference order
+    /// inside the half is unchanged: the tiers first (skipped for
+    /// `is_whitelisted || is_exempt`), then the detection feed (skipped
+    /// for `is_whitelisted` only).
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
+    pub fn decide_tiers_observed(
+        &self,
+        ip: Option<IpAddr>,
+        path: Option<&str>,
+        route: Option<&RouteRateLimits>,
+        gate: Option<IpGateDecision>,
+        finding: Option<&ThreatFinding>,
+        observation: Option<&RequestObservation>,
+    ) -> Option<StageResponse> {
+        let ip = ip?;
+        let passive = self.config.passive_mode;
 
         let whitelisted = gate.is_some_and(|gate| gate.is_whitelisted);
         let skip_rate_limit = whitelisted || gate.is_some_and(|gate| gate.is_exempt);
@@ -1485,6 +1528,93 @@ mod tests {
         assert_eq!(throttled.status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(stage.limiter().tracked_windows(), 1);
         assert_eq!(stage.counters().tracked_ips(), 0, "no autoban feed");
+    }
+
+    #[test]
+    fn the_ban_and_tiers_halves_compose_into_the_fused_pass() {
+        // The split entry points exist so a host can interleave the
+        // reference's cloud-provider and user-agent checks between
+        // ip_security's ban arm and the rate-limit tiers: the halves must
+        // compose to exactly the fused decide.
+        let stage = RateLimitStage::new(RateLimitStageConfig::default()).expect("default config");
+        let banned_ip = ip("192.0.2.5");
+        stage
+            .bans()
+            .ban_ip(banned_ip, 3600, "test")
+            .expect("ban recorded");
+
+        let fused =
+            stage.decide_for_path_observed(Some(banned_ip), Some("/x"), None, None, None, None);
+        let bans = stage.decide_bans_observed(Some(banned_ip), None);
+        assert_eq!(fused.as_ref().map(|answer| answer.body), Some(BANNED_BODY));
+        assert_eq!(fused, bans, "the bans half alone answers a banned IP");
+        assert_eq!(
+            stage.limiter().tracked_windows(),
+            0,
+            "the bans half never records a window"
+        );
+
+        // The tiers half does not consult the ban store: the same banned
+        // IP passes it (and the tiers half is what records the window).
+        assert!(
+            stage
+                .decide_tiers_observed(Some(banned_ip), Some("/x"), None, None, None, None)
+                .is_none()
+        );
+        assert_eq!(stage.limiter().tracked_windows(), 1);
+    }
+
+    #[test]
+    fn the_tiers_half_runs_the_detection_feed_without_the_ban_lookup() {
+        let stage = RateLimitStage::new(RateLimitStageConfig::default()).expect("default config");
+        let attacker = ip("192.0.2.6");
+        let finding = ThreatFinding {
+            is_threat: true,
+            categories: vec!["sqli".to_owned()],
+            trigger_info: "probe".to_owned(),
+        };
+        let fused = stage.decide_for_path(Some(attacker), Some("/x"), None, None, Some(&finding));
+        let tiers = stage.decide_tiers_observed(
+            Some(attacker),
+            Some("/x"),
+            None,
+            None,
+            Some(&finding),
+            None,
+        );
+        assert_eq!(fused, tiers, "below any ban the halves agree");
+        assert!(tiers.is_some(), "the flagged request earns its answer");
+
+        // A banned IP still passes the tiers half (no lookup there): the
+        // composition is what restores the reference's bans-first order.
+        let banned_ip = ip("192.0.2.7");
+        stage.bans().ban_ip(banned_ip, 3600, "test").expect("ban");
+        assert!(
+            stage
+                .decide_tiers_observed(Some(banned_ip), Some("/x"), None, None, None, None)
+                .is_none()
+        );
+        assert_eq!(
+            stage.decide_for_path(Some(banned_ip), Some("/x"), None, None, None),
+            stage.decide_bans_observed(Some(banned_ip), None),
+        );
+    }
+
+    #[test]
+    fn a_passive_mode_ban_is_suppressed_in_the_bans_half() {
+        let stage = stage_with(
+            RateLimitStageConfig {
+                passive_mode: true,
+                ..RateLimitStageConfig::default()
+            },
+            Arc::new(system_clock),
+        );
+        let banned_ip = ip("192.0.2.8");
+        stage.bans().ban_ip(banned_ip, 3600, "test").expect("ban");
+        // Passive mode observes the ban without rendering the block: the
+        // bans half passes, exactly the fused decide.
+        assert!(stage.decide_bans_observed(Some(banned_ip), None).is_none());
+        assert!(stage.decide(Some(banned_ip), None, None).is_none());
     }
 
     #[test]

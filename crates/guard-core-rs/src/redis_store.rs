@@ -1,6 +1,6 @@
 //! The Redis-backed distributed store: the facade implementation of the
-//! engine's [`SlidingWindowStore`](guard_core_engine::distributed::SlidingWindowStore)
-//! and [`BanStore`](guard_core_engine::distributed::BanStore) seams over
+//! engine's [`SlidingWindowStore`]
+//! and [`BanStore`] seams over
 //! the `redis` crate (feature `redis`), plus the full section 08 namespaced
 //! surface and the legacy ban-key migration.
 //!
@@ -148,12 +148,7 @@ impl RedisStore {
     /// # Errors
     ///
     /// [`StoreError`] on a backend failure.
-    pub fn delete(
-        &self,
-        prefix: &str,
-        namespace: &str,
-        key: &str,
-    ) -> Result<i64, StoreError> {
+    pub fn delete(&self, prefix: &str, namespace: &str, key: &str) -> Result<i64, StoreError> {
         let mut connection = self.connection()?;
         let full = guard_core_engine::redis_schema::full_key(prefix, namespace, key);
         redis::cmd("DEL")
@@ -226,10 +221,12 @@ impl RedisStore {
             .cmd("ZREMRANGEBYSCORE")
             .arg(&full)
             .arg("-inf")
-            .arg(guard_core_engine::redis_schema::exclusive_prune_bound(window_start))
+            .arg(guard_core_engine::redis_schema::exclusive_prune_bound(
+                window_start,
+            ))
             .ignore()
             .zcard(&full)
-            .expire(&full, usize::try_from(ttl_seconds).unwrap_or(usize::MAX))
+            .expire(&full, i64::try_from(ttl_seconds).unwrap_or(i64::MAX))
             .ignore()
             .query(&mut connection)
             .map_err(|error| StoreError(error.to_string()))?;
@@ -390,20 +387,17 @@ mod tests {
     #[test]
     fn store_impls_are_object_safe() {
         // The seams the stage builder takes.
-        let store: Arc<dyn SlidingWindowStore> = Arc::new(
-            RedisStore::connect("redis://127.0.0.1:1").expect("lazy client"),
-        );
-        let _bans: Arc<dyn BanStore> = Arc::new(
-            RedisStore::connect("redis://127.0.0.1:1").expect("lazy client"),
-        );
+        let store: Arc<dyn SlidingWindowStore> =
+            Arc::new(RedisStore::connect("redis://127.0.0.1:1").expect("lazy client"));
+        let _bans: Arc<dyn BanStore> =
+            Arc::new(RedisStore::connect("redis://127.0.0.1:1").expect("lazy client"));
         let _ = store;
     }
 
     #[test]
     fn the_store_implements_the_admin_seam_for_the_migration() {
-        let _admin: Arc<dyn guard_core_engine::redis_schema::RedisAdminStore> = Arc::new(
-            RedisStore::connect("redis://127.0.0.1:1").expect("lazy client"),
-        );
+        let _admin: Arc<dyn guard_core_engine::redis_schema::RedisAdminStore> =
+            Arc::new(RedisStore::connect("redis://127.0.0.1:1").expect("lazy client"));
     }
 
     #[test]
@@ -445,9 +439,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            store
-                .migrate_legacy_ban_keys("guard_core:")
-                .is_err(),
+            store.migrate_legacy_ban_keys("guard_core:").is_err(),
             "the migration surfaces the scan failure, never a panic"
         );
     }

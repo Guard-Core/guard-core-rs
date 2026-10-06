@@ -26,6 +26,7 @@
 //! use guard_core_engine::behavior::{BehaviorRule, BehaviorTracker};
 //! use guard_core_engine::ip_ban::IpBanManager;
 //! use guard_core_engine::security_headers::SecurityHeadersConfig;
+
 //! use guard_core_rs::process_response::{RequestBits, ResponseBits, ResponseProcessor};
 //!
 //! let global_rules = vec![BehaviorRule {
@@ -71,6 +72,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
+use crate::metrics::MetricsCollector;
 use guard_core_engine::behavior::{
     BehaviorAction, BehaviorRule, BehaviorTracker, DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
 };
@@ -117,6 +119,7 @@ pub struct ResponseProcessor {
     scan_response_body: bool,
     max_inspect_bytes: usize,
     passive_mode: bool,
+    metrics: Option<MetricsCollector>,
 }
 
 impl ResponseProcessor {
@@ -149,7 +152,18 @@ impl ResponseProcessor {
             scan_response_body,
             max_inspect_bytes,
             passive_mode,
+            metrics: None,
         }
+    }
+
+    /// Wire the reference `MetricsCollector` (the `agent_enable_metrics`
+    /// emission point: the response factory's
+    /// `collect_request_metrics`, between the behavioral rules and the
+    /// security headers). Without this builder nothing is emitted.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Run the pass: the global `return_pattern` rules first (the route's
@@ -195,6 +209,19 @@ impl ResponseProcessor {
                 }
             }
             drop(tracker);
+        }
+
+        // The reference emits the per-request metrics between the
+        // behavioral rules and the security headers (`factory.py`); the
+        // pass itself never times the request, so the response-time
+        // sample is the caller's to add.
+        if let Some(metrics) = &self.metrics {
+            metrics.collect_request_metrics(
+                &request.url_path,
+                &request.method,
+                None,
+                response.status,
+            );
         }
 
         if let Some(config) = self
@@ -670,6 +697,65 @@ mod unit_twins {
         assert_eq!(
             response.headers.get("X-Frame-Options").map(String::as_str),
             Some("SAMEORIGIN")
+        );
+    }
+
+    #[test]
+    fn a_wired_metrics_collector_emits_per_response_after_the_rules() {
+        use crate::metrics::{METRIC_ERROR_RATE, METRIC_REQUEST_COUNT, MetricsCollector};
+        use std::collections::BTreeMap;
+
+        let seen: Arc<Mutex<Vec<(String, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let collector = MetricsCollector::new(true).with_handler(Arc::new(
+            move |metric: &crate::metrics::SecurityMetric| {
+                sink.lock().expect("sink").push((
+                    metric.metric_type.clone(),
+                    metric
+                        .tags
+                        .get("status")
+                        .and_then(|status| status.parse().ok())
+                        .unwrap_or(0),
+                ));
+            },
+        ));
+        let pass = processor(
+            Vec::new(),
+            Some(SecurityHeadersConfig::reference_default()),
+            None,
+            IpBanManager::new(),
+        )
+        .with_metrics(collector);
+
+        let mut response = ResponseBits {
+            status: 404,
+            body: None,
+            headers: BTreeMap::new(),
+        };
+        pass.process(
+            &request(Some("https://app.example.com")),
+            &mut response,
+            None,
+            SystemTime::now(),
+        );
+
+        let emitted = seen.lock().expect("sink").clone();
+        // The reference emits the request count and, for a `>= 400`
+        // status, the error sample; the response_time sample is the
+        // caller's (the pass does not time the request).
+        // The request-count sample carries no status tag (the reference
+        // tags it endpoint + method only), hence the 0 sentinel.
+        assert_eq!(
+            emitted,
+            vec![
+                (METRIC_REQUEST_COUNT.to_owned(), 0),
+                (METRIC_ERROR_RATE.to_owned(), 404)
+            ]
+        );
+        // The headers still render after the emission point.
+        assert!(
+            response.headers.contains_key("X-Content-Type-Options"),
+            "headers must survive the metrics pass"
         );
     }
 }
