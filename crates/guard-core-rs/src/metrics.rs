@@ -326,7 +326,7 @@ mod tests {
         let collector = collector.with_filter(MetricFilter::new([METRIC_REQUEST_COUNT]));
         collector.send_metric(METRIC_REQUEST_COUNT, 1.0, BTreeMap::new());
         collector.send_metric(METRIC_ERROR_RATE, 1.0, BTreeMap::new());
-        let seen = seen.lock().expect("sink");
+        let seen = seen.lock().expect("sink").clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].metric_type, METRIC_ERROR_RATE);
     }
@@ -355,7 +355,7 @@ mod tests {
     fn an_error_status_adds_the_error_rate_sample() {
         let (collector, seen) = recording_collector(true);
         collector.collect_request_metrics("/api", "GET", Some(0.5), 404);
-        let seen = seen.lock().expect("sink");
+        let seen = seen.lock().expect("sink").clone();
         assert_eq!(seen.len(), 3, "response_time + request_count + error_rate");
         assert_eq!(seen[2].metric_type, METRIC_ERROR_RATE);
         assert_eq!(seen[2].tags.get("status").map(String::as_str), Some("404"));
@@ -365,7 +365,7 @@ mod tests {
     fn an_unmeasured_response_skips_the_response_time_sample() {
         let (collector, seen) = recording_collector(true);
         collector.collect_request_metrics("/api", "GET", None, 200);
-        let seen = seen.lock().expect("sink");
+        let seen = seen.lock().expect("sink").clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].metric_type, METRIC_REQUEST_COUNT);
     }
