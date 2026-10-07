@@ -838,8 +838,16 @@ mod tests {
         assert!(config.enable_redis);
         assert_eq!(config.redis_url.as_deref(), Some("redis://localhost:6379"));
         assert_eq!(config.redis_prefix, "guard_core:");
-        assert_eq!(config.redis_socket_connect_timeout.map(|value| (value - 2.0).abs()), Some(0.0));
-        assert_eq!(config.redis_socket_timeout.map(|value| (value - 2.0).abs()), Some(0.0));
+        assert_eq!(
+            config
+                .redis_socket_connect_timeout
+                .map(|value| (value - 2.0).abs()),
+            Some(0.0)
+        );
+        assert_eq!(
+            config.redis_socket_timeout.map(|value| (value - 2.0).abs()),
+            Some(0.0)
+        );
         assert_eq!(config.redis_health_check_interval, 30);
         assert_eq!(config.redis_max_connections, None);
         assert_eq!(config.redis_retries, 1);
