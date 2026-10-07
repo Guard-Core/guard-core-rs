@@ -33,14 +33,14 @@
 //!
 //! let stage = CustomChecksStage::builder()
 //!     .custom_request("maintenance_gate", Arc::new(|ctx| {
-//!         (ctx.path == "/admin").then(|| CustomResponse { status: Some(503) })
+//!         (ctx.path == "/admin").then(|| CustomResponse { status: Some(503), body: None })
 //!     }))
 //!     .build();
 //!
-//! let answer = stage.decide_custom_request("GET", "/admin", None).expect("blocked");
+//! let answer = stage.decide_custom_request("GET", "/admin", None, None).expect("blocked");
 //! assert_eq!(answer.status, Some(503));
 //! assert_eq!(answer.function, "maintenance_gate");
-//! assert!(stage.decide_custom_request("GET", "/public", None).is_none());
+//! assert!(stage.decide_custom_request("GET", "/public", None, None).is_none());
 //! ```
 
 use std::sync::Arc;
@@ -129,6 +129,7 @@ impl CustomChecksStage {
         method: &str,
         path: &str,
         client_ip: Option<&str>,
+        body: Option<&str>,
     ) -> Option<CustomRequestAnswer> {
         let Some((name, check)) = &self.custom_request else {
             return None;
@@ -137,6 +138,7 @@ impl CustomChecksStage {
             method,
             path,
             client_ip,
+            body,
         };
         match engine_custom_request(check, name, &ctx) {
             CustomRequestVerdict::Allowed => None,
@@ -163,6 +165,7 @@ impl CustomChecksStage {
         path: &str,
         method: &str,
         client_ip: Option<&str>,
+        body: Option<&str>,
     ) -> Option<ValidatorFailure> {
         let Some(resolver) = &self.validators_resolver else {
             return None;
@@ -172,6 +175,7 @@ impl CustomChecksStage {
             method,
             path,
             client_ip,
+            body,
         };
         match decide_custom_validators(&validators, &ctx) {
             CustomValidatorsVerdict::Allowed => None,
@@ -333,7 +337,10 @@ mod tests {
             .custom_request(
                 "maintenance_gate",
                 Arc::new(|ctx| {
-                    (ctx.path == "/admin").then_some(CustomResponse { status: Some(503) })
+                    (ctx.path == "/admin").then_some(CustomResponse {
+                        status: Some(503),
+                        body: None,
+                    })
                 }),
             )
             .validators_resolver(Arc::new(|path| {
@@ -343,7 +350,10 @@ mod tests {
                             String::from("post_only"),
                             Arc::new(|ctx: &CustomRequestContext<'_>| {
                                 (ctx.method != "POST").then_some(ValidatorAnswer::Response(
-                                    CustomResponse { status: Some(403) },
+                                    CustomResponse {
+                                        status: Some(403),
+                                        body: None,
+                                    },
                                 ))
                             }) as CustomValidatorFn,
                         ),
@@ -363,13 +373,13 @@ mod tests {
     fn custom_request_blocks_with_the_function_response() {
         let stage = stage();
         let answer = stage
-            .decide_custom_request("GET", "/admin", Some("192.0.2.9"))
+            .decide_custom_request("GET", "/admin", Some("192.0.2.9"), None)
             .expect("blocked");
         assert_eq!(answer.status, Some(503));
         assert_eq!(answer.function, "maintenance_gate");
         assert!(
             stage
-                .decide_custom_request("GET", "/public", None)
+                .decide_custom_request("GET", "/public", None, None)
                 .is_none()
         );
     }
@@ -377,14 +387,18 @@ mod tests {
     #[test]
     fn no_custom_request_configured_never_blocks() {
         let stage = CustomChecksStage::builder().build();
-        assert!(stage.decide_custom_request("GET", "/admin", None).is_none());
+        assert!(
+            stage
+                .decide_custom_request("GET", "/admin", None, None)
+                .is_none()
+        );
     }
 
     #[test]
     fn validators_run_in_order_and_a_response_blocks() {
         let stage = stage();
         let answer = stage
-            .decide_custom_validators("/private", "GET", None)
+            .decide_custom_validators("/private", "GET", None, None)
             .expect("the GET violates the post_only gate");
         assert_eq!(answer.status, Some(403));
         assert_eq!(answer.validator, "post_only");
@@ -393,7 +407,7 @@ mod tests {
         // non-response logs but can never block.
         assert!(
             stage
-                .decide_custom_validators("/private", "POST", None)
+                .decide_custom_validators("/private", "POST", None, None)
                 .is_none()
         );
     }
@@ -403,7 +417,7 @@ mod tests {
         let stage = stage();
         assert!(
             stage
-                .decide_custom_validators("/public", "GET", None)
+                .decide_custom_validators("/public", "GET", None, None)
                 .is_none()
         );
     }
@@ -413,7 +427,12 @@ mod tests {
         let stage = CustomChecksStage::builder()
             .custom_request(
                 "gate",
-                Arc::new(|_ctx| Some(CustomResponse { status: Some(503) })),
+                Arc::new(|_ctx| {
+                    Some(CustomResponse {
+                        status: Some(503),
+                        body: None,
+                    })
+                }),
             )
             .validators_resolver(Arc::new(|_path| {
                 Some(vec![(
@@ -421,14 +440,23 @@ mod tests {
                     Arc::new(|_ctx: &CustomRequestContext<'_>| {
                         Some(ValidatorAnswer::Response(CustomResponse {
                             status: Some(403),
+                            body: None,
                         }))
                     }) as CustomValidatorFn,
                 )])
             }))
             .passive_mode(true)
             .build();
-        assert!(stage.decide_custom_request("GET", "/admin", None).is_none());
-        assert!(stage.decide_custom_validators("/x", "GET", None).is_none());
+        assert!(
+            stage
+                .decide_custom_request("GET", "/admin", None, None)
+                .is_none()
+        );
+        assert!(
+            stage
+                .decide_custom_validators("/x", "GET", None, None)
+                .is_none()
+        );
         assert!(stage.passive_mode());
     }
 
@@ -447,7 +475,7 @@ mod tests {
         // No validators resolver at all: the route check passes.
         let bare = CustomChecksStage::builder().build();
         assert!(
-            bare.decide_custom_validators("/private", "GET", None)
+            bare.decide_custom_validators("/private", "GET", None, None)
                 .is_none()
         );
 
@@ -458,7 +486,7 @@ mod tests {
             .build();
         assert!(
             empty
-                .decide_custom_validators("/private", "GET", None)
+                .decide_custom_validators("/private", "GET", None, None)
                 .is_none(),
             "no validators: the check allows"
         );
@@ -484,12 +512,17 @@ mod tests {
         let stage = CustomChecksStage::builder()
             .custom_request(
                 "maintenance_gate",
-                Arc::new(|_ctx| Some(CustomResponse { status: Some(503) })),
+                Arc::new(|_ctx| {
+                    Some(CustomResponse {
+                        status: Some(503),
+                        body: None,
+                    })
+                }),
             )
             .events(bus)
             .build();
         stage
-            .decide_custom_request("GET", "/admin", Some("192.0.2.9"))
+            .decide_custom_request("GET", "/admin", Some("192.0.2.9"), None)
             .expect("blocked");
         let events = log.lock().expect("sink").clone();
         assert_eq!(events.len(), 1);
@@ -509,13 +542,22 @@ mod tests {
         let stage = CustomChecksStage::builder()
             .custom_request(
                 "unnamed_shape",
-                Arc::new(|_ctx| Some(CustomResponse { status: None })),
+                Arc::new(|_ctx| {
+                    Some(CustomResponse {
+                        status: None,
+                        body: None,
+                    })
+                }),
             )
             .passive_mode(true)
             .events(bus)
             .build();
         // Passive mode never blocks but still emits.
-        assert!(stage.decide_custom_request("GET", "/x", None).is_none());
+        assert!(
+            stage
+                .decide_custom_request("GET", "/x", None, None)
+                .is_none()
+        );
         let events = log.lock().expect("sink").clone();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action_taken, "logged_only");
@@ -532,6 +574,7 @@ mod tests {
                     Arc::new(|_ctx: &CustomRequestContext<'_>| {
                         Some(ValidatorAnswer::Response(CustomResponse {
                             status: Some(403),
+                            body: None,
                         }))
                     }) as CustomValidatorFn,
                 )])
@@ -539,7 +582,7 @@ mod tests {
             .events(bus)
             .build();
         stage
-            .decide_custom_validators("/private", "GET", Some("192.0.2.9"))
+            .decide_custom_validators("/private", "GET", Some("192.0.2.9"), None)
             .expect("blocked");
         let events = log.lock().expect("sink").clone();
         assert_eq!(events.len(), 1);
@@ -567,7 +610,11 @@ mod tests {
             }))
             .events(bus)
             .build();
-        assert!(stage.decide_custom_validators("/x", "GET", None).is_none());
+        assert!(
+            stage
+                .decide_custom_validators("/x", "GET", None, None)
+                .is_none()
+        );
         let events = log.lock().expect("sink").clone();
         assert_eq!(events.len(), 1, "the reference emits on the truthy answer");
         assert_eq!(events[0].metadata["validator_name"], "flagger");
@@ -583,6 +630,7 @@ mod tests {
                     Arc::new(|_ctx: &CustomRequestContext<'_>| {
                         Some(ValidatorAnswer::Response(CustomResponse {
                             status: Some(403),
+                            body: None,
                         }))
                     }) as CustomValidatorFn,
                 )])
@@ -592,7 +640,11 @@ mod tests {
             .build();
         // Passive mode never blocks but still emits, with the flipped
         // action (the reference emits in both modes).
-        assert!(stage.decide_custom_validators("/x", "GET", None).is_none());
+        assert!(
+            stage
+                .decide_custom_validators("/x", "GET", None, None)
+                .is_none()
+        );
         let events = log.lock().expect("sink").clone();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].action_taken, "logged_only");
