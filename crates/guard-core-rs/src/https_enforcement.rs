@@ -141,6 +141,7 @@ impl HttpsEnforcementStage {
     /// A [`guard_core_engine::ip_gate::IpGateError`] naming an invalid
     /// trusted-proxy entry (config errors fail closed at the builder, so
     /// this only surfaces through [`HttpsEnforcementStageBuilder::build`]).
+    #[must_use]
     pub fn decide(
         &self,
         path: &str,
@@ -149,16 +150,43 @@ impl HttpsEnforcementStage {
         x_forwarded_proto: Option<&str>,
         https_url: &str,
     ) -> Option<HttpsRedirectAnswer> {
+        let route_require_https = self
+            .route_resolver
+            .as_ref()
+            .and_then(|resolve| resolve(path));
+        self.decide_route(
+            path,
+            url_scheme,
+            client_host,
+            x_forwarded_proto,
+            https_url,
+            route_require_https,
+        )
+    }
+
+    /// One pass of the stage with the route's `require_https` handed in
+    /// directly (the carrier lane: the adapter resolved the route's
+    /// `RouteConfig` itself, so no resolver seam needs to be installed on
+    /// the stage). Everything else - the global arm, the trust knobs, the
+    /// passive handling, the violation emission - matches
+    /// [`HttpsEnforcementStage::decide`]; `None` means the resolver seam
+    /// had no answer for the path.
+    #[must_use]
+    pub fn decide_route(
+        &self,
+        path: &str,
+        url_scheme: &str,
+        client_host: Option<&str>,
+        x_forwarded_proto: Option<&str>,
+        https_url: &str,
+        route_require_https: Option<bool>,
+    ) -> Option<HttpsRedirectAnswer> {
         let engine_config = guard_core_engine::https_enforcement::HttpsEnforcementConfig::new(
             self.config.enforce_https,
             self.config.trust_x_forwarded_proto,
             self.trusted_proxies.iter().map(String::as_str),
         )
         .expect("builder validated the proxy list");
-        let route_require_https = self
-            .route_resolver
-            .as_ref()
-            .and_then(|resolve| resolve(path));
         let request = guard_core_engine::https_enforcement::HttpsRequest {
             url_scheme,
             client_host,
@@ -475,6 +503,54 @@ mod tests {
             }))
             .build()
             .expect("valid")
+    }
+
+    #[test]
+    fn decide_route_carries_the_direct_require_https_override() {
+        let stage = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig::default())
+            .build()
+            .expect("default config");
+        // The carrier lane: require_https = true on a plain-http request
+        // redirects exactly like the resolver-seam lane.
+        let answer = stage
+            .decide_route(
+                "/private",
+                "http",
+                None,
+                None,
+                "https://host/private",
+                Some(true),
+            )
+            .expect("route require_https redirects");
+        assert_eq!(answer.status, HTTPS_REDIRECT_STATUS);
+        assert_eq!(answer.location, "https://host/private");
+        // require_https = false (the RouteConfig default, the unset shape)
+        // leaves the global arm alone (default config: not enforced).
+        assert!(
+            stage
+                .decide_route(
+                    "/private",
+                    "http",
+                    None,
+                    None,
+                    "https://host/private",
+                    Some(false)
+                )
+                .is_none()
+        );
+        // An already-https request passes.
+        assert!(
+            stage
+                .decide_route(
+                    "/private",
+                    "https",
+                    None,
+                    None,
+                    "https://host/private",
+                    Some(true)
+                )
+                .is_none()
+        );
     }
 
     #[test]
