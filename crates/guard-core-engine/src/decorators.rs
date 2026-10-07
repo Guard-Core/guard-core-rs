@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::behavior::BehaviorRule;
-use crate::custom_checks::{CustomRequestContext, CustomResponse, CustomValidatorFn, ValidatorAnswer};
+use crate::custom_checks::{CustomRequestContext, CustomValidatorFn, ValidatorAnswer};
 use crate::headers_auth::AuthVerifier;
 use crate::route_config::RouteConfig;
 
@@ -713,6 +713,7 @@ fn honeypot_validator(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_checks::CustomResponse;
     use crate::security_config::SecurityConfig;
 
     /// A fresh decorator over the reference-default config.
