@@ -2,6 +2,25 @@
 
 All notable changes to this project.
 
+## [4.3.1] - 2026-10-07
+
+### Note
+
+- The conformance corpus `engine_version` stamp moves with the engine to 4.3.1 so the gate output is a truthful statement about the shipping engine (the spec 4.1.0 corpus is otherwise unchanged: the 12 detect suites, the five pipeline suites, the `safety_gates` and `cost_bodies` gates)
+
+### Added
+
+- The `MetricsCollector` parity port (#78): the reference `guard_core/core/events/metrics.py` lands in `guard_core_rs::metrics` with the seven agent-wire `METRIC_*` types, the `SecurityMetric` telemetry record, the muted-type `MetricFilter`, the panic-isolated transport (a failing handler can never break the pipeline, mirroring the reference's `except Exception` guard), and the `collect_request_metrics` emission point (response-time sample when measured, request count, one error sample per `>= 400` status, tagged endpoint + method + status); wired into the response pass via `ResponseProcessor::with_metrics`, emitting between the behavioral rules and the security headers exactly where `factory.py` does
+- The `cost_bodies` corpus suite with the self-relative scan-cost ceiling runner (`cost_bodies_stay_under_self_relative_ceilings`) plus the `cost_bench` benchmark example (#77, carried by #78)
+- The dependency-free MMDB reader (`guard_core_rs::mmdb`, #78): the MaxMind DB search-tree + data-section decoder standing in for the reference's `maxminddb` country read, with the two spec-correct divergences from the PHP sibling (extended-type size placement, pointer offsets)
+- The custom sus-pattern manager (`guard_core_rs::sus_patterns`, #78): the reference `add_pattern`/`remove_pattern`/`restore_from_store` registry with safety validation, compile, dedup, persistence and the `pattern_added`/`pattern_removed` events
+- The event enrichment layer (#79, closing the family B2 row): `crates/guard-core-rs/src/enrichment.rs` plus the `ENRICHMENT_KEY_*` constants in `event_types.rs` - `ThreatScorer::score_for` carries the reference `_THREAT_SCORE_MAP` verbatim (90 `penetration_attempt` down to 10 for the lifecycle events, default `DEFAULT_THREAT_SCORE = 20` outside the map), and `EventEnricher` runs the four reference steps in order, stamping `SecurityEvent.metadata` under the exact reference strings (`guard.project_id`, `guard.service.name`, `guard.deployment.environment`, `guard.threat_score`, `guard.rule.id`, `guard.rule.version`, `guard.behavior.correlation_key`, `guard.behavior.recent_event_count`): identity (project id when configured, service name always, `deployment.environment` from the resource attributes, non-`guard` attributes never reach the bag), threat score from the event type (empty type skips), dynamic-rule correlation through the injected `RuleMatcher` closure, and behavior correlation through the injected `RecentEventCount` closure over the reference 300s window plus the `sha256(ip|service|bucket)[:16]` key with `bucket = floor(now/300)` (injectable clock, the IP never reaches the wire); `enrich_metric` stamps identity onto `SecurityMetric.tags` only; failure semantics mirror the reference (one panic guard, steps completed before a panicking collaborator keep their mutations, the event still dispatches); `SecurityEventBus::with_enricher` takes the `CompositeAgentHandler` position of this port (filter first, one enrichment pass, every handler observes the same enriched event, the caller's event untouched), and since every stage emission dispatches through `send_event`, one install enriches the full stage surface
+- The JSON record formatters (#79, the portable half of the family B6 row): `logging::asctime` (the python-logging `formatTime` shape), `json_record`/`json_record_for` (the `JsonFormatter` record, exactly four fields in reference key order, serde_json-encoded), and `text_record`/`text_record_for` (the `[guard_core] <asctime> - <LEVEL> - <message>` layout); `setup_custom_logging` itself stays documented as N.A.-idiom (the facade owns no logging registry; a host feeds the record builders to its subscriber), and the reference `body_reader.py` extras (read timeout, concurrency cap, straddle over-read) are documented as inapplicable-idiom in the adapter model with the per-layer recipe
+
+### Changed
+
+- `redis_store` cleanup (#78): the module moved under the `redis` feature, the `i64` expire bound, formatting
+
 ## [Unreleased]
 
 ## [4.3.0] - 2026-10-01
