@@ -34,6 +34,7 @@ pub mod redos;
 pub mod referrer;
 pub mod request_limits;
 pub mod request_logging;
+pub mod route_config;
 pub mod security_config;
 pub mod security_headers;
 pub mod semantic;

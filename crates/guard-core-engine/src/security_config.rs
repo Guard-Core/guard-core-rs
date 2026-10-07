@@ -838,8 +838,8 @@ mod tests {
         assert!(config.enable_redis);
         assert_eq!(config.redis_url.as_deref(), Some("redis://localhost:6379"));
         assert_eq!(config.redis_prefix, "guard_core:");
-        assert_eq!(config.redis_socket_connect_timeout, Some(2.0));
-        assert_eq!(config.redis_socket_timeout, Some(2.0));
+        assert_eq!(config.redis_socket_connect_timeout.map(|value| (value - 2.0).abs()), Some(0.0));
+        assert_eq!(config.redis_socket_timeout.map(|value| (value - 2.0).abs()), Some(0.0));
         assert_eq!(config.redis_health_check_interval, 30);
         assert_eq!(config.redis_max_connections, None);
         assert_eq!(config.redis_retries, 1);
@@ -856,7 +856,7 @@ mod tests {
         assert!(config.global_behavior_rules.is_empty());
         assert!(!config.behavior_scan_response_body);
         assert_eq!(config.behavior_max_response_body_inspect_bytes, 262_144);
-        assert_eq!(config.body_read_timeout, 3.0);
+        assert_eq!((config.body_read_timeout - 3.0).abs(), 0.0);
         assert_eq!(config.sync_body_read_max_concurrent, 64);
         assert_eq!(config.custom_log_file, None);
         assert_eq!(config.log_suspicious_level, Some(LogLevel::Warning));
@@ -943,7 +943,7 @@ mod tests {
         assert!(!config.emergency_mode);
         assert!(config.emergency_whitelist.is_empty());
         assert!(config.endpoint_rate_limits.is_empty());
-        assert_eq!(config.detection_compiler_timeout, 2.0);
+        assert_eq!((config.detection_compiler_timeout - 2.0).abs(), 0.0);
         assert_eq!(config.detection_pattern_validation_cache_path, None);
         assert_eq!(config.detection_max_content_length, 10_000);
         assert_eq!(config.detection_max_body_inspect_bytes, 262_144);
@@ -952,12 +952,12 @@ mod tests {
         assert_eq!(config.detection_max_json_depth, 32);
         assert_eq!(config.detection_binary_min_run_length, 16);
         assert!(config.detection_preserve_attack_patterns);
-        assert_eq!(config.detection_semantic_threshold, 0.7);
-        assert_eq!(config.detection_anomaly_threshold, 3.0);
-        assert_eq!(config.detection_slow_pattern_threshold, 0.1);
+        assert!((config.detection_semantic_threshold - 0.7).abs() < f64::EPSILON);
+        assert!((config.detection_anomaly_threshold - 3.0).abs() < f64::EPSILON);
+        assert!((config.detection_slow_pattern_threshold - 0.1).abs() < f64::EPSILON);
         assert_eq!(config.detection_monitor_history_size, 1000);
         assert_eq!(config.detection_max_tracked_patterns, 1000);
-        assert_eq!(config.detection_anomaly_emission_cooldown, 60.0);
+        assert!((config.detection_anomaly_emission_cooldown - 60.0).abs() < f64::EPSILON);
         assert_eq!(config.detection_min_samples_for_anomaly, 30);
         assert_eq!(config.detection_threat_score_threshold, 1.0);
         assert!(config.muted_event_types.is_empty());
