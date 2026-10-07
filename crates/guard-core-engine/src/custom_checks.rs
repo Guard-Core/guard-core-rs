@@ -46,9 +46,9 @@
 //! };
 //!
 //! let check: CustomRequestFn = Arc::new(|_ctx: &CustomRequestContext<'_>| {
-//!     Some(CustomResponse { status: Some(418) })
+//!     Some(CustomResponse { status: Some(418), body: None })
 //! });
-//! let ctx = CustomRequestContext { method: "GET", path: "/", client_ip: None };
+//! let ctx = CustomRequestContext { method: "GET", path: "/", client_ip: None, body: None };
 //! let verdict = decide_custom_request(&check, "block_maintenance", &ctx);
 //! assert_eq!(
 //!     verdict,
@@ -74,15 +74,25 @@ pub struct CustomRequestContext<'a> {
     pub path: &'a str,
     /// The client IP, when resolved.
     pub client_ip: Option<&'a str>,
+    /// The buffered request body, when the pipeline has one at the
+    /// validator's position (the reference validators read the
+    /// `GuardRequest` body directly; the adapters pass their buffer and
+    /// the framework lanes without one pass `None`).
+    pub body: Option<&'a str>,
 }
 
-/// A response a custom function hands back. `status` is the response's
-/// status code when it carries one (the reference's
-/// `response_status ... else "unknown"` metadata arm).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A response a custom function hands back.
+///
+/// `status` is the response's status code when it carries one (the
+/// reference's `response_status ... else "unknown"` metadata arm); `body`
+/// is the response body when the function authors one (the reference's
+/// `_SimpleResponse`), the family default rendering otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomResponse {
     /// The response's status code, `None` for a response without one.
     pub status: Option<u16>,
+    /// The response body, `None` for the family default shape.
+    pub body: Option<String>,
 }
 
 /// The host-supplied `custom_request_check` function.
@@ -92,7 +102,7 @@ pub type CustomRequestFn =
 /// What a route validator returned: the reference's truthy response
 /// (blocks with its own shape) versus a truthy non-response value (logs
 /// and emits, never blocks).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatorAnswer {
     /// A truthy non-`GuardResponse` value: observability only.
     TruthyNonResponse,
@@ -195,6 +205,7 @@ mod tests {
             method: "GET",
             path: "/private",
             client_ip: Some("192.0.2.9"),
+            body: None,
         }
     }
 
@@ -207,7 +218,12 @@ mod tests {
             CustomRequestVerdict::Allowed
         );
 
-        let block: CustomRequestFn = Arc::new(|_ctx| Some(CustomResponse { status: Some(403) }));
+        let block: CustomRequestFn = Arc::new(|_ctx| {
+            Some(CustomResponse {
+                status: Some(403),
+                body: None,
+            })
+        });
         assert_eq!(
             decide_custom_request(&block, "my_check", &ctx),
             CustomRequestVerdict::Blocked {
@@ -217,7 +233,12 @@ mod tests {
         );
 
         // A response without a status is the reference's "unknown" arm.
-        let unknown: CustomRequestFn = Arc::new(|_ctx| Some(CustomResponse { status: None }));
+        let unknown: CustomRequestFn = Arc::new(|_ctx| {
+            Some(CustomResponse {
+                status: None,
+                body: None,
+            })
+        });
         assert_eq!(
             decide_custom_request(&unknown, "my_check", &ctx),
             CustomRequestVerdict::Blocked {
@@ -234,6 +255,7 @@ mod tests {
         let blocking: CustomValidatorFn = Arc::new(|_ctx| {
             Some(ValidatorAnswer::Response(CustomResponse {
                 status: Some(403),
+                body: None,
             }))
         });
         let flagging: CustomValidatorFn = Arc::new(|_ctx| Some(ValidatorAnswer::TruthyNonResponse));
@@ -257,7 +279,10 @@ mod tests {
         assert_eq!(
             decide_custom_validators(&first_blocks, &ctx),
             CustomValidatorsVerdict::Failed {
-                block: Some(CustomResponse { status: Some(403) }),
+                block: Some(CustomResponse {
+                    status: Some(403),
+                    body: None
+                }),
                 validator: "second".to_owned()
             }
         );
@@ -298,7 +323,10 @@ mod tests {
         let seen: CustomValidatorFn = Arc::new(|ctx| {
             // The validator can decide on the method/path/client_ip.
             (ctx.path == "/private" && ctx.method == "POST").then_some(ValidatorAnswer::Response(
-                CustomResponse { status: Some(403) },
+                CustomResponse {
+                    status: Some(403),
+                    body: None,
+                },
             ))
         });
         let validators = vec![(String::from("gate"), seen)];
@@ -311,11 +339,15 @@ mod tests {
             method: "POST",
             path: "/private",
             client_ip: None,
+            body: None,
         };
         assert_eq!(
             decide_custom_validators(&validators, &post),
             CustomValidatorsVerdict::Failed {
-                block: Some(CustomResponse { status: Some(403) }),
+                block: Some(CustomResponse {
+                    status: Some(403),
+                    body: None
+                }),
                 validator: "gate".to_owned()
             },
             "a real GuardResponse both blocks and carries the response"

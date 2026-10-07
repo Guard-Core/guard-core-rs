@@ -98,6 +98,7 @@ pub mod tower;
 pub mod user_agent;
 
 pub use guard_core_engine::compiler;
+pub use guard_core_engine::decorators;
 pub use guard_core_engine::detect;
 pub use guard_core_engine::detection_exclusions;
 pub use guard_core_engine::preprocessor;

@@ -13,6 +13,7 @@ pub mod cloud_provider;
 pub mod compiler;
 pub mod cors;
 pub mod custom_checks;
+pub mod decorators;
 pub mod detect;
 pub mod detection_exclusions;
 pub mod distributed;
