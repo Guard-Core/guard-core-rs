@@ -115,8 +115,33 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Enforce 100% line coverage
-        run: cargo llvm-cov --workspace --exclude guard-core-python --fail-under-lines 100
+      # The gate computes line coverage from the lcov export's per-line DA
+      # records, not from llvm-cov's summary table. llvm-cov 22's summary
+      # aggregation falsely reports missed lines while every line-level view
+      # built from the exact same profdata (show text/html, the lcov export,
+      # the cobertura export, the JSON segment list, and a faithful
+      # reimplementation of LLVM's LineCoverageStats over the exported
+      # regions) reports the files fully covered. It reproduces on macOS
+      # arm64/x86_64 and ubuntu-latest, survives a clean coverage target dir
+      # and codegen-units=1, and persists on the newest available toolchain
+      # (cargo-llvm-cov 0.9.1 + rustc 1.99.0's llvm-tools; the 2026-10-07 CI
+      # run on the family's tower branch ran exactly that pair and still
+      # reported the phantom misses). Root-cause evidence with the
+      # side-by-side views:
+      # https://github.com/rennf93/tower-guard-rs/pull/35#issuecomment-6038980718
+      # The gate keeps the same fail-closed 100%-lines semantics as before:
+      # every abnormal export fails the job, nothing is hidden or excluded.
+      - name: Generate the line-coverage export
+        run: cargo llvm-cov --workspace --exclude guard-core-python --lcov --output-path lcov.info
+
+      - name: Enforce 100% line coverage from the export's per-line records
+        run: python3 .github/scripts/enforce_line_coverage.py lcov.info
+
+      # Informational only: the summary table still prints for the familiar
+      # per-file view, but it must never gate - it carries the known
+      # aggregation artifact documented above.
+      - name: Print the informational llvm-cov summary
+        run: cargo llvm-cov report --workspace --exclude guard-core-python
 
   msrv:
     name: MSRV (1.92)
