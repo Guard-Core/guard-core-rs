@@ -58,15 +58,10 @@
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 
 use crate::redact::{SensitiveNames, redact_url_for_display};
 
-/// The check names the reference never fires the hook for
-/// (`ON_BLOCK_EXCLUDED_CHECK_NAMES`): the two application-authored checks
-/// and the HTTPS redirect.
-pub const ON_BLOCK_EXCLUDED_CHECK_NAMES: [&str; 3] =
-    ["custom_request", "custom_validators", "https_enforcement"];
+pub use guard_core_engine::payload::{BlockPayload, ON_BLOCK_EXCLUDED_CHECK_NAMES, OnBlockHook};
 
 /// The reference `SecurityConfig.custom_error_responses` map: status code
 /// to message body override.
@@ -82,33 +77,6 @@ pub fn resolve_error_body(custom: &CustomErrorResponses, status: u16, default: &
         .cloned()
         .unwrap_or_else(|| default.to_owned())
 }
-
-/// The reference block payload, key for key
-/// (`build_block_payload`). `path` arrives pre-redacted;
-/// `status_code` is `None` on the passive-mode path, where no response is
-/// ever sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BlockPayload {
-    /// The emitting check (`rate_limit`, `ip_security`, ...).
-    pub check_name: String,
-    /// Why, the reference reason string.
-    pub reason: String,
-    /// The trigger description when the check carries one.
-    pub trigger_info: String,
-    /// Whether the pipeline runs in passive (log-only) mode.
-    pub passive_mode: bool,
-    /// The resolved client identity.
-    pub client_ip: String,
-    /// The redacted request path.
-    pub path: String,
-    /// The HTTP method.
-    pub method: String,
-    /// The block answer's status, `None` on the passive path.
-    pub status_code: Option<u16>,
-}
-
-/// The `on_block` callback type: sync, best-effort, never fatal.
-pub type OnBlockHook = Arc<dyn Fn(&BlockPayload) + Send + Sync>;
 
 /// Build the reference payload: the path runs through the redaction with
 /// the merged sensitive sets (`redact_url_for_display`), the client IP is
@@ -155,6 +123,7 @@ pub fn fire_block_hook(hook: Option<&OnBlockHook>, payload: &BlockPayload) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     fn names() -> SensitiveNames {

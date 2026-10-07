@@ -23,6 +23,15 @@ All notable changes to this project.
 
 ## [Unreleased]
 
+### Added
+
+- The engine-owned payload data contracts (`guard_core_engine::payload`): `BlockPayload` (the reference `on_block` payload, key for key), the `OnBlockHook` type, `ON_BLOCK_EXCLUDED_CHECK_NAMES`, the `RequestBits`/`ResponseBits` views the response pass reads, and the `OnErrorFn`/`ResponseModifierFn` seams (the reference `on_error` and `custom_response_modifier` hooks, typed against engine-domain data) - the data lives in the engine so the unified `SecurityConfig` (next) types every hook field without reaching into a framework layer
+
+### Changed
+
+- The facade re-exports the payload types under their historical paths (`guard_core_rs::responses::{BlockPayload, OnBlockHook, ON_BLOCK_EXCLUDED_CHECK_NAMES}`, `guard_core_rs::process_response::{RequestBits, ResponseBits}`), so no consumer source moves; `build_block_payload` and `fire_block_hook` stay facade-side next to the redaction they run paths through
+- The CI coverage gate computes line coverage from the lcov export's per-line DA records instead of llvm-cov's summary table: llvm-cov 22's summary aggregation falsely reports missed lines that no line-level view (show text/html, lcov, cobertura, the JSON segment list) can see on the same profdata, and the divergence persists on the newest available toolchain (cargo-llvm-cov 0.9.1 + rustc 1.99.0). The gate keeps the same fail-closed 100%-lines semantics with nothing hidden or excluded; the summary table stays in the job as an informational printout. Evidence linked in the workflow
+
 ## [4.3.0] - 2026-10-01
 
 ### Note

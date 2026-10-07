@@ -77,34 +77,17 @@ use guard_core_engine::behavior::{
     BehaviorAction, BehaviorRule, BehaviorTracker, DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
 };
 use guard_core_engine::cors::{CorsConfig, cors_response_headers, downgrade_wildcard_credentials};
+
 use guard_core_engine::ip_ban::IpBanManager;
+pub use guard_core_engine::payload::{RequestBits, ResponseBits};
 use guard_core_engine::security_headers::{
     SecurityHeadersConfig, security_headers as render_security_headers,
 };
 
 pub use guard_core_engine::behavior::rule_from_config;
 
-/// The request facts the pass needs (the subset of the reference
-/// `GuardRequest` the response factory reads).
-#[derive(Debug, Clone, Default)]
-pub struct RequestBits {
-    pub method: String,
-    pub url_path: String,
-    pub client_ip: String,
-    /// The request's `Origin` header value, `None` when absent.
-    pub origin: Option<String>,
-}
-
 /// The response the pass mutates in place: the status and body pass
 /// through untouched, the headers gain the security-header set and the
-/// CORS verdict.
-#[derive(Debug, Clone, Default)]
-pub struct ResponseBits {
-    pub status: u16,
-    pub body: Option<String>,
-    pub headers: std::collections::BTreeMap<String, String>,
-}
-
 /// The `process_response` pass over one response.
 ///
 /// `tracker` and `bans` are shared state (the reference `BehaviorTracker`

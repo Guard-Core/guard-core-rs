@@ -131,8 +131,19 @@ jobs:
         with:
           rustflags: ""
 
+      # The pipeline-wiring train's tests construct UserAgentFilters whose
+      # patterns go through the ReDoS validator's killable-subprocess check:
+      # the probe child must exist or the validator rejects the pattern
+      # fail-secure ("probe child binary not found"). Build it here and pin
+      # it the same way the consumers' own CI jobs do.
+      - name: Build the pattern-probe child
+        working-directory: ${{ matrix.consumer.path }}
+        run: cargo build -p guard-core-engine --bins
+
       - name: Run the consumer test suite against this guard-core-rs checkout
         working-directory: ${{ matrix.consumer.path }}
+        env:
+          GUARD_PATTERN_PROBE_BIN: target/debug/guard-pattern-probe
         run: |
           cargo test
           cargo clippy --all-targets -- -D warnings
