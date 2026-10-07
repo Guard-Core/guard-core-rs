@@ -8,9 +8,10 @@
 //!   processor reads and the adapter fill in; [`ResponseModifierFn`] is
 //!   the reference `custom_response_modifier` seam over them.
 //!
-//! The types live in the engine so [`crate::security_config`] can type
-//! every hook field without reaching into a framework layer; the facade
-//! re-exports them under their historical paths.
+//! The types live in the engine so the unified `SecurityConfig` surface
+//! (the next slice of the fieldization train) can type every hook field
+//! without reaching into a framework layer; the facade re-exports them
+//! under their historical paths.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
