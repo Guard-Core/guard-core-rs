@@ -140,6 +140,40 @@ impl UserAgentFilter {
         Ok(Self { patterns: compiled })
     }
 
+    /// Compile app-authored blocked patterns without the `ReDoS`
+    /// subprocess validation, keeping the compile semantics
+    /// (case-insensitive + multiline, the reference compiler's flags).
+    ///
+    /// This is the per-request lane for the reference's per-route
+    /// `RouteConfig.blocked_user_agents`: the Python reference runs the
+    /// route list through the same matcher per request (`fnmatch`-based,
+    /// no safety validation on the per-request path), and the adapter
+    /// route resolver hands over app-authored lists whose patterns the
+    /// application itself authored. Config-file surfaces (the global
+    /// `blocked_user_agents`) must keep using [`UserAgentFilter::new`],
+    /// which validates every entry with the engine's `ReDoS` validator.
+    ///
+    /// # Errors
+    ///
+    /// [`UserAgentConfigError`] naming the first entry the regex engine
+    /// cannot compile.
+    pub fn from_trusted_patterns<I, S>(patterns: I) -> Result<Self, UserAgentConfigError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut compiled = Vec::new();
+        for pattern in patterns {
+            let pattern = pattern.as_ref();
+            let regex = compiler::compile(pattern).map_err(|error| UserAgentConfigError {
+                entry: pattern.to_owned(),
+                reason: format!("expected a compilable regular expression ({error})"),
+            })?;
+            compiled.push(regex);
+        }
+        Ok(Self { patterns: compiled })
+    }
+
     /// Whether the `User-Agent` value matches any blocked pattern.
     ///
     /// The subject is the value truncated to its first
@@ -184,6 +218,20 @@ mod tests {
                 "{agent} must pass an empty filter"
             );
         }
+    }
+
+    #[test]
+    fn trusted_patterns_keep_the_compile_semantics_without_the_subprocess() {
+        let filter = UserAgentFilter::from_trusted_patterns(["sqlmap", "havij"])
+            .expect("compilable patterns");
+        assert!(filter.is_blocked("Mozilla/5.0 (SQLMAP/1.8)"));
+        assert!(filter.is_blocked("user agent: HaViJ probe"));
+        assert!(!filter.is_blocked("Mozilla/5.0 (compatible)"));
+
+        // An uncompilable entry still fails closed (compile errors are
+        // independent of the safety subprocess).
+        let error = UserAgentFilter::from_trusted_patterns(["(["]).unwrap_err();
+        assert_eq!(error.entry, "([");
     }
 
     #[test]
