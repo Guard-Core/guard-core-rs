@@ -141,7 +141,9 @@ jobs:
       # per-file view, but it must never gate - it carries the known
       # aggregation artifact documented above.
       - name: Print the informational llvm-cov summary
-        run: cargo llvm-cov report --workspace --exclude guard-core-python
+        # `report` takes no --exclude: it reads the profdata the run above
+        # already produced (guard-core-python was excluded there).
+        run: cargo llvm-cov report
 
   msrv:
     name: MSRV (1.92)
