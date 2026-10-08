@@ -154,7 +154,7 @@ pub fn extract_body_scan_values_with_exclusions(
 ) -> Vec<BodyScanValue> {
     let lowered = content_type.to_ascii_lowercase();
     if lowered.contains("application/x-www-form-urlencoded") {
-        return append_form_body_values(Vec::new(), raw_body, excluded);
+        return append_form_body_values(Vec::new(), raw_body, excluded, config.max_json_depth);
     }
     if lowered.contains("multipart/form-data") {
         return append_multipart_body_values(Vec::new(), raw_body, content_type, config, excluded);
@@ -162,7 +162,13 @@ pub fn extract_body_scan_values_with_exclusions(
     if lowered.contains("json")
         && let Some(root) = parse_ordered_json(raw_body)
     {
-        return append_json_walk_entries(Vec::new(), &root, REQUEST_BODY_CONTEXT, excluded);
+        return append_json_walk_entries(
+            Vec::new(),
+            &root,
+            REQUEST_BODY_CONTEXT,
+            excluded,
+            config.max_json_depth,
+        );
     }
     vec![BodyScanValue::plain(raw_body, REQUEST_BODY_CONTEXT)]
 }
@@ -176,6 +182,7 @@ fn append_form_body_values(
     mut values: Vec<BodyScanValue>,
     raw_body: &str,
     excluded: ExcludedBodyFields<'_>,
+    depth_cap: usize,
 ) -> Vec<BodyScanValue> {
     for pair in parse_form_pairs(raw_body) {
         // An excluded field name skips the whole pair (name and value).
@@ -183,7 +190,8 @@ fn append_form_body_values(
             continue;
         }
         values.push(BodyScanValue::plain(pair.name, REQUEST_BODY_CONTEXT));
-        values = append_field_body_value(values, &pair.value, FORM_FIELD_CONTEXT, excluded);
+        values =
+            append_field_body_value(values, &pair.value, FORM_FIELD_CONTEXT, excluded, depth_cap);
     }
     values
 }
@@ -200,10 +208,11 @@ fn append_field_body_value(
     text: &str,
     ctx: &str,
     excluded: ExcludedBodyFields<'_>,
+    depth_cap: usize,
 ) -> Vec<BodyScanValue> {
     if let Some(root) = parse_ordered_json(text) {
         let walk_context = format!("{ctx}{}", crate::detect::EMBEDDED_JSON_LEAF_CONTEXT_SUFFIX);
-        values = append_json_walk_entries(values, &root, &walk_context, excluded);
+        values = append_json_walk_entries(values, &root, &walk_context, excluded, depth_cap);
     }
     values.push(BodyScanValue::plain(text, ctx));
     values
@@ -293,6 +302,7 @@ fn append_multipart_part_values(
             entry,
             MULTIPART_FIELD_CONTEXT,
             excluded,
+            config.max_json_depth,
         );
     }
 }
@@ -575,6 +585,9 @@ mod tests {
             semantic_threshold: 0.7,
             threat_score_threshold: 1.0,
             binary_min_run_length: 16,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
         }
     }
 
@@ -905,9 +918,54 @@ mod coverage_tests {
             semantic_threshold: 0.7,
             threat_score_threshold: 1.0,
             binary_min_run_length: 8,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
         }
     }
 
+    #[test]
+    fn the_json_depth_knob_caps_the_walk() {
+        // A depth-3 object with a threat in the deepest leaf: at the
+        // reference default the walk reaches the leaf, at a knob-capped
+        // depth of 1 the object serializes to compact JSON and scans as
+        // one text value.
+        let body = r#"{"a":{"b":{"c":"1 UNION SELECT password"}}}"#;
+        let mut config = config();
+        config.max_json_depth = 32;
+        let values = extract_body_scan_values_with_exclusions(
+            body,
+            "application/json",
+            &config,
+            ExcludedBodyFields::default(),
+        );
+        assert!(
+            values
+                .iter()
+                .any(|value| value.content == "1 UNION SELECT password"),
+            "the default cap walks to the leaf"
+        );
+
+        config.max_json_depth = 1;
+        let values = extract_body_scan_values_with_exclusions(
+            body,
+            "application/json",
+            &config,
+            ExcludedBodyFields::default(),
+        );
+        assert!(
+            values
+                .iter()
+                .any(|value| value.content.contains(r#"{"b":{"c""#)),
+            "the knob-capped walk serializes the depth-2 object as text"
+        );
+        assert!(
+            !values
+                .iter()
+                .any(|value| value.content == "1 UNION SELECT password"),
+            "the leaf is never reached at the capped depth"
+        );
+    }
     #[test]
     fn excluded_multipart_parts_and_rfc2231_filenames_scan() {
         let boundary = "XBOUND";

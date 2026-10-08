@@ -336,6 +336,45 @@ pub struct RequestScanVerdict {
     pub reason: String,
 }
 
+/// The per-request scan budgets (`detection_max_scan_values` /
+/// `detection_max_scan_chars`): the value count increments for every
+/// candidate, the character count at the same per-value point; once a cap
+/// is crossed the remaining request values are not scanned (the
+/// reference's fail-open signal, logged once per request there - the
+/// engine keeps its no-logger idiom, the budget answer is the behavior).
+struct ScanBudget {
+    max_values: usize,
+    scanned_values: usize,
+    max_chars: usize,
+    scanned_chars: usize,
+}
+
+impl ScanBudget {
+    const fn new(config: &DetectConfig) -> Self {
+        Self {
+            max_values: config.max_scan_values,
+            scanned_values: 0,
+            max_chars: config.max_scan_chars,
+            scanned_chars: 0,
+        }
+    }
+
+    /// Account one candidate; `true` when it may scan. Both counts run
+    /// regardless of earlier verdicts (the reference increments the value
+    /// count before the char check).
+    fn admit(&mut self, content: &str) -> bool {
+        self.scanned_values += 1;
+        if self.scanned_values > self.max_values {
+            return false;
+        }
+        let value_chars = content.chars().count();
+        if self.scanned_chars >= self.max_chars {
+            return false;
+        }
+        self.scanned_chars += value_chars;
+        true
+    }
+}
 /// The multi-surface scan (`detectThreat`).
 ///
 /// Scan the request surfaces in the reference order - URL path, query
@@ -427,7 +466,16 @@ pub fn scan_request(
         });
     }
 
+    // The per-request scan budgets (`detection_max_scan_values` /
+    // `detection_max_scan_chars`): the value count increments for every
+    // candidate, the character count at the same per-value point; once a
+    // cap is crossed the remaining request values are not scanned (the
+    // reference's fail-open signal, logged once per request there).
+    let mut budget = ScanBudget::new(config);
     for value in &values {
+        if !budget.admit(value.content) {
+            continue;
+        }
         let verdict = detect::detect(value.content, value.context, config);
         if !verdict.is_threat {
             continue;
@@ -522,6 +570,9 @@ mod tests {
             semantic_threshold: 0.7,
             threat_score_threshold: 1.0,
             binary_min_run_length: 16,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
         }
     }
 
@@ -643,6 +694,85 @@ mod tests {
         assert!(!resolve(Some(&global), None).scan_body);
     }
 
+    #[test]
+    fn the_scan_value_budget_caps_the_values_scanned() {
+        let mut config = corpus_config();
+        config.max_scan_values = 2;
+        let exclusions = resolve(None, None);
+        // Five candidate values; the threat sits in the third, past the cap.
+        let surfaces = RequestSurfaces {
+            url_path: Some("/scan"),
+            query_params: &[
+                ("a".to_owned(), "benign-one".to_owned()),
+                ("b".to_owned(), "benign-two".to_owned()),
+                ("c".to_owned(), "1 UNION SELECT password".to_owned()),
+                ("d".to_owned(), "benign-four".to_owned()),
+                ("e".to_owned(), "<script>alert(1)</script>".to_owned()),
+            ],
+            headers: &[],
+            content_type: "",
+            raw_body: "",
+        };
+        let verdict = scan_request(&surfaces, &exclusions, &config);
+        assert!(
+            !verdict.is_threat,
+            "values past the detection_max_scan_values cap are not scanned"
+        );
+
+        // The same request under the default budget detects.
+        let verdict = scan_request(&surfaces, &exclusions, &corpus_config());
+        assert!(verdict.is_threat);
+    }
+
+    #[test]
+    fn the_scan_char_budget_caps_the_characters_scanned() {
+        let mut config = corpus_config();
+        // The two benign values burn the budget; the third is skipped.
+        config.max_scan_chars = "benign-one".chars().count() + "benign-two".chars().count();
+        let exclusions = resolve(None, None);
+        let surfaces = RequestSurfaces {
+            url_path: Some("/scan"),
+            query_params: &[
+                ("a".to_owned(), "benign-one".to_owned()),
+                ("b".to_owned(), "benign-two".to_owned()),
+                ("c".to_owned(), "1 UNION SELECT password".to_owned()),
+            ],
+            headers: &[],
+            content_type: "",
+            raw_body: "",
+        };
+        let verdict = scan_request(&surfaces, &exclusions, &config);
+        assert!(
+            !verdict.is_threat,
+            "values past the detection_max_scan_chars cap are not scanned"
+        );
+    }
+
+    #[test]
+    fn the_budgets_count_every_candidate_even_skipped_ones() {
+        let mut config = corpus_config();
+        // The value budget counts all three candidates even though the
+        // char budget stops the scan after the first.
+        config.max_scan_values = 3;
+        config.max_scan_chars = 0;
+        let exclusions = resolve(None, None);
+        let surfaces = RequestSurfaces {
+            url_path: Some("/scan"),
+            query_params: &[
+                ("a".to_owned(), "1 UNION SELECT password".to_owned()),
+                ("b".to_owned(), "<script>alert(1)</script>".to_owned()),
+                ("c".to_owned(), "benign".to_owned()),
+            ],
+            headers: &[],
+            content_type: "",
+            raw_body: "",
+        };
+        let verdict = scan_request(&surfaces, &exclusions, &config);
+        assert!(
+            !verdict.is_threat,
+            "a zero char budget skips every value (the count still ran)"
+        );
+    }
     #[test]
     fn scan_body_false_still_scans_headers_params_and_path() {
         let route = RouteDetectionExclusions {
@@ -880,6 +1010,9 @@ mod gap_tests {
             semantic_threshold: 0.7,
             threat_score_threshold: 1.0,
             binary_min_run_length: 16,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
         }
     }
 
