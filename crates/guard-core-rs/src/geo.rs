@@ -576,8 +576,14 @@ mod tests {
                 .country_check_log(Some(ip("192.0.2.1")), None, Some(LogLevel::Info))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn the_country_verdict_lines_cover_the_debug_and_not_affected_arms() {
+        use crate::logging::LogLevel;
 
         // Not affected: rides log_country_check_level.
+        let stage = blocklist_stage();
         let (level, line) = stage
             .country_check_log(
                 Some(ip("192.0.2.2")),
