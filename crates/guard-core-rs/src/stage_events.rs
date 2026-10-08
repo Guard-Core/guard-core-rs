@@ -143,6 +143,47 @@ impl CountryRule {
     }
 }
 
+/// The reference `_send_headers_applied_event` as a composer: the event
+/// the caller sends over the bus when the security-header set lands on a
+/// response.
+///
+/// (The reference lives in `handlers/_security_headers_events.py`.) The
+/// path is redacted for display (`redact_url_for_display` over the
+/// default sensitive names), and the metadata carries the reference
+/// shape: `path`, `headers_count`, `has_csp`, `has_hsts`.
+#[must_use]
+pub fn security_headers_applied_event(
+    url_path: &str,
+    header_count: usize,
+    has_csp: bool,
+    has_hsts: bool,
+    client_ip: &str,
+) -> crate::events::SecurityEvent {
+    let mut event = crate::events::SecurityEvent::new(
+        crate::event_types::EVENT_SECURITY_HEADERS_APPLIED,
+        client_ip,
+        "headers_added",
+        "Security headers applied",
+        "security_headers",
+    );
+    let redacted =
+        crate::redact::redact_url_for_display(url_path, &crate::redact::SensitiveNames::default());
+    event
+        .metadata
+        .insert("path".to_owned(), serde_json::Value::String(redacted));
+    event.metadata.insert(
+        "headers_count".to_owned(),
+        serde_json::Value::from(header_count as u64),
+    );
+    event
+        .metadata
+        .insert("has_csp".to_owned(), serde_json::Value::Bool(has_csp));
+    event
+        .metadata
+        .insert("has_hsts".to_owned(), serde_json::Value::Bool(has_hsts));
+    event
+}
+
 /// The geo stage's emissions (`check_country_access` / the config-level
 /// country verdict): the `country_blocked` event with the matching rule
 /// type and the block hook under `ip_security`.
@@ -335,6 +376,24 @@ mod tests {
         )
     }
 
+    #[test]
+    fn the_headers_applied_event_carries_the_reference_metadata() {
+        let event = security_headers_applied_event("/login?token=abc", 6, true, true, "192.0.2.1");
+        assert_eq!(
+            event.event_type,
+            crate::event_types::EVENT_SECURITY_HEADERS_APPLIED
+        );
+        assert_eq!(event.action_taken, "headers_added");
+        assert_eq!(event.handler_name.as_deref(), Some("security_headers"));
+        assert_eq!(
+            event.metadata["path"].as_str(),
+            Some("/login?token=[REDACTED]"),
+            "the query redacts like the reference display path"
+        );
+        assert_eq!(event.metadata["headers_count"].as_u64(), Some(6));
+        assert_eq!(event.metadata["has_csp"].as_bool(), Some(true));
+        assert_eq!(event.metadata["has_hsts"].as_bool(), Some(true));
+    }
     #[test]
     fn the_geo_emission_carries_the_rule_type_and_the_hook() {
         let (sink, recorded) = sink_with_hook();
