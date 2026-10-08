@@ -58,6 +58,16 @@
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+
+/// The reference `on_error` best-effort callback
+/// (`SecurityConfig.on_error`): invoked when a middleware/agent step
+/// fails, receiving `(stage, error, context)`.
+///
+/// `stage` is one of `agent_init`, `geoip`, `transport_send`,
+/// `encryption` (the reference stages); a callback that raises is caught
+/// and logged, never propagated.
+pub type OnErrorHook = Arc<dyn Fn(&str, &str, &[(String, String)]) + Send + Sync>;
 
 use crate::redact::{SensitiveNames, redact_url_for_display};
 

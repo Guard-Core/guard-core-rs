@@ -104,6 +104,8 @@ pub struct ResponseProcessor {
     max_inspect_bytes: usize,
     passive_mode: bool,
     metrics: Option<MetricsCollector>,
+    response_modifier: Option<guard_core_engine::payload::ResponseModifierFn>,
+    on_error: Option<crate::responses::OnErrorHook>,
 }
 
 impl ResponseProcessor {
@@ -137,6 +139,8 @@ impl ResponseProcessor {
             max_inspect_bytes,
             passive_mode,
             metrics: None,
+            response_modifier: None,
+            on_error: None,
         }
     }
 
@@ -148,6 +152,51 @@ impl ResponseProcessor {
     pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Wire the reference `custom_response_modifier`: the callback runs
+    /// LAST in the pass (after the CORS verdict, the reference
+    /// `apply_modifier` position) over every response the pass touches -
+    /// forwarded and blocked alike. A panicking callback leaves the
+    /// response unmodified (the reference's except arm: the modifier
+    /// never fails the request) and reports through the
+    /// [`Self::with_on_error`] hook when one is installed.
+    #[must_use]
+    pub fn with_response_modifier(
+        mut self,
+        modifier: guard_core_engine::payload::ResponseModifierFn,
+    ) -> Self {
+        self.response_modifier = Some(modifier);
+        self
+    }
+
+    /// Wire the reference `on_error` best-effort hook: invoked when a
+    /// middleware step fails, receiving `(stage, error, context)` (the
+    /// reference stages: `agent_init`, `geoip`, `transport_send`,
+    /// `encryption`; the pass reports the modifier's failures under
+    /// `custom_response_modifier`). A raising callback is caught and
+    /// dropped, never propagated.
+    #[must_use]
+    pub fn with_on_error(mut self, hook: crate::responses::OnErrorHook) -> Self {
+        self.on_error = Some(hook);
+        self
+    }
+
+    /// The reference `invoke_error_hook`: fire the installed `on_error`
+    /// best-effort hook; a panicking callback is caught and dropped.
+    pub fn report_error(&self, stage: &str, error: &str, context: &[(&str, &str)]) {
+        let Some(hook) = &self.on_error else {
+            return;
+        };
+        let pairs: Vec<(String, String)> = context
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        let stage = stage.to_owned();
+        let error = error.to_owned();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            hook(&stage, &error, &pairs);
+        }));
     }
 
     /// Run the pass: the global `return_pattern` rules first (the route's
@@ -221,6 +270,25 @@ impl ResponseProcessor {
         if let Some(cors) = self.cors.as_ref() {
             for (name, value) in cors_response_headers(cors, request.origin.as_deref()) {
                 response.headers.insert(name, value);
+            }
+        }
+
+        // The reference `apply_modifier`: the callback runs LAST over the
+        // finished response view. A panicking callback restores the
+        // unmodified response (the reference's except arm) and reports
+        // through the on_error hook.
+        if let Some(modifier) = &self.response_modifier {
+            let unmodified = response.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                modifier(response);
+            }));
+            if outcome.is_err() {
+                *response = unmodified;
+                self.report_error(
+                    "custom_response_modifier",
+                    "the response modifier panicked; returning unmodified response",
+                    &[("path", request.url_path.as_str())],
+                );
             }
         }
 
@@ -338,6 +406,103 @@ pub fn process_response(
 mod tests {
     use super::*;
     use guard_core_engine::security_headers::HstsConfig;
+    #[test]
+    fn the_response_modifier_runs_last_and_restores_on_panic() {
+        let hooked = processor(
+            Vec::new(),
+            Some(SecurityHeadersConfig::default()),
+            None,
+            IpBanManager::new(),
+        )
+        .with_response_modifier(Arc::new(|response: &mut ResponseBits| {
+            response
+                .headers
+                .insert("X-Modified".to_owned(), "yes".to_owned());
+        }));
+        let request = request(None);
+        let mut response = ResponseBits {
+            status: 200,
+            body: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        hooked.process(&request, &mut response, None, std::time::SystemTime::now());
+        assert_eq!(
+            response.headers.get("X-Modified").map(String::as_str),
+            Some("yes"),
+            "the modifier runs after the header passes"
+        );
+
+        // A panicking modifier restores the unmodified response and
+        // reports through the on_error hook.
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hooked = processor(
+            Vec::new(),
+            Some(SecurityHeadersConfig::reference_default()),
+            None,
+            IpBanManager::new(),
+        )
+        .with_response_modifier(Arc::new(|_response: &mut ResponseBits| {
+            panic!("modifier exploded");
+        }))
+        .with_on_error(Arc::new(move |stage, error, _context| {
+            sink.lock()
+                .expect("sink")
+                .push((stage.to_owned(), error.to_owned()));
+        }));
+        let mut response = ResponseBits {
+            status: 200,
+            body: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        hooked.process(&request, &mut response, None, std::time::SystemTime::now());
+        assert!(
+            response.headers.contains_key("X-Content-Type-Options"),
+            "the security headers survive the panicking modifier"
+        );
+        let seen = seen.lock().expect("sink");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "custom_response_modifier");
+    }
+
+    #[test]
+    fn a_panicking_modifier_without_on_error_still_restores() {
+        let hooked = processor(
+            Vec::new(),
+            Some(SecurityHeadersConfig::reference_default()),
+            None,
+            IpBanManager::new(),
+        )
+        .with_response_modifier(Arc::new(|_response: &mut ResponseBits| {
+            panic!("modifier exploded");
+        }));
+        let request = request(None);
+        let mut response = ResponseBits {
+            status: 200,
+            body: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        hooked.process(&request, &mut response, None, std::time::SystemTime::now());
+        assert!(response.headers.contains_key("X-Content-Type-Options"));
+    }
+
+    #[test]
+    fn the_on_error_hook_survives_a_panicking_callback() {
+        let hooked = processor(Vec::new(), None, None, IpBanManager::new()).with_on_error(
+            Arc::new(|_stage, _error, _context| {
+                panic!("the error hook itself exploded");
+            }),
+        );
+        hooked.report_error("geoip", "lookup failed", &[("client_ip", "192.0.2.1")]);
+        let request = request(None);
+        let mut response = ResponseBits {
+            status: 200,
+            body: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        let action = hooked.process(&request, &mut response, None, std::time::SystemTime::now());
+        assert_eq!(action, None, "the pass is unaffected");
+    }
 
     fn processor(
         rules: Vec<BehaviorRule>,
