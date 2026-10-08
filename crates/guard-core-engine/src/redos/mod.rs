@@ -91,6 +91,8 @@ pub mod structure;
 pub mod timeout;
 #[allow(clippy::pedantic, clippy::nursery)]
 pub mod unreachable_terminator;
+#[allow(clippy::pedantic, clippy::nursery)]
+pub mod validation_cache;
 
 pub use safety::{
     SafetyMode, SafetyReason, SafetyVerdict, StructuralRule, default_flags,

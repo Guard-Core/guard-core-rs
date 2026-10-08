@@ -209,7 +209,7 @@ pub fn default_flags() -> super::ast::Flags {
     super::ast::Flags::ignorecase_multiline()
 }
 
-fn compile_failed(pattern: &str, flags: super::ast::Flags) -> Result<(), String> {
+pub(crate) fn compile_failed(pattern: &str, flags: super::ast::Flags) -> Result<(), String> {
     let prefix = if flags.ignorecase || flags.multiline || flags.dotall || flags.ascii {
         let mut prefix = String::from("(?");
         if flags.ignorecase {
