@@ -25,8 +25,17 @@
 //!   included - the same inherited limitation, kept for byte-for-byte key
 //!   compatibility.
 //! - **detection**: [`SusPatternsManager::matches`] runs the compiled set
-//!   over a payload, the custom-pattern arm of the reference `detect`;
-//!   wiring it into the scan pipeline is the caller's composition.
+//!   over a payload (the custom-pattern arm of the reference `detect`), and
+//!   [`SusPatternsManager::detect_pattern_match`] is the reference
+//!   `detect_pattern_match` entry: one engine `detect` call plus the custom
+//!   registry, answering the `(is_threat, matched_pattern)` tuple with the
+//!   redacted match identity (the regex source, `semantic:{attack_type}`,
+//!   a custom source, or the `"unknown"` fallback).
+//! - **the Redis-backed store**: [`RedisPatternStore`] (the `redis`
+//!   feature) is the reference registry's `redis_handler` - a
+//!   [`RedisStore`](crate::redis_store::RedisStore) client plus the key
+//!   prefix behind the [`CustomPatternStore`] seam, so the registry
+//!   persists through the live `{prefix}patterns:custom` key.
 //!
 //! # Example
 //!
@@ -53,11 +62,13 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use guard_core_engine::compiler;
+use guard_core_engine::detect::{self, DetectConfig, Threat};
 use guard_core_engine::distributed::StoreError;
 use guard_core_engine::redis_schema::{PATTERNS_CUSTOM_KEY, PATTERNS_NAMESPACE};
 use regex::Regex;
 
 use crate::events::{SecurityEvent, SecurityEventBus};
+use crate::redact::{SensitiveNames, redact_blob_for_display};
 
 /// Compile a source that already passed the safety chain. The chain's own
 /// second stage compiles the source with the same `(?im)` flags
@@ -151,6 +162,44 @@ impl CustomPatternStore for MemoryPatternStore {
             .expect("pattern store")
             .insert(full, value.to_owned());
         Ok(())
+    }
+}
+
+/// The Redis-backed [`CustomPatternStore`] (the reference registry's
+/// `redis_handler`).
+///
+/// A [`RedisStore`](crate::redis_store::RedisStore) client plus the key
+/// prefix, so the registry persists through the live
+/// `{prefix}patterns:custom` key exactly like the Python handler's
+/// `set_key("patterns", "custom", ...)` pair.
+#[cfg(feature = "redis")]
+pub struct RedisPatternStore {
+    store: crate::redis_store::RedisStore,
+    prefix: String,
+}
+
+#[cfg(feature = "redis")]
+impl RedisPatternStore {
+    /// Bind a connected-capable client to the registry's key prefix (the
+    /// reference `redis_prefix`).
+    #[must_use]
+    pub fn new(store: crate::redis_store::RedisStore, prefix: impl Into<String>) -> Self {
+        Self {
+            store,
+            prefix: prefix.into(),
+        }
+    }
+}
+
+#[cfg(feature = "redis")]
+impl CustomPatternStore for RedisPatternStore {
+    fn get_key(&self, namespace: &str, key: &str) -> Result<Option<String>, StoreError> {
+        self.store.get_key(&self.prefix, namespace, key)
+    }
+
+    fn set_key(&self, namespace: &str, key: &str, value: &str) -> Result<(), StoreError> {
+        self.store
+            .set_key(&self.prefix, namespace, key, value, None)
     }
 }
 
@@ -360,6 +409,44 @@ impl SusPatternsManager {
             .collect()
     }
 
+    /// The reference `detect_pattern_match(content, ip_address, context)`:
+    /// one engine `detect` call over the content (the built-in regex and
+    /// semantic pool) plus the custom registry, answering the reference's
+    /// `(is_threat, matched_pattern)` tuple with the redacted match
+    /// identity:
+    ///
+    /// - a regex threat carries the display-redacted pattern source (the
+    ///   reference `_redact_pattern_source(threat["pattern"])`),
+    /// - a semantic threat carries `semantic:{attack_type}`,
+    /// - a custom-registry hit (the pool the reference compiles into the
+    ///   same regex set) carries the redacted custom source,
+    /// - a threat with no resolvable identity carries the reference
+    ///   `"unknown"` fallback,
+    /// - a clean scan answers `(false, None)`.
+    #[must_use]
+    pub fn detect_pattern_match(
+        &self,
+        content: &str,
+        request_context: &str,
+        detect_config: &DetectConfig,
+        sensitive: &SensitiveNames,
+    ) -> (bool, Option<String>) {
+        let verdict = detect::detect(content, request_context, detect_config);
+        let built_in = verdict
+            .threats
+            .first()
+            .map(|threat| threat_identity(threat, sensitive));
+        let custom = self
+            .matches(content)
+            .first()
+            .map(|pattern| redact_blob_for_display(pattern, sensitive));
+        match (built_in.or(custom), verdict.is_threat) {
+            (Some(identity), _) => (true, Some(identity)),
+            (None, true) => (true, Some(String::from("unknown"))),
+            (None, false) => (false, None),
+        }
+    }
+
     /// Persist the current source set as the comma-joined list (the
     /// reference `set_key("patterns", "custom", ",".join(...))`).
     fn persist(&self, sources: &[String]) -> Result<(), SusPatternsError> {
@@ -412,6 +499,17 @@ impl SusPatternsManager {
 /// store key from it).
 pub const PATTERNS_CUSTOM_KEY_NAME: &str = PATTERNS_CUSTOM_KEY;
 
+/// The redacted match identity one threat carries (the reference
+/// `detect_pattern_match`'s identity resolution): a regex threat's
+/// display-redacted pattern source, a semantic threat's
+/// `semantic:{attack_type}`.
+fn threat_identity(threat: &Threat, sensitive: &SensitiveNames) -> String {
+    match threat {
+        Threat::Regex(regex) => redact_blob_for_display(&regex.pattern, sensitive),
+        Threat::Semantic(semantic) => format!("semantic:{}", semantic.attack_type),
+    }
+}
+
 /// The reference `_redact_pattern_source`'s truncation shape for the
 /// event-carried source.
 fn truncate_source(pattern: &str) -> String {
@@ -429,10 +527,14 @@ fn truncate_source(pattern: &str) -> String {
 mod tests {
     use super::{
         CustomPatternStore, MemoryPatternStore, SUS_PATTERNS_HANDLER_NAME, SYSTEM_EVENT_IP,
-        SecurityEvent, StoreError, SusPatternsError, SusPatternsManager,
+        SecurityEvent, StoreError, SusPatternsError, SusPatternsManager, Threat,
     };
     use crate::events::SecurityEventBus;
+    use guard_core_engine::detect::{self, DetectConfig};
     use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "redis")]
+    use super::RedisPatternStore;
 
     fn seen_bus() -> (Arc<Mutex<Vec<SecurityEvent>>>, SecurityEventBus) {
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -688,5 +790,176 @@ mod tests {
             .expect("pattern");
         assert_eq!(carried.chars().count(), 64 + 3, "64 chars + `...`");
         assert!(carried.ends_with("..."));
+    }
+
+    /// The regex source a threat carries, if it is a regex threat (the
+    /// test view of the identity's regex arm; the semantic arm answers
+    /// `None` and is exercised by the constructed threat below).
+    fn regex_source(threat: &Threat) -> Option<&str> {
+        match threat {
+            Threat::Regex(regex) => Some(&regex.pattern),
+            Threat::Semantic(_) => None,
+        }
+    }
+
+    fn corpus_config() -> DetectConfig {
+        DetectConfig {
+            max_content_length: 10_000,
+            max_full_scan_bytes: 262_144,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            binary_min_run_length: 16,
+        }
+    }
+
+    #[test]
+    fn detect_pattern_match_answers_the_redacted_regex_identity() {
+        let manager = SusPatternsManager::new();
+        let sensitive = crate::redact::SensitiveNames::default();
+        let (threat, identity) = manager.detect_pattern_match(
+            "SELECT * FROM users",
+            "request_body",
+            &corpus_config(),
+            &sensitive,
+        );
+        assert!(threat);
+        // The identity is the matched table pattern, display-redacted.
+        let verdict = detect::detect("SELECT * FROM users", "request_body", &corpus_config());
+        assert_eq!(
+            identity.as_deref(),
+            regex_source(verdict.threats.first().expect("regex threat"))
+        );
+    }
+
+    #[test]
+    fn the_semantic_threat_identity_names_the_attack_type() {
+        let sensitive = crate::redact::SensitiveNames::default();
+        // A semantic threat (the shape the engine's detect emits when the
+        // analyzer flags without a regex pool hit) resolves to
+        // `semantic:{attack_type}`.
+        let analysis = guard_core_engine::semantic::analyze(
+            "select union insert update delete drop",
+            &guard_core_engine::semantic::AttackKeywords::default(),
+            &guard_core_engine::semantic::AttackStructures::default(),
+        );
+        let semantic = guard_core_engine::detect::SemanticThreat {
+            attack_type: String::from("sqli"),
+            score: 0.8,
+            fallback: true,
+            analysis,
+        };
+        assert_eq!(
+            super::threat_identity(&Threat::Semantic(semantic.clone()), &sensitive),
+            "semantic:sqli"
+        );
+        assert_eq!(regex_source(&Threat::Semantic(semantic)), None);
+    }
+
+    #[test]
+    fn detect_pattern_match_answers_the_semantic_identity_through_detect() {
+        let manager = SusPatternsManager::new();
+        let sensitive = crate::redact::SensitiveNames::default();
+        // A mixed verdict (regex first, semantic second): the identity is
+        // the first threat's - the regex pool's redacted source, exactly
+        // the reference's threats[0] resolution.
+        let content = format!(
+            "select union insert update delete drop from where order group having concat substring database table column (1 OR 1=1) {}",
+            "A".repeat(120)
+        );
+        let verdict = detect::detect(&content, "request_body", &corpus_config());
+        assert!(matches!(verdict.threats.first(), Some(Threat::Regex(_))));
+        assert!(
+            verdict
+                .threats
+                .iter()
+                .any(|t| matches!(t, Threat::Semantic(_))),
+            "the mixed payload carries a semantic threat"
+        );
+        let (threat, identity) =
+            manager.detect_pattern_match(&content, "request_body", &corpus_config(), &sensitive);
+        assert!(threat);
+        assert_eq!(
+            identity.as_deref(),
+            regex_source(verdict.threats.first().expect("regex first"))
+        );
+    }
+
+    #[test]
+    fn detect_pattern_match_answers_a_custom_registry_hit() {
+        let manager = SusPatternsManager::new();
+        let sensitive = crate::redact::SensitiveNames::default();
+        assert!(manager.add_pattern(r"zz-guard-custom-[0-9]+").expect("add"));
+        // The content trips no built-in pattern; the custom pool flags it.
+        let verdict = detect::detect("zz-guard-custom-42", "request_body", &corpus_config());
+        assert!(!verdict.is_threat, "no built-in covers the marker");
+        let (threat, identity) = manager.detect_pattern_match(
+            "zz-guard-custom-42",
+            "request_body",
+            &corpus_config(),
+            &sensitive,
+        );
+        assert!(threat);
+        assert_eq!(identity.as_deref(), Some(r"zz-guard-custom-[0-9]+"));
+    }
+
+    #[test]
+    fn detect_pattern_match_answers_the_unknown_fallback_for_identityless_threats() {
+        let manager = SusPatternsManager::new();
+        let sensitive = crate::redact::SensitiveNames::default();
+        // A zero threshold marks every scan a threat: no threats, no custom
+        // hits - the reference `unknown` fallback is the only identity.
+        let config = DetectConfig {
+            threat_score_threshold: 0.0,
+            ..corpus_config()
+        };
+        let (threat, identity) =
+            manager.detect_pattern_match("hello world", "request_body", &config, &sensitive);
+        assert!(threat);
+        assert_eq!(identity.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn detect_pattern_match_answers_clean_for_benign_content() {
+        let manager = SusPatternsManager::new();
+        let sensitive = crate::redact::SensitiveNames::default();
+        let (threat, identity) = manager.detect_pattern_match(
+            "hello world",
+            "request_body",
+            &corpus_config(),
+            &sensitive,
+        );
+        assert!(!threat);
+        assert_eq!(identity, None);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn the_redis_store_satisfies_the_persistence_seam() {
+        let store = crate::redis_store::RedisStore::connect("redis://127.0.0.1:1")
+            .expect("client construction is lazy");
+        let _registry_store: Arc<dyn CustomPatternStore> =
+            Arc::new(RedisPatternStore::new(store.clone(), "guard"));
+        // The prefix rides the impl: the same client can back two prefixes.
+        let _other: RedisPatternStore = RedisPatternStore::new(store, "other-app");
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_dead_redis_backend_surfaces_the_store_error_from_the_registry() {
+        // Port 1 on localhost is never the test Redis; the first command
+        // fails with the store error the registry surfaces, exactly like
+        // the reference's failing redis_handler.
+        let store =
+            crate::redis_store::RedisStore::connect("redis://127.0.0.1:1").expect("lazy client");
+        let manager =
+            SusPatternsManager::new().with_store(Arc::new(RedisPatternStore::new(store, "guard")));
+        let error = manager.add_pattern(r"union\s+select").unwrap_err();
+        assert!(
+            matches!(error, SusPatternsError::Store(_)),
+            "the persist failure surfaces: {error:?}"
+        );
+        let error = manager.restore_from_store().unwrap_err();
+        assert!(matches!(error, SusPatternsError::Store(_)), "{error:?}");
     }
 }
