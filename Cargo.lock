@@ -394,6 +394,7 @@ checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
  "num-traits",
+ "serde",
  "windows-link",
 ]
 
@@ -915,6 +916,7 @@ dependencies = [
  "percent-encoding",
  "rand 0.10.3",
  "regex",
+ "serde",
  "serde_json",
  "sha2",
  "unicode-normalization",

@@ -17,6 +17,7 @@ pub mod decorators;
 pub mod detect;
 pub mod detection_exclusions;
 pub mod distributed;
+pub mod dynamic_rules;
 pub mod emergency_mode;
 pub mod geo;
 pub mod headers_auth;
