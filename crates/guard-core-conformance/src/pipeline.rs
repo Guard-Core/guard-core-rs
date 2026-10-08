@@ -235,6 +235,12 @@ fn config_bool(config: &Value, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn config_int(config: &Value, key: &str, default: u64) -> u64 {
+    config_value(config, key)
+        .and_then(Value::as_u64)
+        .unwrap_or(default)
+}
+
 /// Case-insensitive header lookup (the adapters' header maps).
 fn header_value(headers: &BTreeMap<String, String>, name: &str) -> Option<String> {
     headers
@@ -481,6 +487,7 @@ impl CaseEngine {
                     }
                 },
                 allow_credentials: config_bool(config, "cors_allow_credentials", false),
+                max_age: config_int(config, "cors_max_age", 600),
             };
             if cors.allow_origins.is_empty() {
                 cors.allow_origins = CorsConfig::default().allow_origins;

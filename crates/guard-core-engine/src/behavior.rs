@@ -97,6 +97,15 @@ pub enum BehaviorAction {
     LoggedOnly,
 }
 
+impl BehaviorAction {
+    /// Whether the action is the active-mode `ban` (the usage-rule
+    /// consumer's dispatch check).
+    #[must_use]
+    pub const fn is_ban(&self) -> bool {
+        matches!(self, Self::Ban { .. })
+    }
+}
+
 /// The reference `BehaviorTracker`'s in-memory return-pattern windows.
 ///
 /// The redis-free fallback: `pattern_key -> client_ip -> timestamps`,
@@ -380,6 +389,18 @@ mod tests {
     }
 
     #[test]
+    fn the_action_dispatch_predicate_names_the_ban() {
+        assert!(BehaviorAction::Ban { duration: 3600 }.is_ban());
+        assert!(
+            !BehaviorAction::Note {
+                action: String::from("log")
+            }
+            .is_ban()
+        );
+        assert!(!BehaviorAction::LoggedOnly.is_ban());
+    }
+
+    #[test]
     fn usage_windows_count_per_identity_and_trip_at_the_threshold() {
         let base = BehaviorRule {
             rule_type: "usage".to_owned(),
@@ -402,7 +423,10 @@ mod tests {
         assert!(!tracker.track_endpoint_usage("POST:/api", "192.0.2.10", &base, 1_004.0));
 
         // The full history answers inside a wide window.
-        assert_eq!(tracker.get_recent_event_count("192.0.2.10", 3_600, 1_050.0), 4);
+        assert_eq!(
+            tracker.get_recent_event_count("192.0.2.10", 3_600, 1_050.0),
+            4
+        );
         // Sliding: a 60s window read at 1062 drops the 1000/1001 stamps.
         assert_eq!(tracker.get_recent_event_count("192.0.2.10", 60, 1_062.0), 2);
         // The reference's empty-identity guard.
