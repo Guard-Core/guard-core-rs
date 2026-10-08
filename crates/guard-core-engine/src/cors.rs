@@ -52,6 +52,9 @@ pub struct CorsConfig {
     pub allow_methods: Vec<String>,
     pub allow_headers: Vec<String>,
     pub allow_credentials: bool,
+    /// The reference `cors_max_age` (600 by default): the preflight
+    /// cache lifetime the `Access-Control-Max-Age` header carries.
+    pub max_age: u64,
 }
 
 impl Default for CorsConfig {
@@ -65,6 +68,7 @@ impl Default for CorsConfig {
                 .collect(),
             allow_headers: vec!["*".to_owned()],
             allow_credentials: false,
+            max_age: 600,
         }
     }
 }
@@ -145,6 +149,158 @@ pub fn cors_response_headers(cors: &CorsConfig, origin: Option<&str>) -> BTreeMa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_allowed_preflight_answers_the_full_header_set() {
+        let cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["https://app.example.com".to_owned()],
+            allow_methods: vec!["GET".to_owned(), "POST".to_owned()],
+            allow_headers: vec!["content-type".to_owned(), "x-custom".to_owned()],
+            allow_credentials: true,
+            max_age: 900,
+        };
+        let answer = build_preflight_response(
+            &cors,
+            PreflightRequest {
+                origin: Some("https://app.example.com"),
+                request_method: Some("post"),
+                request_headers_raw: Some("Content-Type, X-Custom"),
+            },
+        );
+        assert_eq!(answer.status_code, 200);
+        assert_eq!(answer.body, "OK");
+        assert_eq!(
+            answer
+                .headers
+                .get("Access-Control-Allow-Origin")
+                .map(String::as_str),
+            Some("https://app.example.com"),
+            "credentials keep the exact origin (no wildcard echo)"
+        );
+        assert_eq!(
+            answer
+                .headers
+                .get("Access-Control-Allow-Methods")
+                .map(String::as_str),
+            Some("GET, POST")
+        );
+        assert_eq!(
+            answer
+                .headers
+                .get("Access-Control-Max-Age")
+                .map(String::as_str),
+            Some("900")
+        );
+        assert_eq!(
+            answer
+                .headers
+                .get("Access-Control-Allow-Credentials")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            answer.headers.get("Vary").map(String::as_str),
+            Some("Origin")
+        );
+    }
+
+    #[test]
+    fn a_disallowed_preflight_answers_the_failure_list() {
+        let cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["https://app.example.com".to_owned()],
+            allow_methods: vec!["GET".to_owned()],
+            allow_headers: vec!["content-type".to_owned()],
+            allow_credentials: false,
+            max_age: 600,
+        };
+        let answer = build_preflight_response(
+            &cors,
+            PreflightRequest {
+                origin: Some("https://evil.example.com"),
+                request_method: Some("DELETE"),
+                request_headers_raw: Some("X-Injected"),
+            },
+        );
+        assert_eq!(answer.status_code, 400);
+        assert_eq!(answer.body, "Disallowed CORS: origin, method, headers");
+        // The failure still carries the method list, the max age, and Vary.
+        assert_eq!(
+            answer
+                .headers
+                .get("Access-Control-Allow-Methods")
+                .map(String::as_str),
+            Some("GET")
+        );
+        assert_eq!(
+            answer
+                .headers
+                .get("Access-Control-Max-Age")
+                .map(String::as_str),
+            Some("600")
+        );
+        assert!(!answer.headers.contains_key("Access-Control-Allow-Origin"));
+    }
+
+    #[test]
+    fn the_wildcard_config_downgrades_the_credentials_echo() {
+        let cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["*".to_owned()],
+            allow_methods: vec!["PATCH".to_owned()],
+            allow_headers: vec!["*".to_owned()],
+            allow_credentials: false,
+            max_age: 600,
+        };
+        let answer = build_preflight_response(
+            &cors,
+            PreflightRequest {
+                origin: Some("https://any.example.com"),
+                request_method: Some("PATCH"),
+                request_headers_raw: Some("X-Anything"),
+            },
+        );
+        assert_eq!(answer.status_code, 200);
+        assert_eq!(
+            answer
+                .headers
+                .get("Access-Control-Allow-Origin")
+                .map(String::as_str),
+            Some("*")
+        );
+        assert_eq!(
+            answer
+                .headers
+                .get("Access-Control-Allow-Headers")
+                .map(String::as_str),
+            Some("X-Anything"),
+            "the wildcard header policy echoes the requested list"
+        );
+    }
+
+    #[test]
+    fn is_preflight_needs_options_and_the_request_method_header() {
+        let headers = vec![
+            (
+                String::from("Origin"),
+                String::from("https://app.example.com"),
+            ),
+            (
+                String::from("Access-Control-Request-Method"),
+                String::from("POST"),
+            ),
+        ];
+        assert!(is_preflight("OPTIONS", &headers));
+        assert!(is_preflight("options", &headers));
+        // A plain OPTIONS (no preflight header) is not a preflight.
+        let plain = vec![(
+            String::from("Origin"),
+            String::from("https://app.example.com"),
+        )];
+        assert!(!is_preflight("OPTIONS", &plain));
+        assert!(!is_preflight("GET", &headers));
+    }
 
     #[test]
     fn wildcard_policy_with_downgraded_credentials_answers_the_wildcard() {
@@ -263,6 +419,7 @@ mod coverage_tests {
             allow_methods: Vec::new(),
             allow_headers: Vec::new(),
             allow_credentials: false,
+            max_age: 600,
         };
         assert!(cors_response_headers(&empty, Some("https://good")).is_empty());
     }
@@ -278,5 +435,150 @@ mod coverage_tests {
             ..CorsConfig::default()
         };
         assert!(cors_response_headers(&cors, Some("https://good")).is_empty());
+    }
+}
+
+/// The preflight request header the reference gates an OPTIONS request on
+/// (`ALLOWED_PREFLIGHT_REQUEST_HEADER`).
+pub const ALLOWED_PREFLIGHT_REQUEST_HEADER: &str = "access-control-request-method";
+
+/// The reference `is_preflight`: an `OPTIONS` method (case-insensitive)
+/// carrying the `access-control-request-method` header.
+#[must_use]
+pub fn is_preflight(method: &str, request_headers: &[(String, String)]) -> bool {
+    method.eq_ignore_ascii_case("OPTIONS")
+        && request_headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(ALLOWED_PREFLIGHT_REQUEST_HEADER))
+}
+
+/// The reference `build_preflight_response`'s request view: the three
+/// headers the preflight validation reads (each already extracted by the
+/// adapter from its own header map).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreflightRequest<'a> {
+    /// The `Origin` header value, if present.
+    pub origin: Option<&'a str>,
+    /// The `Access-Control-Request-Method` value, if present.
+    pub request_method: Option<&'a str>,
+    /// The raw `Access-Control-Request-Headers` value, if present.
+    pub request_headers_raw: Option<&'a str>,
+}
+
+/// The reference `CorsPreflightResponse`: the status, the header set, and
+/// the plain-text body the preflight answer renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorsPreflightResponse {
+    /// `200` for an allowed preflight, `400` for a disallowed one.
+    pub status_code: u16,
+    /// The CORS headers the answer carries (`Vary`, allow-origin,
+    /// allow-methods, max-age, credentials, allow-headers).
+    pub headers: BTreeMap<String, String>,
+    /// `"OK"` allowed, `"Disallowed CORS: <failures>"` otherwise.
+    pub body: String,
+}
+
+/// The reference `build_preflight_response` (`cors_handler.py`).
+///
+/// Validate the origin, the requested method, and the requested headers
+/// against the resolved config; always carry the method list, the max
+/// age, and the credentials flag; a failure answers `400` with the
+/// joined failure list.
+#[must_use]
+pub fn build_preflight_response(
+    cors: &CorsConfig,
+    request: PreflightRequest<'_>,
+) -> CorsPreflightResponse {
+    let mut failures: Vec<&'static str> = Vec::new();
+    let mut response_headers = BTreeMap::from([(String::from("Vary"), String::from("Origin"))]);
+
+    // The origin arm (`_validate_preflight_origin`): an allowed origin
+    // gets the wildcard (unless credentials downgrade it) or itself.
+    let origin = request.origin.unwrap_or_default();
+    if is_origin_allowed(origin, &cors.allow_origins) {
+        let wildcard = cors.allow_origins.iter().any(|o| o == "*");
+        let allow_origin = if wildcard && !cors.allow_credentials {
+            "*"
+        } else {
+            origin
+        };
+        response_headers.insert(
+            String::from("Access-Control-Allow-Origin"),
+            allow_origin.to_owned(),
+        );
+    } else {
+        failures.push("origin");
+    }
+
+    // The method arm: the uppercased request method must be listed.
+    let requested_method = request
+        .request_method
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if !cors
+        .allow_methods
+        .iter()
+        .any(|method| method.to_ascii_uppercase() == requested_method)
+    {
+        failures.push("method");
+    }
+
+    // The headers arm (`_validate_preflight_headers`): the wildcard echoes
+    // the requested list, a listed set rejects any unlisted name, and an
+    // exact set echoes the raw value.
+    let requested_headers: Vec<String> = request
+        .request_headers_raw
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let requested_headers_raw = request.request_headers_raw.unwrap_or_default();
+    let allow_all_headers = cors.allow_headers.iter().any(|h| h == "*");
+    if allow_all_headers {
+        if !requested_headers_raw.is_empty() {
+            response_headers.insert(
+                String::from("Access-Control-Allow-Headers"),
+                requested_headers_raw.to_owned(),
+            );
+        }
+    } else if requested_headers.iter().any(|name| {
+        !cors
+            .allow_headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+    }) {
+        failures.push("headers");
+    }
+
+    response_headers.insert(
+        String::from("Access-Control-Allow-Methods"),
+        cors.allow_methods.join(", "),
+    );
+    response_headers.insert(
+        String::from("Access-Control-Max-Age"),
+        cors.max_age.to_string(),
+    );
+
+    if cors.allow_credentials {
+        response_headers.insert(
+            String::from("Access-Control-Allow-Credentials"),
+            String::from("true"),
+        );
+    }
+
+    if failures.is_empty() {
+        CorsPreflightResponse {
+            status_code: 200,
+            headers: response_headers,
+            body: String::from("OK"),
+        }
+    } else {
+        CorsPreflightResponse {
+            status_code: 400,
+            headers: response_headers,
+            body: format!("Disallowed CORS: {}", failures.join(", ")),
+        }
     }
 }

@@ -23,7 +23,7 @@
 //! use std::sync::{Arc, Mutex};
 //! use std::time::SystemTime;
 //!
-//! use guard_core_engine::behavior::{BehaviorRule, BehaviorTracker};
+//! use guard_core_engine::behavior::{unix_now, BehaviorRule, BehaviorTracker};
 //! use guard_core_engine::ip_ban::IpBanManager;
 //! use guard_core_engine::security_headers::SecurityHeadersConfig;
 
@@ -75,6 +75,7 @@ use std::time::SystemTime;
 use crate::metrics::MetricsCollector;
 use guard_core_engine::behavior::{
     BehaviorAction, BehaviorRule, BehaviorTracker, DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+    unix_now,
 };
 use guard_core_engine::cors::{CorsConfig, cors_response_headers, downgrade_wildcard_credentials};
 
@@ -225,6 +226,56 @@ impl ResponseProcessor {
 
         last_action
     }
+
+    /// The reference `process_usage_rules` (the usage/frequency half of
+    /// the behavioral processor): record one request observation per rule
+    /// for `(endpoint_id, client_ip)`, and dispatch the action of every
+    /// rule that crossed its threshold (a `ban` lands in the shared ban
+    /// manager, exactly like the response pass's return rules).
+    ///
+    /// `rules` are the route's `behavior_rules` (the carrier knob); the
+    /// reference reads them from the matched `RouteConfig`.
+    #[must_use]
+    pub fn process_usage_rules(
+        &self,
+        endpoint_id: &str,
+        client_ip: &str,
+        rules: &[BehaviorRule],
+        now: SystemTime,
+    ) -> Vec<BehaviorAction> {
+        let mut actions = Vec::new();
+        if rules.is_empty() {
+            return actions;
+        }
+        let mut tracker = self.tracker.lock().expect("behavior tracker");
+        for rule in rules {
+            if rule.rule_type != "usage" && rule.rule_type != "frequency" {
+                continue;
+            }
+            if tracker.track_endpoint_usage(endpoint_id, client_ip, rule, unix_now(now)) {
+                let action = BehaviorTracker::dispatch_action(rule, client_ip, self.passive_mode);
+                if let (BehaviorAction::Ban { duration }, Ok(ip)) = (&action, client_ip.parse()) {
+                    let _ = self.bans.ban_ip(ip, *duration, "behavioral_violation");
+                }
+                actions.push(action);
+            }
+        }
+        actions
+    }
+
+    /// Whether the processor carries CORS (the preflight short-circuit's
+    /// gate: the reference answers preflights only when CORS is enabled).
+    #[must_use]
+    pub fn cors_enabled(&self) -> bool {
+        self.cors.as_ref().is_some_and(|cors| cors.enabled)
+    }
+
+    /// The CORS config the processor renders (the preflight short-circuit
+    /// reads the same resolved surface the response pass does).
+    #[must_use]
+    pub const fn cors(&self) -> Option<&CorsConfig> {
+        self.cors.as_ref()
+    }
 }
 
 /// The free-function shape for a caller that owns the pieces.
@@ -374,6 +425,100 @@ mod tests {
         );
         processor.process(&request(None), &mut response, None, SystemTime::now());
         assert!(response.headers.is_empty());
+    }
+
+    #[test]
+    fn usage_rules_track_per_identity_and_the_ban_lands_in_the_shared_store() {
+        let bans = IpBanManager::new();
+        let usage_processor = processor(
+            vec![BehaviorRule {
+                rule_type: String::from("usage"),
+                threshold: 2,
+                window: 60,
+                pattern: String::new(),
+                action: String::from("ban"),
+                ban_duration: Some(3600),
+                correlate_with_detection: false,
+            }],
+            None,
+            None,
+            bans.clone(),
+        );
+        let rules = [BehaviorRule {
+            rule_type: String::from("usage"),
+            threshold: 2,
+            window: 60,
+            pattern: String::new(),
+            action: String::from("ban"),
+            ban_duration: Some(3600),
+            correlate_with_detection: false,
+        }];
+        let now = std::time::SystemTime::now();
+
+        // Two observations: under the strict threshold, no action.
+        assert!(
+            usage_processor
+                .process_usage_rules("GET:/api", "192.0.2.70", &rules, now)
+                .is_empty()
+        );
+        assert!(
+            usage_processor
+                .process_usage_rules("GET:/api", "192.0.2.70", &rules, now)
+                .is_empty()
+        );
+        // The third crossing dispatches the ban...
+        let actions = usage_processor.process_usage_rules("GET:/api", "192.0.2.70", &rules, now);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            actions[0],
+            guard_core_engine::behavior::BehaviorAction::Ban { .. }
+        ));
+        // ...and the ban stands in the shared store (the pipeline consults
+        // the same manager).
+        let ip: std::net::IpAddr = "192.0.2.70".parse().expect("ip");
+        assert!(bans.is_banned(ip));
+
+        // A return_pattern rule never feeds the usage pass (the type gate
+        // skips it before any tracking).
+        let return_rule = [BehaviorRule {
+            rule_type: String::from("return_pattern"),
+            threshold: 1,
+            window: 60,
+            pattern: String::from("status:404"),
+            action: String::from("log"),
+            ban_duration: None,
+            correlate_with_detection: false,
+        }];
+        let return_only = processor(Vec::new(), None, None, IpBanManager::new());
+        assert!(
+            return_only
+                .process_usage_rules("GET:/api", "192.0.2.71", &return_rule, now)
+                .is_empty()
+        );
+        // An empty rule set answers without touching the tracker.
+        let no_rules = processor(Vec::new(), None, None, IpBanManager::new());
+        assert!(
+            no_rules
+                .process_usage_rules("GET:/api", "192.0.2.71", &[], now)
+                .is_empty()
+        );
+
+        // The preflight short-circuit's gates read the same surface: a
+        // CORS-enabled processor answers both accessors.
+        let cors_on = processor(
+            Vec::new(),
+            None,
+            Some(CorsConfig {
+                enabled: true,
+                ..CorsConfig::default()
+            }),
+            IpBanManager::new(),
+        );
+        assert!(cors_on.cors_enabled());
+        assert!(cors_on.cors().is_some_and(|cors| cors.enabled));
+        let cors_off = processor(Vec::new(), None, None, IpBanManager::new());
+        assert!(!cors_off.cors_enabled());
+        assert!(cors_off.cors().is_none());
     }
 
     #[test]
