@@ -928,6 +928,11 @@ impl TelemetryHandler for OtelHandler {
         "OtelHandler"
     }
 
+    // The claim must be atomic with the derived endpoints: a concurrent
+    // start must observe the same single installation, so the derived
+    // endpoints land under the same critical section that flips the
+    // started flag.
+    #[allow(clippy::significant_drop_tightening)]
     fn start(&self) -> Result<(), TelemetryError> {
         if self.state.lock().expect("otel state").started {
             return Ok(());
@@ -941,9 +946,6 @@ impl TelemetryHandler for OtelHandler {
                     Some(otlp_signal_endpoint(endpoint, "/v1/metrics")),
                 )
             });
-        // The claim must be atomic with the derived endpoints: a
-        // concurrent start must observe the same single installation.
-        #[allow(clippy::significant_drop_tightening)]
         let mut state = self.state.lock().expect("otel state");
         if !state.started {
             state.traces_endpoint = derived.0;
@@ -1906,6 +1908,15 @@ mod otel_tests {
         }
     }
 
+    fn find_attribute(attributes: &[(String, serde_json::Value)], key: &str) -> serde_json::Value {
+        for (attribute_key, value) in attributes {
+            if attribute_key == key {
+                return value.clone();
+            }
+        }
+        panic!("missing attribute {key}");
+    }
+
     fn otel_with_endpoint(endpoint: Option<&str>) -> (OtelHandler, Arc<CapturingTransport>) {
         let transport = Arc::new(CapturingTransport::new());
         let handler = OtelHandler::new(
@@ -2021,16 +2032,6 @@ mod otel_tests {
         event.endpoint = Some(String::from("/login"));
         event.method = Some(String::from("POST"));
         event.metadata.insert(
-            String::from("traceparent"),
-            serde_json::Value::String(String::from(
-                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-            )),
-        );
-        event.metadata.insert(
-            String::from("tracestate"),
-            serde_json::Value::String(String::from("vendor=1")),
-        );
-        event.metadata.insert(
             String::from("status_code"),
             serde_json::Value::Number(serde_json::Number::from(403)),
         );
@@ -2062,11 +2063,6 @@ mod otel_tests {
         let span = &resource_span["scopeSpans"][0]["spans"][0];
         assert_eq!(span["name"], "guard.event.penetration_attempt");
         assert_eq!(span["kind"], 1);
-        assert_eq!(
-            span["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736",
-            "the traceparent is the remote parent"
-        );
-        assert_eq!(span["parentSpanId"], "00f067aa0ba902b7");
         assert_eq!(span["spanId"].as_str().expect("span id").len(), 16);
         assert!(
             span["startTimeUnixNano"]
@@ -2086,25 +2082,36 @@ mod otel_tests {
                 )
             })
             .collect();
-        let find = |key: &str| {
-            attributes
-                .iter()
-                .find(|(attribute_key, _)| attribute_key == key)
-                .map(|(_, value)| value.clone())
-                .unwrap_or_else(|| panic!("missing attribute {key}"))
-        };
         assert_eq!(
-            find("guard.event_type")["stringValue"],
+            find_attribute(&attributes, "guard.event_type")["stringValue"],
             "penetration_attempt"
         );
-        assert_eq!(find("guard.ip_address")["stringValue"], "192.0.2.1");
-        assert_eq!(find("guard.action_taken")["stringValue"], "request_blocked");
-        assert_eq!(find("guard.reason")["stringValue"], "sqli in ?q=");
-        assert_eq!(find("guard.endpoint")["stringValue"], "/login");
-        assert_eq!(find("guard.method")["stringValue"], "POST");
-        assert_eq!(find("guard.status_code")["intValue"], 403);
         assert_eq!(
-            find(ENRICHMENT_KEY_SERVICE_NAME)["stringValue"],
+            find_attribute(&attributes, "guard.ip_address")["stringValue"],
+            "192.0.2.1"
+        );
+        assert_eq!(
+            find_attribute(&attributes, "guard.action_taken")["stringValue"],
+            "request_blocked"
+        );
+        assert_eq!(
+            find_attribute(&attributes, "guard.reason")["stringValue"],
+            "sqli in ?q="
+        );
+        assert_eq!(
+            find_attribute(&attributes, "guard.endpoint")["stringValue"],
+            "/login"
+        );
+        assert_eq!(
+            find_attribute(&attributes, "guard.method")["stringValue"],
+            "POST"
+        );
+        assert_eq!(
+            find_attribute(&attributes, "guard.status_code")["intValue"],
+            403
+        );
+        assert_eq!(
+            find_attribute(&attributes, ENRICHMENT_KEY_SERVICE_NAME)["stringValue"],
             "edge-svc",
             "guard.* metadata forwards"
         );
@@ -2113,6 +2120,60 @@ mod otel_tests {
             assert!(key != "guard.container", "containers skip");
             assert!(key != "guard.null", "nulls skip");
         }
+    }
+
+    #[test]
+    fn the_traceparent_metadata_becomes_the_remote_parent() {
+        let (handler, transport) = otel_with_endpoint(Some("http://collector:4318"));
+        handler.start().expect("start");
+        let mut event = sample_event();
+        event.metadata.insert(
+            String::from("traceparent"),
+            serde_json::Value::String(String::from(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )),
+        );
+        event.metadata.insert(
+            String::from("tracestate"),
+            serde_json::Value::String(String::from("vendor=1")),
+        );
+        handler.send_event(&event).expect("send");
+        let (_, body) = &transport.exports()[0];
+        let payload: serde_json::Value = serde_json::from_str(body).expect("json");
+        let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(
+            span["traceId"], "4bf92f3577b34da6a3ce929d0e0e4736",
+            "the traceparent is the remote parent"
+        );
+        assert_eq!(span["parentSpanId"], "00f067aa0ba902b7");
+        // The attribute bag: traceparent/tracestate never re-emit.
+        let keys: Vec<String> = span["attributes"]
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .map(|attribute| attribute["key"].as_str().expect("key").to_owned())
+            .collect();
+        for key in &keys {
+            assert!(key != "traceparent" && key != "tracestate");
+        }
+
+        // The find helper's panic arm: an absent attribute is a test bug
+        // (the shape test drives the happy path only).
+        let attributes: Vec<(String, serde_json::Value)> = span["attributes"]
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .map(|attribute| {
+                (
+                    attribute["key"].as_str().expect("key").to_owned(),
+                    attribute["value"].clone(),
+                )
+            })
+            .collect();
+        let missed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            find_attribute(&attributes, "guard.missing")
+        }));
+        assert!(missed.is_err(), "the helper panics on a missing attribute");
     }
 
     #[test]
@@ -2298,9 +2359,10 @@ mod otel_tests {
         assert!(otlp_attribute("k", &serde_json::json!([])).is_none());
         assert!(otlp_attribute("k", &serde_json::json!({})).is_none());
         assert_eq!(
-            otlp_attribute("k", &serde_json::json!(u64::MAX)).expect("unsigned")["value"]["doubleValue"],
-            u64::MAX as f64,
-            "an out-of-i64 number lands as a double"
+            otlp_attribute("k", &serde_json::json!(9_223_372_036_854_775_808_u64))
+                .expect("unsigned")["value"]["doubleValue"],
+            9_223_372_036_854_775_808.0_f64,
+            "an out-of-i64 number lands as a double (the exact power of two)"
         );
         assert_eq!(string_attribute("k", "v")["value"]["stringValue"], "v");
         assert!(
