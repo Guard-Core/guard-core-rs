@@ -294,6 +294,29 @@ pub struct AppliedDynamicRules {
     pub emergency_activated: bool,
 }
 
+/// `_apply_user_agent_rules`: the ReDoS-validated lane, the rejected
+/// patterns surfaced. The empirical cost verdict consults the optional
+/// disk-backed cache (the cheap layers re-run inside the validator).
+fn validate_user_agent_rules(
+    patterns: &[String],
+    cache: Option<&crate::redos::validation_cache::ValidationCache>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut valid = Vec::new();
+    let mut rejected = Vec::new();
+    for pattern in patterns {
+        let (is_safe, reason) = cache.map_or_else(
+            || validate_pattern_safety(pattern),
+            |cache| cache.validate_compat(pattern),
+        );
+        if is_safe {
+            valid.push(pattern.clone());
+        } else {
+            rejected.push((pattern.clone(), reason));
+        }
+    }
+    (valid, rejected)
+}
+
 /// The config-mutating half of `_apply_rules` +
 /// `DynamicRuleApplicationMixin`.
 ///
@@ -301,6 +324,21 @@ pub struct AppliedDynamicRules {
 /// the outcome carrying the stateful lands (bans, unbans, patterns) and
 /// the rejection reports.
 pub fn apply_to_config(config: &mut SecurityConfig, rules: &DynamicRules) -> AppliedDynamicRules {
+    apply_to_config_with_validation_cache(config, rules, None)
+}
+
+/// [`apply_to_config`] with the optional disk-backed validation cache.
+///
+/// The user-agent lane's ReDoS validation consults the cache for the
+/// empirical cost verdict, so a poll or a boot reuses prior
+/// certifications. (The cheap deterministic layers re-run inside the
+/// cached validator; only the timed cost verdict is cached.) The knob
+/// is `detection_pattern_validation_cache_path`.
+pub fn apply_to_config_with_validation_cache(
+    config: &mut SecurityConfig,
+    rules: &DynamicRules,
+    cache: Option<&crate::redos::validation_cache::ValidationCache>,
+) -> AppliedDynamicRules {
     let mut outcome = AppliedDynamicRules::default();
 
     // `_apply_ip_rules`: the bans and unbans surface for the caller's
@@ -375,15 +413,8 @@ pub fn apply_to_config(config: &mut SecurityConfig, rules: &DynamicRules) -> App
     // `_apply_user_agent_rules`: the ReDoS-validated lane, the rejected
     // patterns surfaced.
     if !rules.blocked_user_agents.is_empty() {
-        let mut valid = Vec::new();
-        for pattern in &rules.blocked_user_agents {
-            let (is_safe, reason) = validate_pattern_safety(pattern);
-            if is_safe {
-                valid.push(pattern.clone());
-            } else {
-                outcome.rejected_user_agents.push((pattern.clone(), reason));
-            }
-        }
+        let (valid, rejected) = validate_user_agent_rules(&rules.blocked_user_agents, cache);
+        outcome.rejected_user_agents = rejected;
         config.blocked_user_agents = valid;
     }
 

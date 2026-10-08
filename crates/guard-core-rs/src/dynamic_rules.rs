@@ -68,8 +68,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use guard_core_engine::dynamic_rules::{
-    AppliedDynamicRules, DynamicRules, apply_to_config, dump_last_known_rules_snapshot,
-    expired_identity, has_expired, load_last_known_rules_snapshot, matches_event, should_update,
+    AppliedDynamicRules, DynamicRules, dump_last_known_rules_snapshot, expired_identity,
+    has_expired, load_last_known_rules_snapshot, matches_event, should_update,
 };
 use guard_core_engine::ip_ban::IpBanManager;
 use guard_core_engine::security_config::SecurityConfig;
@@ -165,6 +165,7 @@ pub struct DynamicRuleManager {
     bans: Option<IpBanManager>,
     patterns: Option<Arc<SusPatternsManager>>,
     cache_path: Option<PathBuf>,
+    validation_cache: Option<Arc<guard_core_engine::redos::validation_cache::ValidationCache>>,
     clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     state: Mutex<ManagerState>,
 }
@@ -215,6 +216,7 @@ impl DynamicRuleManager {
             bans: None,
             patterns: None,
             cache_path,
+            validation_cache: None,
             clock: Arc::new(chrono::Utc::now),
             state: Mutex::new(ManagerState::default()),
         }
@@ -249,6 +251,21 @@ impl DynamicRuleManager {
     #[must_use]
     pub fn with_clock(mut self, clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// The disk-backed pattern-validation cache
+    /// (`detection_pattern_validation_cache_path`): every poll's
+    /// user-agent ReDoS validation consults the cache for the empirical
+    /// cost verdict, so repeated boots and polls reuse prior
+    /// certifications instead of re-timing every fetched pattern. The
+    /// load outcome rides [`guard_core_engine::redos::validation_cache::ValidationCache::outcome`] (the reference's
+    /// log-once warnings, surfaced as data).
+    #[must_use]
+    pub fn with_validation_cache_path(mut self, path: &std::path::Path) -> Self {
+        self.validation_cache = Some(Arc::new(
+            guard_core_engine::redos::validation_cache::ValidationCache::load(path),
+        ));
         self
     }
 
@@ -460,7 +477,11 @@ impl DynamicRuleManager {
                             state.base_snapshot = Some(SnapshotConfig::capture(&config));
                         }
                     }
-                    apply_to_config(&mut config, rules)
+                    guard_core_engine::dynamic_rules::apply_to_config_with_validation_cache(
+                        &mut config,
+                        rules,
+                        self.validation_cache.as_deref(),
+                    )
                 });
         if let Some(bans) = self.bans.as_ref() {
             for (ip, duration) in &outcome.bans {
@@ -759,6 +780,49 @@ mod dynamic_rule_manager_tests {
         (manager, config)
     }
 
+    #[test]
+    fn the_validation_cache_path_persists_pattern_certifications() {
+        // A rule set with a blocked user-agent pattern: the poll's
+        // ReDoS validation consults the disk cache and the certification
+        // persists for the next boot or poll.
+        let mut payload = rules();
+        payload.blocked_user_agents = vec![String::from("^bad-bot-\\d+$")];
+        let sink = Arc::new(ScriptedSink::new(vec![Some(
+            serde_json::to_value(&payload).expect("serializes"),
+        )]));
+        let config = Arc::new(RwLock::new(SecurityConfig {
+            enable_dynamic_rules: true,
+            ..SecurityConfig::default()
+        }));
+        let dir =
+            std::env::temp_dir().join(format!("guard-dyn-validation-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let cache_path = dir.join("validation-cache.json");
+
+        let manager = DynamicRuleManager::new(Arc::clone(&config))
+            .with_sink(sink)
+            .with_validation_cache_path(&cache_path);
+        manager.update_rules();
+
+        assert!(cache_path.is_file(), "the pattern certification persisted");
+        let reloaded =
+            guard_core_engine::redos::validation_cache::ValidationCache::load(&cache_path);
+        assert_eq!(
+            reloaded.outcome(),
+            &guard_core_engine::redos::validation_cache::LoadOutcome::Loaded {
+                foreign_versions_dropped: 0
+            }
+        );
+        assert!(
+            reloaded.get("^bad-bot-\\d+$", true).is_some(),
+            "the fetched pattern's verdict is cached"
+        );
+        // The validated pattern landed on the live config.
+        let applied = config.read().expect("config").blocked_user_agents.clone();
+        assert_eq!(applied, vec![String::from("^bad-bot-\\d+$")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn an_unwired_manager_polls_nothing() {
         let config = Arc::new(RwLock::new(SecurityConfig::default()));
