@@ -41,28 +41,28 @@ jobs:
           # the engine and all four adapters merged, so every consumer is
           # tested at master (the same moving-pin dance the sibling repos'
           # CI does for this engine).
-          - repo: rennf93/actix-guard-rs
+          - repo: Guard-Core/actix-guard-rs
             path: actix-guard-rs
             test_ref: master
             # Extra sibling checkout the consumer needs besides this engine.
             extra_repo: ''
             extra_path: ''
             extra_ref: ''
-          - repo: rennf93/axum-guard-rs
+          - repo: Guard-Core/axum-guard-rs
             path: axum-guard-rs
             test_ref: master
             # axum-guard-rs consumes tower-guard-rs as a sibling path
             # dependency, which itself consumes this engine.
-            extra_repo: rennf93/tower-guard-rs
+            extra_repo: Guard-Core/tower-guard-rs
             extra_path: tower-guard-rs
             extra_ref: master
-          - repo: rennf93/rocket-guard-rs
+          - repo: Guard-Core/rocket-guard-rs
             path: rocket-guard-rs
             test_ref: master
             extra_repo: ''
             extra_path: ''
             extra_ref: ''
-          - repo: rennf93/tower-guard-rs
+          - repo: Guard-Core/tower-guard-rs
             path: tower-guard-rs
             test_ref: master
             extra_repo: ''

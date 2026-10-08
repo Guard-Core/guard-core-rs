@@ -1,8 +1,8 @@
 site_name: guard-core-rs
 site_description: Rust application-layer API security engine - content preprocessing, semantic analysis, and pattern detection
 site_author: Renn F
-repo_url: https://github.com/rennf93/guard-core-rs
-repo_name: rennf93/guard-core-rs
+repo_url: https://github.com/Guard-Core/guard-core-rs
+repo_name: Guard-Core/guard-core-rs
 
 theme:
   name: material

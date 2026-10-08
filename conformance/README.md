@@ -1,6 +1,6 @@
 # Conformance
 
-Normative conformance harness for [guard-core-rs](https://github.com/rennf93/guard-core-rs)
+Normative conformance harness for [guard-core-rs](https://github.com/Guard-Core/guard-core-rs)
 against the guard-core spec 4.1.0 fixture corpus. Mirrors the Go port layout
 (`guard-core-go/conformance/`): the corpus is vendored byte-identical and a
 native runner compares each case per the rules in `specs/fixtures/README.md`

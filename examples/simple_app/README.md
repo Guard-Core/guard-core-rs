@@ -1,7 +1,7 @@
 # simple_app
 
 Minimal guarded service: a tiny hand-rolled router wrapped in a guard shim
-that runs the [`guard_core_rs::detect`](https://github.com/rennf93/guard-core-rs)
+that runs the [`guard_core_rs::detect`](https://github.com/Guard-Core/guard-core-rs)
 pipeline over every request, served over hyper. Every detection decision
 comes from the engine; the example itself holds no security logic beyond
 translating a verdict into a response (the wiring an adapter performs).

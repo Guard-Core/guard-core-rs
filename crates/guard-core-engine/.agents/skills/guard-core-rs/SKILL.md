@@ -1,6 +1,6 @@
 ---
 name: guard-core-rs
-description: Use when working in the guard-core-rs Rust workspace (github.com/rennf93/guard-core-rs): porting Python guard-core detection behavior (spec 4.0.2 sections 04-06) to Rust, editing guard-core-engine compiler/preprocessor/semantic code, running or interpreting the spec 4.0.2 conformance gate, updating conformance/pattern_ledger.toml or conformance/xfail_baseline.toml, extending the PyO3 bindings in guard-core-python, adding criterion benches or libfuzzer targets, or answering status questions about what the Rust port does and does not implement. Covers CI-verified cargo commands, boundary rules (engine has no I/O and no tokio; PyO3 binds detection sections 04-06 only), and honest limitations (no 4.x pattern-table scan stage yet; baseline 39 pass / 124 xfail).
+description: Use when working in the guard-core-rs Rust workspace (github.com/Guard-Core/guard-core-rs): porting Python guard-core detection behavior (spec 4.0.2 sections 04-06) to Rust, editing guard-core-engine compiler/preprocessor/semantic code, running or interpreting the spec 4.0.2 conformance gate, updating conformance/pattern_ledger.toml or conformance/xfail_baseline.toml, extending the PyO3 bindings in guard-core-python, adding criterion benches or libfuzzer targets, or answering status questions about what the Rust port does and does not implement. Covers CI-verified cargo commands, boundary rules (engine has no I/O and no tokio; PyO3 binds detection sections 04-06 only), and honest limitations (no 4.x pattern-table scan stage yet; baseline 39 pass / 124 xfail).
 ---
 
 # guard-core-rs
@@ -25,7 +25,7 @@ cargo +nightly fuzz run fuzz_preprocess -- -max_total_time=60             # fuzz
 Not published in usable form: the facade crate `guard-core-rs` is version 0.0.1 and the project is a work in progress. Clone the repository:
 
 ```bash
-git clone https://github.com/rennf93/guard-core-rs
+git clone https://github.com/Guard-Core/guard-core-rs
 cd guard-core-rs
 ```
 
@@ -78,7 +78,7 @@ The engine implements: regex compilation with an LRU `PatternCache` and ReDoS-sa
 
 ## Related Projects
 
-- [guard-core](https://github.com/rennf93/guard-core): Python reference implementation, spec owner, corpus source.
-- [guard-core-go](https://github.com/rennf93/guard-core-go): Go port, conformance layout precedent. [guard-core-ts](https://github.com/rennf93/guard-core-ts): TypeScript port.
-- Adapters (scaffolds): [tower-guard-rs](https://github.com/rennf93/tower-guard-rs), [axum-guard-rs](https://github.com/rennf93/axum-guard-rs), [actix-guard-rs](https://github.com/rennf93/actix-guard-rs), [rocket-guard-rs](https://github.com/rennf93/rocket-guard-rs).
-- [fastapi-guard](https://github.com/rennf93/fastapi-guard) and the other Python framework adapters.
+- [guard-core](https://github.com/Guard-Core/guard-core): Python reference implementation, spec owner, corpus source.
+- [guard-core-go](https://github.com/Guard-Core/guard-core-go): Go port, conformance layout precedent. [guard-core-ts](https://github.com/Guard-Core/guard-core-ts): TypeScript port.
+- Adapters (scaffolds): [tower-guard-rs](https://github.com/Guard-Core/tower-guard-rs), [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs), [actix-guard-rs](https://github.com/Guard-Core/actix-guard-rs), [rocket-guard-rs](https://github.com/Guard-Core/rocket-guard-rs).
+- [fastapi-guard](https://github.com/Guard-Core/fastapi-guard) and the other Python framework adapters.

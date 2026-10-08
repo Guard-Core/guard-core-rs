@@ -11,10 +11,10 @@ authors = [
 categories = ["web-programming"]
 documentation = "https://docs.rs/guard-core-rs"
 edition = "2024"
-homepage = "https://github.com/rennf93/guard-core-rs"
+homepage = "https://github.com/Guard-Core/guard-core-rs"
 keywords = ["security", "middleware", "api", "detection-engine", "waf"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rennf93/guard-core-rs"
+repository = "https://github.com/Guard-Core/guard-core-rs"
 rust-version = "1.92"
 
 [workspace.metadata.docs.rs]
