@@ -2,7 +2,7 @@
 
 Guarded Rocket service: the rate-limit and dynamic-ban stage installed as a
 request guard with its fairing and catchers, with every decision delegated to
-[`guard_core_rs::tower`](https://github.com/rennf93/guard-core-rs)'s
+[`guard_core_rs::tower`](https://github.com/Guard-Core/guard-core-rs)'s
 `RateLimitStage::decide` so behavior is byte-identical to the tower stage.
 All security decisions come from the engine stage; this example holds no
 security logic beyond translating a block answer into a Rocket response (the

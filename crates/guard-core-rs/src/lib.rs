@@ -7,7 +7,7 @@
 
 //! Framework-agnostic application-layer API security engine.
 //!
-//! Rust port of [guard-core](https://github.com/rennf93/guard-core)'s
+//! Rust port of [guard-core](https://github.com/Guard-Core/guard-core)'s
 //! detection engine. **Work in progress:** the CPU-bound detection pipeline
 //! is the core, and the first pipeline stage has landed: the rate-limit and
 //! dynamic-ban [`tower`] layer for Axum/tonic-shaped stacks. Handlers,

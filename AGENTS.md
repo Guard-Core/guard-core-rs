@@ -3,9 +3,9 @@ Guidance for AI agents (including Claude Code) working in this repository.
 
 ## Project Overview
 
-guard-core-rs is the Rust port of the [guard-core](https://github.com/rennf93/guard-core) detection engine: the framework-agnostic, CPU-bound core of the Guard ecosystem. It is a cargo workspace of five crates: the engine implements the full 4.x detect pipeline (pattern compilation, content preprocessing, the pattern-table scan stage, semantic analysis) plus the pipeline-side surfaces the adapters consume (rate limiting, IP bans, geo country rules, cloud provider checks, security headers, the event bus, responses), and the conformance harness pins the detect stage to the vendored spec 4.1.0 corpus. Documented divergences from the Python engine live in the CHANGELOG's "Known differences from Python" section; do not claim full parity beyond what that list and the corpus gate prove.
+guard-core-rs is the Rust port of the [guard-core](https://github.com/Guard-Core/guard-core) detection engine: the framework-agnostic, CPU-bound core of the Guard ecosystem. It is a cargo workspace of five crates: the engine implements the full 4.x detect pipeline (pattern compilation, content preprocessing, the pattern-table scan stage, semantic analysis) plus the pipeline-side surfaces the adapters consume (rate limiting, IP bans, geo country rules, cloud provider checks, security headers, the event bus, responses), and the conformance harness pins the detect stage to the vendored spec 4.1.0 corpus. Documented divergences from the Python engine live in the CHANGELOG's "Known differences from Python" section; do not claim full parity beyond what that list and the corpus gate prove.
 
-- **Repository**: https://github.com/rennf93/guard-core-rs
+- **Repository**: https://github.com/Guard-Core/guard-core-rs
 - **Language**: Rust, edition 2024, MSRV 1.92
 - **License**: MIT OR Apache-2.0
 - **Version**: 4.1.0 (all workspace crates; mirrors guard-core 4.1.0)
@@ -69,7 +69,7 @@ Honest state of the port. Verify rather than trust; numbers below were read from
 ## Quick Start
 
 ```bash
-git clone https://github.com/rennf93/guard-core-rs
+git clone https://github.com/Guard-Core/guard-core-rs
 cd guard-core-rs
 cargo build --workspace --exclude guard-core-python
 cargo test --workspace --exclude guard-core-python
@@ -215,8 +215,8 @@ The RE2-like `regex` crate is a structural advantage: section 04's catastrophic-
 
 ## Related Projects
 
-- [guard-core](https://github.com/rennf93/guard-core): Python reference implementation, spec owner (`specs/01-14`), and conformance corpus source.
-- [guard-core-go](https://github.com/rennf93/guard-core-go): Go port; precedent for the conformance directory layout.
-- [guard-core-ts](https://github.com/rennf93/guard-core-ts): TypeScript port.
-- [fastapi-guard](https://github.com/rennf93/fastapi-guard), flaskapi-guard, djapi-guard, tornadoapi-guard: Python framework adapters.
-- Rust adapters (released at v1.1.0): [tower-guard-rs](https://github.com/rennf93/tower-guard-rs), [axum-guard-rs](https://github.com/rennf93/axum-guard-rs), [actix-guard-rs](https://github.com/rennf93/actix-guard-rs), [rocket-guard-rs](https://github.com/rennf93/rocket-guard-rs).
+- [guard-core](https://github.com/Guard-Core/guard-core): Python reference implementation, spec owner (`specs/01-14`), and conformance corpus source.
+- [guard-core-go](https://github.com/Guard-Core/guard-core-go): Go port; precedent for the conformance directory layout.
+- [guard-core-ts](https://github.com/Guard-Core/guard-core-ts): TypeScript port.
+- [fastapi-guard](https://github.com/Guard-Core/fastapi-guard), flaskapi-guard, djapi-guard, tornadoapi-guard: Python framework adapters.
+- Rust adapters (released at v1.1.0): [tower-guard-rs](https://github.com/Guard-Core/tower-guard-rs), [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs), [actix-guard-rs](https://github.com/Guard-Core/actix-guard-rs), [rocket-guard-rs](https://github.com/Guard-Core/rocket-guard-rs).

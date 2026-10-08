@@ -1,7 +1,7 @@
 # guard-core-rs
 
 `guard-core-rs` is the Rust port of the
-[guard-core](https://github.com/rennf93/guard-core) detection engine: the
+[guard-core](https://github.com/Guard-Core/guard-core) detection engine: the
 framework-agnostic, CPU-bound core of the Guard ecosystem. It is a cargo
 workspace that implements the full 4.x detect pipeline (content
 preprocessing, the pattern-table scan stage, semantic analysis, and regex
@@ -68,7 +68,7 @@ The crate is not on crates.io yet. Depend on it via git:
 
 ```toml
 [dependencies]
-guard-core-rs = { git = "https://github.com/rennf93/guard-core-rs" }
+guard-core-rs = { git = "https://github.com/Guard-Core/guard-core-rs" }
 ```
 
 Requires Rust 1.92 or later (edition 2024).

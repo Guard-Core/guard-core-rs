@@ -80,10 +80,10 @@ fn scan_request(path: &str, query_values: &[String], body: &str, config: &Detect
 
 !!! note
     For production wiring prefer the adapter crates
-    ([tower-guard-rs](https://github.com/rennf93/tower-guard-rs),
+    ([tower-guard-rs](https://github.com/Guard-Core/tower-guard-rs),
     axum-guard-rs, actix-guard-rs, rocket-guard-rs): they handle body
     buffering, caps, and response translation. The
-    [`examples/`](https://github.com/rennf93/guard-core-rs/tree/master/examples)
+    [`examples/`](https://github.com/Guard-Core/guard-core-rs/tree/master/examples)
     directory shows this wiring over hyper.
 
 ## Standalone use of the building blocks
