@@ -226,6 +226,65 @@ impl CloudProviderStage {
             details,
         })
     }
+
+    /// The reference `get_cloud_providers_to_check` route lane: the
+    /// route's `block_cloud_providers` selectors replace the global
+    /// config's for this request (the route list overrides the global
+    /// one), everything else - the whitelist/exempt skip, the table
+    /// lookups, the emissions, the passive reading, and the `403`
+    /// blocked shape - runs exactly like [`Self::decide`]. `None`
+    /// selectors fall back to the global config (the reference's global
+    /// fallback when the route names none).
+    #[must_use]
+    pub fn decide_route(
+        &self,
+        ip: Option<IpAddr>,
+        gate: Option<IpGateDecision>,
+        route_selectors: &CloudSelectors,
+    ) -> Option<CloudDecision> {
+        if gate.is_some_and(|gate| gate.is_whitelisted || gate.is_exempt) {
+            return None;
+        }
+        let ip = ip?;
+        let selectors = if route_selectors.blocked.is_empty() {
+            &self.config.block_cloud_providers
+        } else {
+            route_selectors
+        };
+        if selectors.blocked.is_empty() {
+            return None;
+        }
+        if !self.config.table.is_cloud_ip(ip, selectors) {
+            return None;
+        }
+        let details = self.config.table.provider_details(ip, selectors);
+        if let Some(sink) = &self.event_sink {
+            let (provider, network) = details
+                .as_ref()
+                .map_or((None, None), |(provider, network)| {
+                    (Some(provider.as_str()), Some(network.as_str()))
+                });
+            crate::stage_events::emit_cloud_block(
+                sink,
+                provider,
+                network,
+                &ip.to_string(),
+                self.config.passive_mode,
+            );
+        }
+        if self.config.passive_mode {
+            return None;
+        }
+        Some(CloudDecision {
+            answer: StageResponse {
+                status: StatusCode::FORBIDDEN,
+                body: CLOUD_PROVIDER_BLOCKED_BODY,
+                retry_after: None,
+                custom_body: None,
+            },
+            details,
+        })
+    }
 }
 
 /// The builder for [`CloudProviderStage`].
@@ -380,6 +439,147 @@ mod tests {
 
     fn ip(text: &str) -> IpAddr {
         IpAddr::from_str(text).expect("test address")
+    }
+
+    #[test]
+    fn the_route_lane_overrides_the_global_selectors() {
+        // The global stage blocks AWS only; the route's GCP list replaces
+        // it for the request (the reference
+        // `get_cloud_providers_to_check`: the route list overrides the
+        // global one), and a route with no list falls back to the global
+        // config.
+        let table = CloudIpTable::default();
+        table
+            .set_provider_ranges("AWS", vec![("203.0.113.0/24".to_owned(), None)])
+            .expect("valid ranges");
+        table
+            .set_provider_ranges("GCP", vec![("192.0.2.0/24".to_owned(), None)])
+            .expect("valid ranges");
+        let stage = CloudProviderStage::new(CloudProviderStageConfig {
+            block_cloud_providers: parse_cloud_selectors(["AWS"]).expect("valid selectors"),
+            table,
+            passive_mode: false,
+        });
+        let gcp = parse_cloud_selectors(["GCP"]).expect("valid selectors");
+
+        // The route's list decides: an AWS address inside the GLOBAL list
+        // passes, a GCP address outside it blocks.
+        assert!(
+            stage
+                .decide_route(Some(ip("203.0.113.9")), None, &gcp)
+                .is_none(),
+            "the global AWS list no longer applies on the route"
+        );
+        let decision = stage
+            .decide_route(Some(ip("192.0.2.9")), None, &gcp)
+            .expect("blocked");
+        assert_eq!(decision.answer.status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            decision.details,
+            Some(("GCP".to_owned(), "192.0.2.0/24".to_owned()))
+        );
+
+        // An empty route list falls back to the global config.
+        let empty = parse_cloud_selectors([] as [&str; 0]).expect("valid selectors");
+        assert!(
+            stage
+                .decide_route(Some(ip("203.0.113.9")), None, &empty)
+                .is_some(),
+            "the global list applies when the route names none"
+        );
+
+        // The global lane stays untouched.
+        assert!(
+            stage
+                .decide_route(
+                    Some(ip("192.0.2.9")),
+                    None,
+                    &stage.config().block_cloud_providers
+                )
+                .is_none(),
+            "the route selector wins over the global list"
+        );
+    }
+
+    #[test]
+    fn the_route_lane_falls_back_through_the_empty_global_list() {
+        // The global config names no providers and neither does the
+        // route: the empty-selectors return answers before any lookup.
+        let stage = CloudProviderStage::new(CloudProviderStageConfig::default());
+        let empty = parse_cloud_selectors([] as [&str; 0]).expect("valid selectors");
+        assert!(
+            stage
+                .decide_route(Some(ip("203.0.113.9")), None, &empty)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_route_lane_emits_the_cloud_blocked_event_through_the_sink() {
+        // With a bus installed the route lane emits exactly what the
+        // global lane emits: the `cloud_blocked` event carrying the
+        // provider and network.
+        use std::sync::Mutex;
+
+        use crate::events::SecurityEventBus;
+        use crate::redact::SensitiveNames;
+        use crate::stage_events::StageEventSink;
+
+        let table = CloudIpTable::default();
+        table
+            .set_provider_ranges("GCP", vec![("192.0.2.0/24".to_owned(), None)])
+            .expect("valid ranges");
+        let seen: std::sync::Arc<Mutex<Vec<crate::events::SecurityEvent>>> =
+            std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink_log = std::sync::Arc::clone(&seen);
+        let bus = std::sync::Arc::new(SecurityEventBus::new(true).on_event(std::sync::Arc::new(
+            move |event: &crate::events::SecurityEvent| {
+                sink_log.lock().expect("sink").push(event.clone());
+            },
+        )));
+        let sink = StageEventSink::new(None, Some(bus), SensitiveNames::default());
+        let stage = CloudProviderStage::builder(CloudProviderStageConfig {
+            block_cloud_providers: parse_cloud_selectors(["AWS"]).expect("valid selectors"),
+            table,
+            passive_mode: false,
+        })
+        .event_sink(sink)
+        .build();
+        let gcp = parse_cloud_selectors(["GCP"]).expect("valid selectors");
+        let decision = stage
+            .decide_route(Some(ip("192.0.2.9")), None, &gcp)
+            .expect("blocked");
+        assert_eq!(
+            decision.details,
+            Some(("GCP".to_owned(), "192.0.2.0/24".to_owned()))
+        );
+        let events = seen.lock().expect("sink");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EVENT_CLOUD_BLOCKED);
+        assert_eq!(events[0].metadata["cloud_provider"], "GCP");
+    }
+
+    #[test]
+    fn the_route_lane_skips_and_reads_passive_like_the_global_lane() {
+        // The whitelist/exempt skip and the passive reading carry over.
+        let stage = passive_aws_stage();
+        let aws = parse_cloud_selectors(["AWS"]).expect("valid selectors");
+        assert!(
+            stage
+                .decide_route(Some(ip("203.0.113.9")), None, &aws)
+                .is_none(),
+            "passive mode observes only"
+        );
+        let whitelisted = guard_core_engine::ip_gate::IpGateDecision {
+            is_whitelisted: true,
+            is_exempt: false,
+        };
+        assert!(
+            stage
+                .decide_route(Some(ip("203.0.113.9")), Some(whitelisted), &aws)
+                .is_none(),
+            "the whitelist skip carries over"
+        );
     }
 
     #[test]
