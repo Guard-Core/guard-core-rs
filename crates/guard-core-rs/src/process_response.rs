@@ -344,6 +344,19 @@ impl ResponseProcessor {
     pub const fn cors(&self) -> Option<&CorsConfig> {
         self.cors.as_ref()
     }
+
+    /// The security-headers config the processor renders (the adapter
+    /// funnels read the resolved surface to compose the
+    /// `security_headers_applied` event over the exact set the pass lands:
+    /// the count and the CSP/HSTS flags of
+    /// [`guard_core_engine::security_headers::security_headers`] over this
+    /// config, before the CORS verdict and the response modifier touch the
+    /// view). `None` (or a disabled config) renders no set, and the
+    /// reference fires the event only when the set lands.
+    #[must_use]
+    pub const fn security_headers(&self) -> Option<&SecurityHeadersConfig> {
+        self.security_headers.as_ref()
+    }
 }
 
 /// The free-function shape for a caller that owns the pieces.
@@ -684,6 +697,54 @@ mod tests {
         let cors_off = processor(Vec::new(), None, None, IpBanManager::new());
         assert!(!cors_off.cors_enabled());
         assert!(cors_off.cors().is_none());
+    }
+
+    #[test]
+    fn the_security_headers_accessor_exposes_the_rendered_surface() {
+        // The headers-on processor answers with its config; a disabled
+        // config still surfaces (the caller filters on `enabled`, exactly
+        // like the pass), and no config answers `None`.
+        let headers_on = processor(
+            Vec::new(),
+            Some(SecurityHeadersConfig::reference_default()),
+            None,
+            IpBanManager::new(),
+        );
+        let config = headers_on.security_headers().expect("the config surfaces");
+        assert!(config.enabled);
+        // The set the accessor's config renders is the set the pass
+        // lands: the count and the CSP/HSTS flags line up.
+        let set = guard_core_engine::security_headers::security_headers(config);
+        let mut response = ResponseBits::default();
+        headers_on.process(&request(None), &mut response, None, SystemTime::now());
+        assert_eq!(response.headers.len(), set.len());
+        assert_eq!(
+            set.contains_key("Content-Security-Policy"),
+            response.headers.contains_key("Content-Security-Policy")
+        );
+        assert_eq!(
+            set.contains_key("Strict-Transport-Security"),
+            response.headers.contains_key("Strict-Transport-Security")
+        );
+        assert!(headers_on.security_headers().is_some());
+
+        let headers_off = processor(
+            Vec::new(),
+            Some(SecurityHeadersConfig {
+                enabled: false,
+                ..SecurityHeadersConfig::reference_default()
+            }),
+            None,
+            IpBanManager::new(),
+        );
+        assert!(
+            headers_off
+                .security_headers()
+                .is_some_and(|config| !config.enabled)
+        );
+
+        let bare = processor(Vec::new(), None, None, IpBanManager::new());
+        assert!(bare.security_headers().is_none());
     }
 
     #[test]
