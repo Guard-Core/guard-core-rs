@@ -251,6 +251,108 @@ impl SecurityEventBus {
             MIDDLEWARE_HANDLER_NAME,
         ));
     }
+    /// The reference `send_https_violation_event`
+    /// (`middleware_events.py:137`): the HTTPS-enforcement violation
+    /// envelope - a route `require_https` answers the decorator-violation
+    /// shape (`authentication` / `require_https`, the original scheme and
+    /// the redacted redirect URL in the metadata), the global arm answers
+    /// `https_enforced` with the same tail keys.
+    pub fn send_https_violation_event(
+        &self,
+        client_ip: &str,
+        original_scheme: &str,
+        redirect_url: &str,
+        route_requires_https: bool,
+    ) {
+        let mut event = if route_requires_https {
+            SecurityEvent::new(
+                crate::event_types::EVENT_DECORATOR_VIOLATION,
+                client_ip,
+                "https_redirect",
+                "Route requires HTTPS but request was HTTP",
+                "middleware",
+            )
+        } else {
+            SecurityEvent::new(
+                crate::event_types::EVENT_HTTPS_ENFORCED,
+                client_ip,
+                "https_redirect",
+                "HTTP request redirected to HTTPS for security",
+                "middleware",
+            )
+        };
+        event.metadata.insert(
+            String::from("decorator_type"),
+            serde_json::Value::from("authentication"),
+        );
+        event.metadata.insert(
+            String::from("violation_type"),
+            serde_json::Value::from("require_https"),
+        );
+        event.metadata.insert(
+            String::from("original_scheme"),
+            serde_json::Value::from(original_scheme),
+        );
+        event.metadata.insert(
+            String::from("redirect_url"),
+            serde_json::Value::from(redirect_url),
+        );
+        self.send_event(&event);
+    }
+
+    /// The reference `send_cloud_detection_events`
+    /// (`middleware_events.py:168`): the cloud-provider detection
+    /// envelopes - a detected `(provider, network)` pair emits the
+    /// cloud-provider detection event through the bus (`cloud_blocked`,
+    /// the provider/network keys), and a route `block_cloud_providers`
+    /// adds the decorator-violation shape (`access_control` /
+    /// `cloud_provider`, the blocked-provider list).
+    pub fn send_cloud_detection_events(
+        &self,
+        client_ip: &str,
+        detected: Option<(&str, &str)>,
+        action_taken: &str,
+        blocked_providers: &[String],
+    ) {
+        if let Some((provider, network)) = detected {
+            let mut event = SecurityEvent::new(
+                crate::event_types::EVENT_CLOUD_BLOCKED,
+                client_ip,
+                action_taken,
+                "Cloud provider IP detected",
+                "middleware",
+            );
+            event
+                .metadata
+                .insert(String::from("provider"), serde_json::Value::from(provider));
+            event
+                .metadata
+                .insert(String::from("network"), serde_json::Value::from(network));
+            self.send_event(&event);
+        }
+        if !blocked_providers.is_empty() {
+            let mut event = SecurityEvent::new(
+                crate::event_types::EVENT_DECORATOR_VIOLATION,
+                client_ip,
+                action_taken,
+                "Cloud provider IP blocked",
+                "middleware",
+            );
+            event.metadata.insert(
+                String::from("decorator_type"),
+                serde_json::Value::from("access_control"),
+            );
+            event.metadata.insert(
+                String::from("violation_type"),
+                serde_json::Value::from("cloud_provider"),
+            );
+            event.metadata.insert(
+                String::from("blocked_providers"),
+                serde_json::Value::from(blocked_providers.to_vec()),
+            );
+            self.send_event(&event);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +583,69 @@ mod tests {
         assert_eq!(EVENT_TYPE_VALUES.len(), 39);
         assert!(EVENT_TYPE_VALUES.contains(&EVENT_PENETRATION_ATTEMPT));
         assert!(EVENT_TYPE_VALUES.contains(&EVENT_PATTERN_ANOMALY_STATISTICAL_ANOMALY));
+    }
+    #[test]
+    fn the_named_emitters_carry_the_reference_envelopes() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        let bus = SecurityEventBus::new(true).on_event(std::sync::Arc::new(
+            move |event: &SecurityEvent| {
+                sink.lock().expect("sink").push(event.clone());
+            },
+        ));
+
+        bus.send_https_violation_event("192.0.2.9", "http", "https://h/p", false);
+        bus.send_https_violation_event("192.0.2.9", "http", "https://h/p", true);
+        bus.send_cloud_detection_events(
+            "192.0.2.9",
+            Some(("AWS", "203.0.113.0/24")),
+            "request_blocked",
+            &["AWS".to_owned()],
+        );
+        // No detection and no blocked list: nothing emits.
+        bus.send_cloud_detection_events("192.0.2.9", None, "logged_only", &[]);
+
+        let seen = seen.lock().expect("sink").clone();
+        assert_eq!(seen.len(), 4);
+        assert_eq!(seen[0].event_type, crate::event_types::EVENT_HTTPS_ENFORCED);
+        assert_eq!(seen[0].action_taken, "https_redirect");
+        assert_eq!(
+            seen[0]
+                .metadata
+                .get("redirect_url")
+                .and_then(serde_json::Value::as_str),
+            Some("https://h/p")
+        );
+        assert_eq!(
+            seen[1].event_type,
+            crate::event_types::EVENT_DECORATOR_VIOLATION
+        );
+        assert_eq!(
+            seen[1]
+                .metadata
+                .get("violation_type")
+                .and_then(serde_json::Value::as_str),
+            Some("require_https")
+        );
+        assert_eq!(seen[2].event_type, crate::event_types::EVENT_CLOUD_BLOCKED);
+        assert_eq!(
+            seen[2]
+                .metadata
+                .get("provider")
+                .and_then(serde_json::Value::as_str),
+            Some("AWS")
+        );
+        assert_eq!(
+            seen[3].event_type,
+            crate::event_types::EVENT_DECORATOR_VIOLATION
+        );
+        assert_eq!(
+            seen[3]
+                .metadata
+                .get("violation_type")
+                .and_then(serde_json::Value::as_str),
+            Some("cloud_provider")
+        );
     }
 }
 
