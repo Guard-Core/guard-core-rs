@@ -87,6 +87,7 @@ use std::task::{Context, Poll};
 use ::tower::Layer;
 use http::{Extensions, HeaderMap, Request, Response, StatusCode};
 
+use crate::logging::LogLevel;
 use crate::tower::{ExtractIp, IpGateDecision, StageResponse, default_extract_ip};
 pub use guard_core_engine::geo::{
     CountryBlock, CountryGate, GeoIpHandler, check_countries, generic_list_block_reason,
@@ -181,6 +182,82 @@ impl GeoStage {
     #[must_use]
     pub const fn config(&self) -> &GeoStageConfig {
         &self.config
+    }
+
+    /// The reference `_log_country_check_result` as a composer: the
+    /// verdict kind re-derives over the same gate and handler the stage
+    /// decides under, the level selection mirrors the reference exactly -
+    /// blocked rides `log_suspicious_level`, whitelisted and
+    /// not-affected ride `log_country_check_level` (`None` silences
+    /// either), and the no-rules / no-geolocation / loopback-exempt arms
+    /// always compose at `DEBUG`. `Some((level, line))` is what the host
+    /// logs; `None` composes nothing.
+    #[must_use]
+    pub fn country_check_log(
+        &self,
+        ip: Option<IpAddr>,
+        log_suspicious_level: Option<LogLevel>,
+        log_country_check_level: Option<LogLevel>,
+    ) -> Option<(LogLevel, String)> {
+        let ip_text = ip.map_or_else(|| UNKNOWN_CLIENT_IP.to_owned(), |addr| addr.to_string());
+        if !self.config.gate.has_rules() {
+            return Some((
+                LogLevel::Debug,
+                format!(
+                    "No countries blocked or whitelisted {ip_text} - No countries blocked or whitelisted"
+                ),
+            ));
+        }
+        if ip.is_some_and(|addr| addr.is_loopback()) {
+            return Some((
+                LogLevel::Debug,
+                format!("Loopback IP exempt from country allowlist check {ip_text}"),
+            ));
+        }
+        let handler = NoopHandler(self.config.handler.as_deref());
+        let country = ip.and_then(|addr| handler.get_country(addr));
+        let Some(country) = country.filter(|code| !code.is_empty()) else {
+            return Some((
+                LogLevel::Debug,
+                format!("IP not geolocated {ip_text} - IP geolocation failed"),
+            ));
+        };
+        // `_evaluate_country_access`: a whitelist is restrictive.
+        let (kind, level) = if !self.config.gate.whitelist_countries.is_empty() {
+            if self
+                .config
+                .gate
+                .whitelist_countries
+                .iter()
+                .any(|code| code == &country)
+            {
+                ("whitelisted", log_country_check_level)
+            } else {
+                ("blocked", log_suspicious_level)
+            }
+        } else if self
+            .config
+            .gate
+            .blocked_countries
+            .iter()
+            .any(|code| code == &country)
+        {
+            ("blocked", log_suspicious_level)
+        } else {
+            ("not_affected", log_country_check_level)
+        };
+        let line = match kind {
+            "blocked" => {
+                format!("IP from blocked country {ip_text} - {country} - IP from blocked country")
+            }
+            "whitelisted" => format!(
+                "IP from whitelisted country {ip_text} - {country} - IP from whitelisted country"
+            ),
+            _ => format!(
+                "IP not from blocked or whitelisted country {ip_text} - {country} - IP not from blocked or whitelisted country"
+            ),
+        };
+        level.map(|level| (level, line))
     }
 
     /// One pass of the stage: `ip` is the extracted client identity and
@@ -429,6 +506,138 @@ mod tests {
         })
     }
 
+    #[test]
+    fn the_country_verdict_lines_follow_the_reference_levels() {
+        use crate::logging::LogLevel;
+
+        // Whitelisted: rides log_country_check_level.
+        let stage = GeoStage::new(GeoStageConfig {
+            gate: parse_country_lists(["DE"], [] as [&str; 0]),
+            handler: Some(Arc::new(Fixed("DE"))),
+            passive_mode: false,
+        });
+        let (level, line) = stage
+            .country_check_log(
+                Some(ip("203.0.113.7")),
+                Some(LogLevel::Warning),
+                Some(LogLevel::Info),
+            )
+            .expect("composes");
+        assert_eq!(level, LogLevel::Info);
+        assert_eq!(
+            line,
+            "IP from whitelisted country 203.0.113.7 - DE - IP from whitelisted country"
+        );
+
+        // A None country level silences the non-block verdicts.
+        assert!(
+            stage
+                .country_check_log(Some(ip("203.0.113.7")), Some(LogLevel::Warning), None)
+                .is_none()
+        );
+
+        // A restrictive whitelist blocks the unlisted: rides
+        // log_suspicious_level like a blocklist block.
+        let restrictive = GeoStage::new(GeoStageConfig {
+            gate: parse_country_lists(["DE"], [] as [&str; 0]),
+            handler: Some(Arc::new(Fixed("RU"))),
+            passive_mode: false,
+        });
+        let (level, line) = restrictive
+            .country_check_log(
+                Some(ip("192.0.2.1")),
+                Some(LogLevel::Warning),
+                Some(LogLevel::Info),
+            )
+            .expect("composes");
+        assert_eq!(level, LogLevel::Warning);
+        assert_eq!(
+            line,
+            "IP from blocked country 192.0.2.1 - RU - IP from blocked country"
+        );
+
+        // Blocked: rides log_suspicious_level.
+        let stage = blocklist_stage();
+        let (level, line) = stage
+            .country_check_log(
+                Some(ip("192.0.2.1")),
+                Some(LogLevel::Warning),
+                Some(LogLevel::Info),
+            )
+            .expect("composes");
+        assert_eq!(level, LogLevel::Warning);
+        assert_eq!(
+            line,
+            "IP from blocked country 192.0.2.1 - RU - IP from blocked country"
+        );
+        // A None suspicious level silences the blocked verdict too.
+        assert!(
+            stage
+                .country_check_log(Some(ip("192.0.2.1")), None, Some(LogLevel::Info))
+                .is_none()
+        );
+
+        // Not affected: rides log_country_check_level.
+        let (level, line) = stage
+            .country_check_log(
+                Some(ip("192.0.2.2")),
+                Some(LogLevel::Warning),
+                Some(LogLevel::Info),
+            )
+            .expect("composes");
+        assert_eq!(level, LogLevel::Info);
+        assert_eq!(
+            line,
+            "IP not from blocked or whitelisted country 192.0.2.2 - DE - IP not from blocked or whitelisted country"
+        );
+
+        // No rules: always DEBUG.
+        let stage = GeoStage::new(GeoStageConfig {
+            gate: parse_country_lists([] as [&str; 0], [] as [&str; 0]),
+            handler: Some(Arc::new(Fixed("DE"))),
+            passive_mode: false,
+        });
+        let (level, line) = stage
+            .country_check_log(
+                Some(ip("192.0.2.2")),
+                Some(LogLevel::Warning),
+                Some(LogLevel::Info),
+            )
+            .expect("composes");
+        assert_eq!(level, LogLevel::Debug);
+        assert!(
+            line.contains("No countries blocked or whitelisted 192.0.2.2"),
+            "{line}"
+        );
+
+        // Loopback: always DEBUG, before geolocation.
+        let stage = whitelist_stage();
+        let (level, line) = stage
+            .country_check_log(
+                Some(ip("127.0.0.1")),
+                Some(LogLevel::Warning),
+                Some(LogLevel::Info),
+            )
+            .expect("composes");
+        assert_eq!(level, LogLevel::Debug);
+        assert!(line.contains("Loopback IP exempt"), "{line}");
+
+        // Unresolvable: always DEBUG.
+        let stage = GeoStage::new(GeoStageConfig {
+            gate: parse_country_lists(["US"], [] as [&str; 0]),
+            handler: None,
+            passive_mode: false,
+        });
+        let (level, line) = stage
+            .country_check_log(
+                Some(ip("192.0.2.2")),
+                Some(LogLevel::Warning),
+                Some(LogLevel::Info),
+            )
+            .expect("composes");
+        assert_eq!(level, LogLevel::Debug);
+        assert!(line.contains("IP not geolocated"), "{line}");
+    }
     #[test]
     fn blocklist_blocks_only_the_listed_country() {
         let stage = blocklist_stage();

@@ -215,6 +215,13 @@ pub struct ObservabilityConfig {
     /// `log_suspicious_level`, `"WARNING"` in the reference; `None` means
     /// the reference's `level=None` (compose nothing).
     pub log_suspicious_level: Option<LogLevel>,
+    /// `log_request_level`: the request-logging check's level (`None` is
+    /// the reference default - the check does not exist in the pipeline).
+    pub log_request_level: Option<LogLevel>,
+    /// `log_country_check_level`: the per-request country verdicts that
+    /// are not blocks (`"INFO"` in the reference; `None` silences them;
+    /// blocked countries ride `log_suspicious_level` instead).
+    pub log_country_check_level: Option<LogLevel>,
     /// `muted_check_logs`: check names suppressed from pipeline logging.
     pub muted_check_logs: Option<HashSet<String>>,
     /// The merged sensitive-name sets for the redaction.
@@ -3337,6 +3344,8 @@ mod tests {
             log_suspicious_level: Some(LogLevel::Warning),
             muted_check_logs: None,
             sensitive: SensitiveNames::default(),
+            log_request_level: None,
+            log_country_check_level: None,
         })
         .on_block(hook)
         .build()
@@ -3366,6 +3375,8 @@ mod tests {
             log_suspicious_level: Some(LogLevel::Warning),
             muted_check_logs: None,
             sensitive: SensitiveNames::default(),
+            log_request_level: None,
+            log_country_check_level: None,
         })
         .on_block(hook)
         .build()
@@ -3405,6 +3416,8 @@ mod tests {
             log_suspicious_level: Some(LogLevel::Warning),
             muted_check_logs: None,
             sensitive: SensitiveNames::default(),
+            log_request_level: None,
+            log_country_check_level: None,
         })
         .on_block(hook)
         .build()
