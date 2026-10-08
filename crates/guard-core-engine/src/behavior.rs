@@ -107,6 +107,10 @@ pub struct BehaviorTracker {
     return_patterns: HashMap<String, HashMap<String, Vec<f64>>>,
     status_patterns: HashMap<String, u16>,
     regex_patterns: HashMap<String, Regex>,
+    /// The usage windows: `endpoint_id -> client_ip -> timestamps` (the
+    /// reference `usage_counts` bucket shape, `track_endpoint_usage`'s
+    /// in-memory store).
+    usage_counts: HashMap<String, HashMap<String, Vec<f64>>>,
 }
 
 /// The default response-body prefix the reference reads for a non-`status:`
@@ -126,6 +130,43 @@ impl BehaviorTracker {
         self.return_patterns.clear();
         self.status_patterns.clear();
         self.regex_patterns.clear();
+        self.usage_counts.clear();
+    }
+
+    /// `track_endpoint_usage`: record one request observation for
+    /// `(endpoint_id, client_ip)` inside the rule's window, and answer
+    /// whether the rule tripped (`len(timestamps) > threshold`, the
+    /// reference's strict comparison). `now` is the caller's clock (the
+    /// reference `time.time()` float; [`unix_now`] converts).
+    pub fn track_endpoint_usage(
+        &mut self,
+        endpoint_id: &str,
+        client_ip: &str,
+        rule: &BehaviorRule,
+        now: f64,
+    ) -> bool {
+        let window_start = now - f64::from(u32::try_from(rule.window).unwrap_or(u32::MAX));
+        let bucket = self.usage_counts.entry(endpoint_id.to_owned()).or_default();
+        let timestamps = bucket.entry(client_ip.to_owned()).or_default();
+        timestamps.retain(|ts| *ts >= window_start);
+        timestamps.push(now);
+        timestamps.len() > usize::try_from(rule.threshold).unwrap_or(usize::MAX)
+    }
+
+    /// `get_recent_event_count`: how many tracked events any endpoint
+    /// recorded for `ip` inside `window_seconds` (the reference walks
+    /// every endpoint bucket's timestamps for the identity).
+    #[must_use]
+    pub fn get_recent_event_count(&self, ip: &str, window_seconds: u64, now: f64) -> usize {
+        if ip.is_empty() {
+            return 0;
+        }
+        let cutoff = now - f64::from(u32::try_from(window_seconds).unwrap_or(u32::MAX));
+        self.usage_counts
+            .values()
+            .filter_map(|bucket| bucket.get(ip))
+            .map(|timestamps| timestamps.iter().filter(|ts| **ts >= cutoff).count())
+            .sum()
     }
 
     /// `track_return_pattern`: record one response observation for
@@ -336,6 +377,39 @@ mod tests {
             ban_duration: Some(900),
             correlate_with_detection: false,
         }
+    }
+
+    #[test]
+    fn usage_windows_count_per_identity_and_trip_at_the_threshold() {
+        let base = BehaviorRule {
+            rule_type: "usage".to_owned(),
+            threshold: 2,
+            window: 60,
+            pattern: String::new(),
+            action: "ban".to_owned(),
+            ban_duration: None,
+            correlate_with_detection: false,
+        };
+        let mut tracker = BehaviorTracker::new();
+        // Two observations: under the strict threshold.
+        assert!(!tracker.track_endpoint_usage("GET:/api", "192.0.2.10", &base, 1_000.0));
+        assert!(!tracker.track_endpoint_usage("GET:/api", "192.0.2.10", &base, 1_001.0));
+        // The third observation crosses (len > threshold).
+        assert!(tracker.track_endpoint_usage("GET:/api", "192.0.2.10", &base, 1_002.0));
+        // A second identity counts independently.
+        assert!(!tracker.track_endpoint_usage("GET:/api", "192.0.2.11", &base, 1_003.0));
+        // A second endpoint counts independently for the same identity.
+        assert!(!tracker.track_endpoint_usage("POST:/api", "192.0.2.10", &base, 1_004.0));
+
+        // The full history answers inside a wide window.
+        assert_eq!(tracker.get_recent_event_count("192.0.2.10", 3_600, 1_050.0), 4);
+        // Sliding: a 60s window read at 1062 drops the 1000/1001 stamps.
+        assert_eq!(tracker.get_recent_event_count("192.0.2.10", 60, 1_062.0), 2);
+        // The reference's empty-identity guard.
+        assert_eq!(tracker.get_recent_event_count("", 60, 1_050.0), 0);
+
+        // Re-crossing after the slide: the stale stamps drop first.
+        assert!(!tracker.track_endpoint_usage("GET:/api", "192.0.2.10", &base, 1_070.0));
     }
 
     #[test]
