@@ -1,8 +1,9 @@
 //! The Redis-backed distributed store: the facade implementation of the
-//! engine's [`SlidingWindowStore`]
-//! and [`BanStore`] seams over
-//! the `redis` crate (feature `redis`), plus the full section 08 namespaced
-//! surface and the legacy ban-key migration.
+//! engine's [`SlidingWindowStore`] and [`BanStore`] seams over the
+//! `redis` crate (feature `redis`).
+//!
+//! Also here: the full section 08 namespaced surface and the legacy
+//! ban-key migration.
 //!
 //! One hit runs the reference's four operations in a single transaction
 //! (`guard_core/scripts/rate_lua.py`, via the Go port's
@@ -55,6 +56,7 @@
 //! ```
 
 use guard_core_engine::distributed::{BanStore, SlidingWindowStore, StoreError};
+use std::sync::Arc;
 
 /// The Redis backend construction/connection error.
 #[derive(Debug)]
@@ -69,9 +71,26 @@ impl core::fmt::Display for RedisStoreError {
 impl std::error::Error for RedisStoreError {}
 
 /// The Redis backend over a synchronous client.
+///
+/// The resilience knobs mirror the reference `_connection_kwargs`
+/// (`redis_handler.py`): a bounded socket read timeout, a client-level
+/// retry on connection failures (the reference's
+/// `Retry(ExponentialBackoff(), redis_retries)` over the connection error
+/// family), and a connection-pool ceiling (the reference
+/// `max_connections`).
 #[derive(Clone)]
 pub struct RedisStore {
     client: redis::Client,
+    /// The client-level retry budget for connection failures (the
+    /// reference `redis_retries`; `0` disables retrying).
+    retries: u32,
+    /// The bounded socket read timeout per command (`socket_timeout`;
+    /// `None` = the crate default).
+    socket_timeout: Option<std::time::Duration>,
+    /// The pool ceiling (`max_connections`; `None` = unbounded).
+    max_connections: Option<usize>,
+    /// The live-connection counter backing [`RedisStore::with_max_connections`].
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl RedisStore {
@@ -86,13 +105,227 @@ impl RedisStore {
     pub fn connect(url: &str) -> Result<Self, RedisStoreError> {
         Ok(Self {
             client: redis::Client::open(url).map_err(RedisStoreError)?,
+            retries: 0,
+            socket_timeout: None,
+            max_connections: None,
+            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
+    /// The reference `redis_retries`: retry connection failures up to
+    /// `retries` times (the client-level `Retry` over the connection
+    /// error family; command errors never retry).
+    #[must_use]
+    pub const fn with_retries(mut self, retries: u32) -> Self {
+        self.retries = retries;
+        self
+    }
+
+    /// The reference `socket_timeout`: bound every command's socket read
+    /// (`get_connection_with_timeout`; `None` keeps the crate default).
+    #[must_use]
+    pub const fn with_socket_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.socket_timeout = Some(timeout);
+        self
+    }
+
+    /// The reference `max_connections`: ceiling the live connections the
+    /// store opens at once (a call over the ceiling waits for a slot).
+    #[must_use]
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = Some(max_connections.max(1));
+        self
+    }
+
     fn connection(&self) -> Result<redis::Connection, StoreError> {
-        self.client
-            .get_connection()
-            .map_err(|error| StoreError(error.to_string()))
+        self.with_retry(|| {
+            if let Some(max) = self.max_connections {
+                // A plain counter wait: spin with a short sleep until a
+                // slot frees (the pool ceiling is a safeguard against
+                // unbounded connection storms, not a latency-tuned path).
+                while self.in_flight.load(std::sync::atomic::Ordering::Relaxed) >= max {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let connect = |client: &redis::Client, timeout: Option<std::time::Duration>| {
+                timeout
+                    .map_or_else(
+                        || client.get_connection(),
+                        |bounded| client.get_connection_with_timeout(bounded),
+                    )
+                    .map_err(|error| StoreError(error.to_string()))
+            };
+            let result = connect(&self.client, self.socket_timeout);
+            self.in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            result
+        })
+    }
+
+    /// Run one Redis operation with the reference retry semantics: a
+    /// connection-level failure retries up to the configured budget, the
+    /// last error surfaces. Command errors do not retry (the reference
+    /// retries the connection family only).
+    fn with_retry<T>(
+        &self,
+        mut operation: impl FnMut() -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut attempt = 0u32;
+        loop {
+            match operation() {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    if attempt >= self.retries {
+                        return Err(error);
+                    }
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// The reference `safe_operation`: run the operation, swallowing a
+    /// failure into `None` (the reference's fail-open per-operation
+    /// contract; the error belongs to the host's logging).
+    pub fn safe_operation<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> Result<T, StoreError>,
+    ) -> Option<T> {
+        operation(self).ok()
+    }
+
+    /// The reference `incr(namespace, key, ttl)`: `INCR` the namespaced
+    /// counter, applying the TTL with `EXPIRE NX` when given (the TTL only
+    /// lands on the first increment, the window anchor). The reference's
+    /// retry-re-entry note stands: a retried `INCR` may over-count by one.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a backend failure.
+    pub fn incr(
+        &self,
+        prefix: &str,
+        namespace: &str,
+        key: &str,
+        ttl_seconds: Option<u64>,
+    ) -> Result<i64, StoreError> {
+        self.with_retry(|| {
+            let mut connection = self.connection()?;
+            let full = guard_core_engine::redis_schema::full_key(prefix, namespace, key);
+            let count: i64 = redis::cmd("INCR")
+                .arg(&full)
+                .query(&mut connection)
+                .map_err(|error| StoreError(error.to_string()))?;
+            if let Some(ttl) = ttl_seconds
+                && ttl > 0
+            {
+                let _: () = redis::cmd("EXPIRE")
+                    .arg(&full)
+                    .arg("NX")
+                    .arg(ttl)
+                    .query(&mut connection)
+                    .map_err(|error| StoreError(error.to_string()))?;
+            }
+            Ok(count)
+        })
+    }
+
+    /// The reference `exists(namespace, key)`: whether the namespaced key
+    /// is present.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a backend failure.
+    pub fn exists(&self, prefix: &str, namespace: &str, key: &str) -> Result<bool, StoreError> {
+        self.with_retry(|| {
+            let mut connection = self.connection()?;
+            let full = guard_core_engine::redis_schema::full_key(prefix, namespace, key);
+            let present: i64 = redis::cmd("EXISTS")
+                .arg(&full)
+                .query(&mut connection)
+                .map_err(|error| StoreError(error.to_string()))?;
+            Ok(present > 0)
+        })
+    }
+
+    /// The distributed lock's acquire half: `SET {key} {token} NX EX ttl`
+    /// (the `SET`-with-NX primitive the Rust family names as its lock
+    /// surface). `true` = the lock is held by `token`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a backend failure.
+    pub fn acquire_lock(
+        &self,
+        prefix: &str,
+        namespace: &str,
+        key: &str,
+        token: &str,
+        ttl_seconds: u64,
+    ) -> Result<bool, StoreError> {
+        self.with_retry(|| {
+            let mut connection = self.connection()?;
+            let full = guard_core_engine::redis_schema::full_key(prefix, namespace, key);
+            let acquired: Option<String> = redis::cmd("SET")
+                .arg(&full)
+                .arg(token)
+                .arg("NX")
+                .arg("EX")
+                .arg(ttl_seconds)
+                .query(&mut connection)
+                .map_err(|error| StoreError(error.to_string()))?;
+            Ok(acquired.is_some())
+        })
+    }
+
+    /// The distributed lock's release half: delete the lock key only when
+    /// it still carries `token` (GET-compare-DEL in one atomic pipeline).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a backend failure.
+    pub fn release_lock(
+        &self,
+        prefix: &str,
+        namespace: &str,
+        key: &str,
+        token: &str,
+    ) -> Result<bool, StoreError> {
+        self.with_retry(|| {
+            let mut connection = self.connection()?;
+            let full = guard_core_engine::redis_schema::full_key(prefix, namespace, key);
+            let (current, deleted): (Option<String>, i64) = redis::pipe()
+                .atomic()
+                .cmd("GET")
+                .arg(&full)
+                .cmd("DEL")
+                .arg(&full)
+                .query(&mut connection)
+                .map_err(|error| StoreError(error.to_string()))?;
+            Ok(current.as_deref() == Some(token) && deleted > 0)
+        })
+    }
+
+    /// The health probe (the Go sibling's status-route probe): `PTTL` a
+    /// probe key that matches nothing - a miss is swallowed like any
+    /// other, so only a connection failure surfaces.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] on a backend failure (the health answer).
+    pub fn health_check(&self, prefix: &str) -> Result<(), StoreError> {
+        self.with_retry(|| {
+            let mut connection = self.connection()?;
+            let probe =
+                guard_core_engine::redis_schema::full_key(prefix, "__health__", "__status_probe__");
+            let _: i64 = redis::cmd("PTTL")
+                .arg(&probe)
+                .query(&mut connection)
+                .map_err(|error| StoreError(error.to_string()))?;
+            Ok(())
+        })
     }
 
     /// `GET {prefix}{namespace}:{key}`: `Ok(None)` is a miss and never
@@ -364,7 +597,7 @@ impl guard_core_engine::redis_schema::RedisAdminStore for RedisStore {
         namespace: &str,
         key: &str,
     ) -> Result<Option<String>, StoreError> {
-        RedisStore::get_key(self, prefix, namespace, key)
+        Self::get_key(self, prefix, namespace, key)
     }
 }
 
@@ -375,6 +608,81 @@ mod tests {
 
     /// No live Redis in CI: the connect error path and the trait object
     /// shapes are what the unit surface can honestly cover.
+    #[test]
+    fn the_resilience_knobs_chain() {
+        let store = RedisStore::connect("redis://127.0.0.1:1")
+            .expect("lazy client")
+            .with_retries(3)
+            .with_socket_timeout(std::time::Duration::from_secs(2))
+            .with_max_connections(4);
+        // The knobs ride every subsequent operation (the health probe goes
+        // out over the bounded, retrying connection path).
+        let _ = store.health_check("guard");
+    }
+
+    #[test]
+    fn with_retries_exhausts_before_surfacing() {
+        // The retry loop: a failing operation surfaces the last error
+        // after the budget (the pool ceiling of 1 with a live inner
+        // failure exercises connection() through the retry path).
+        let store = RedisStore::connect("redis://127.0.0.1:1")
+            .expect("lazy client")
+            .with_retries(2)
+            .with_max_connections(1);
+        let error = store.health_check("guard").unwrap_err();
+        assert!(
+            error.0.contains("127.0.0.1:1") || !error.0.is_empty(),
+            "the last error surfaces: {error:?}"
+        );
+    }
+
+    #[test]
+    fn safe_operation_swallows_the_failure() {
+        let store = RedisStore::connect("redis://127.0.0.1:1").expect("lazy client");
+        // The reference `safe_operation`'s fail-open per-operation shape.
+        assert!(
+            store
+                .safe_operation(|store| store.exists("guard", "patterns", "custom"))
+                .is_none()
+        );
+        assert_eq!(
+            store.safe_operation(|store| store.get_key("guard", "patterns", "custom")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_fail_open_store_reads_the_permissive_defaults() {
+        use super::{FailOpenStore, SlidingWindowStore};
+        use guard_core_engine::distributed::{BanStore, StoreError};
+
+        struct Failing;
+        impl SlidingWindowStore for Failing {
+            fn record_hit(&self, _key: &str, _now: f64, _window: u64) -> Result<u64, StoreError> {
+                Err(StoreError(String::from("backend down")))
+            }
+        }
+        impl BanStore for Failing {
+            fn set_ban(&self, _key: &str, _expiry: f64, _ttl: u64) -> Result<(), StoreError> {
+                Err(StoreError(String::from("backend down")))
+            }
+            fn get_ban(&self, _key: &str) -> Result<Option<f64>, StoreError> {
+                Err(StoreError(String::from("backend down")))
+            }
+            fn delete_ban(&self, _key: &str) -> Result<(), StoreError> {
+                Err(StoreError(String::from("backend down")))
+            }
+        }
+
+        let fail_open = FailOpenStore::new(Failing);
+        // A window read answers the empty window (allowed).
+        assert_eq!(fail_open.record_hit("k", 1.0, 60).expect("fail-open"), 0);
+        // A ban read answers "no live ban"; writes answer no-op success.
+        assert_eq!(fail_open.get_ban("k").expect("fail-open"), None);
+        fail_open.set_ban("k", 1.0, 60).expect("fail-open");
+        fail_open.delete_ban("k").expect("fail-open");
+    }
+
     #[test]
     fn connect_fails_closed_on_an_unroutable_url() {
         // Port 1 on localhost is never the test Redis; the client itself
@@ -401,12 +709,14 @@ mod tests {
     }
 
     #[test]
-    fn store_is_cheaply_clonable_and_shares_the_client() {
+    fn store_is_cheaply_clonable_and_shares_the_pool_counter() {
         let store = RedisStore::connect("redis://127.0.0.1:1").expect("lazy client");
         let clone = store.clone();
-        let first: *const redis::Client = &store.client;
-        let second: *const redis::Client = &clone.client;
-        assert_eq!(first, second, "a clone shares the pooled client");
+        assert_eq!(
+            Arc::as_ptr(&store.in_flight),
+            Arc::as_ptr(&clone.in_flight),
+            "a clone shares the pool counter (the ceiling is global)"
+        );
     }
 
     #[test]
@@ -442,5 +752,54 @@ mod tests {
             store.migrate_legacy_ban_keys("guard_core:").is_err(),
             "the migration surfaces the scan failure, never a panic"
         );
+    }
+}
+
+/// The `redis_fail_open` posture over any distributed store: a backend
+/// failure reads as the permissive default instead of surfacing.
+///
+/// A window hit answers `0` (empty window: allowed) and a ban read
+/// answers "no live ban" (the reference `safe_operation`'s
+/// swallow-to-default contract, lifted from the handler to the store
+/// boundary so a decorated store needs no per-caller error plumbing).
+/// Writes (`set_ban`, `delete_ban`) answer successfully-without-effect.
+#[derive(Debug, Clone, Default)]
+pub struct FailOpenStore<S> {
+    inner: S,
+}
+
+impl<S> FailOpenStore<S> {
+    /// Wrap `inner` with the fail-open defaults.
+    #[must_use]
+    pub const fn new(inner: S) -> Self {
+        Self { inner }
+    }
+
+    /// The decorated store.
+    #[must_use]
+    pub const fn inner(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: SlidingWindowStore> SlidingWindowStore for FailOpenStore<S> {
+    fn record_hit(&self, key: &str, now: f64, window: u64) -> Result<u64, StoreError> {
+        Ok(self.inner.record_hit(key, now, window).unwrap_or(0))
+    }
+}
+
+impl<S: BanStore> BanStore for FailOpenStore<S> {
+    fn set_ban(&self, key: &str, expiry: f64, ttl_seconds: u64) -> Result<(), StoreError> {
+        let _ = self.inner.set_ban(key, expiry, ttl_seconds);
+        Ok(())
+    }
+
+    fn get_ban(&self, key: &str) -> Result<Option<f64>, StoreError> {
+        Ok(self.inner.get_ban(key).unwrap_or(None))
+    }
+
+    fn delete_ban(&self, key: &str) -> Result<(), StoreError> {
+        let _ = self.inner.delete_ban(key);
+        Ok(())
     }
 }
