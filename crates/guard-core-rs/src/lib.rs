@@ -81,6 +81,7 @@ pub mod enrichment;
 pub mod event_types;
 pub mod events;
 pub mod geo;
+pub mod geo_lifecycle;
 pub mod headers_auth;
 pub mod https_enforcement;
 pub mod logging;
