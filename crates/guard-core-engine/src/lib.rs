@@ -23,6 +23,7 @@ pub mod geo;
 pub mod headers_auth;
 pub mod https_enforcement;
 pub mod ip_ban;
+pub mod ip_extraction;
 pub mod ip_gate;
 pub mod json_walk;
 pub mod multipart_scan;
