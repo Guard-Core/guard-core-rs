@@ -75,6 +75,7 @@ pub mod cloud_fetch;
 pub mod cloud_provider;
 pub mod composite;
 pub mod custom_checks;
+pub mod dynamic_rules;
 pub mod emergency_mode;
 pub mod enrichment;
 pub mod event_types;
