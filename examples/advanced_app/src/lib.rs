@@ -46,6 +46,9 @@ pub const DEFAULT_CONFIG: DetectConfig = DetectConfig {
     semantic_threshold: 0.7,
     threat_score_threshold: 1.0,
     binary_min_run_length: 16,
+    max_scan_values: 512,
+    max_scan_chars: 65_536,
+    max_json_depth: 32,
 };
 
 /// Request body handed to the guards: wire body or rebuilt buffered bytes.
@@ -335,6 +338,9 @@ pub fn env_config() -> DetectConfig {
             "GUARD_BINARY_MIN_RUN_LENGTH",
             defaults.binary_min_run_length,
         ),
+        max_scan_values: env_usize("GUARD_MAX_SCAN_VALUES", defaults.max_scan_values),
+        max_scan_chars: env_usize("GUARD_MAX_SCAN_CHARS", defaults.max_scan_chars),
+        max_json_depth: env_usize("GUARD_MAX_JSON_DEPTH", defaults.max_json_depth),
     }
 }
 

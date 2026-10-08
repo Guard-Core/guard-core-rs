@@ -28,6 +28,9 @@ pub fn detect(content: &str, request_context: &str, knobs: &Knobs) -> Verdict {
         // `detection_binary_min_run_length` existed; the reference default
         // applies and body extraction is not part of the recorded surface.
         binary_min_run_length: 16,
+        max_scan_values: 512,
+        max_scan_chars: 65_536,
+        max_json_depth: 32,
     };
     let verdict = detect::detect(content, request_context, &config);
 

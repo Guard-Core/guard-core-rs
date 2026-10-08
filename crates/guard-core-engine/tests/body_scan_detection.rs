@@ -22,6 +22,9 @@ const fn corpus_config() -> DetectConfig {
         semantic_threshold: 0.7,
         threat_score_threshold: 1.0,
         binary_min_run_length: 16,
+        max_scan_values: 512,
+        max_scan_chars: 65_536,
+        max_json_depth: 32,
     }
 }
 

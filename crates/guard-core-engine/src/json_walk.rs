@@ -636,6 +636,7 @@ pub(crate) fn append_json_walk_entries(
     root: &JsonNode,
     context: &str,
     excluded: crate::body_scan::ExcludedBodyFields<'_>,
+    depth_cap: usize,
 ) -> Vec<BodyScanValue> {
     let allow_leaf_reparse = context != REQUEST_BODY_CONTEXT;
     // Frames are consumed in order; the reference uses a LIFO stack and pushes
@@ -674,7 +675,7 @@ pub(crate) fn append_json_walk_entries(
         }
         let node = frame.node;
         if node.is_object {
-            if frame.depth >= JSON_WALK_DEPTH_CAP {
+            if frame.depth >= depth_cap {
                 values.push(BodyScanValue::plain(serialize_compact_json(node), context));
                 continue;
             }
@@ -687,7 +688,7 @@ pub(crate) fn append_json_walk_entries(
                 });
             }
         } else if node.is_array {
-            if frame.depth >= JSON_WALK_DEPTH_CAP {
+            if frame.depth >= depth_cap {
                 values.push(BodyScanValue::plain(serialize_compact_json(node), context));
                 continue;
             }
@@ -709,6 +710,7 @@ pub(crate) fn append_json_walk_entries(
                     &inner,
                     &format!("{context}{EMBEDDED_JSON_LEAF_CONTEXT_SUFFIX}"),
                     excluded,
+                    depth_cap,
                 );
                 continue;
             }
@@ -812,6 +814,7 @@ mod tests {
                     &root,
                     context,
                     crate::body_scan::ExcludedBodyFields::default(),
+                    JSON_WALK_DEPTH_CAP,
                 )
                 .into_iter()
                 .map(|v| (v.context, v.content, v.forced_category))
@@ -1153,6 +1156,7 @@ mod gap_tests {
             &node,
             REQUEST_BODY_CONTEXT,
             ExcludedBodyFields::default(),
+            JSON_WALK_DEPTH_CAP,
         );
         // the rewind lands two chars into the failed second escape, so the
         // trailing digits rescan as literal text
@@ -1178,6 +1182,7 @@ mod gap_tests {
             &node,
             REQUEST_BODY_CONTEXT,
             ExcludedBodyFields::default(),
+            JSON_WALK_DEPTH_CAP,
         );
         assert!(values.iter().any(|value| value.content == "1e+5"));
     }
@@ -1191,6 +1196,7 @@ mod gap_tests {
             &node,
             REQUEST_BODY_CONTEXT,
             ExcludedBodyFields::new(&excluded),
+            JSON_WALK_DEPTH_CAP,
         );
         let keys: Vec<&str> = values.iter().map(|value| value.content.as_str()).collect();
         assert!(!keys.contains(&"password"));
@@ -1208,6 +1214,7 @@ mod gap_tests {
             &node,
             REQUEST_BODY_CONTEXT,
             ExcludedBodyFields::default(),
+            JSON_WALK_DEPTH_CAP,
         );
         assert!(values.iter().any(|value| value.content == "{\"k\":1}"));
     }

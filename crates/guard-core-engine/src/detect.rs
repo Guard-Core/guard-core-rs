@@ -44,6 +44,43 @@ pub struct DetectConfig {
     /// multipart file-part payload must reach before the run is handed to the
     /// pattern scan (see [`crate::binary_islands`]).
     pub binary_min_run_length: usize,
+    /// `detection_max_scan_values` (reference default 512): the per-request
+    /// scan budget counting values handed to [`detect`]; once the count
+    /// crosses the cap the remaining request values are not scanned (the
+    /// fail-open signal the reference logs once).
+    pub max_scan_values: usize,
+    /// `detection_max_scan_chars` (reference default 65536): the
+    /// per-request character budget, accounted at the same per-value point
+    /// as `max_scan_values`; once the consumed count reaches the cap the
+    /// remaining request values are not scanned.
+    pub max_scan_chars: usize,
+    /// `detection_max_json_depth` (reference default 32): the JSON walk's
+    /// semantic depth cap; containers at or beyond this nesting serialize
+    /// back to compact JSON and scan as text (see [`crate::json_walk`]).
+    pub max_json_depth: usize,
+}
+
+impl Default for DetectConfig {
+    /// The reference defaults from `_security_config_fields.py`: the
+    /// reference `detection_max_content_length` (ten thousand), the
+    /// reference `detection_max_body_inspect_bytes` (262,144), preserved
+    /// patterns, the 0.7 / 1.0 thresholds, the reference binary run
+    /// length (16), the reference `detection_max_scan_values` (512), the
+    /// reference `detection_max_scan_chars` (65,536), and the reference
+    /// `detection_max_json_depth` (32).
+    fn default() -> Self {
+        Self {
+            max_content_length: 10_000,
+            max_full_scan_bytes: 262_144,
+            preserve_attack_patterns: true,
+            semantic_threshold: 0.7,
+            threat_score_threshold: 1.0,
+            binary_min_run_length: 16,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
+        }
+    }
 }
 
 /// One threat, regex or semantic, exactly as the reference emits it.
@@ -306,7 +343,24 @@ mod tests {
             semantic_threshold: 0.7,
             threat_score_threshold: 1.0,
             binary_min_run_length: 16,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
         }
+    }
+
+    #[test]
+    fn the_config_defaults_carry_the_reference_values() {
+        let config = DetectConfig::default();
+        assert_eq!(config.max_content_length, 10_000);
+        assert_eq!(config.max_full_scan_bytes, 262_144);
+        assert!(config.preserve_attack_patterns);
+        assert!((config.semantic_threshold - 0.7).abs() < f64::EPSILON);
+        assert!((config.threat_score_threshold - 1.0).abs() < f64::EPSILON);
+        assert_eq!(config.binary_min_run_length, 16);
+        assert_eq!(config.max_scan_values, 512);
+        assert_eq!(config.max_scan_chars, 65_536);
+        assert_eq!(config.max_json_depth, 32);
     }
 
     #[test]
@@ -487,6 +541,9 @@ mod gap_tests {
             semantic_threshold: 0.7,
             threat_score_threshold: 1.0,
             binary_min_run_length: 16,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
         }
     }
 

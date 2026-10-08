@@ -1081,6 +1081,9 @@ pub fn run_case(
         // Spec 4.1.0 predates `detection_binary_min_run_length`; the
         // reference default applies (same pin the detect runner makes).
         binary_min_run_length: 16,
+        max_scan_values: 512,
+        max_scan_chars: 65_536,
+        max_json_depth: 32,
     };
     let engine = CaseEngine::new(case, detect_config)?;
     let mut observed = Vec::new();
@@ -1249,6 +1252,9 @@ mod tests {
             semantic_threshold: 0.8,
             threat_score_threshold: 8.0,
             binary_min_run_length: 16,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
         }
     }
 
@@ -2008,6 +2014,9 @@ mod unit_twins {
             semantic_threshold: 0.7,
             threat_score_threshold: 1.0,
             binary_min_run_length: 16,
+            max_scan_values: 512,
+            max_scan_chars: 65_536,
+            max_json_depth: 32,
         }
     }
 
