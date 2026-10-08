@@ -258,6 +258,26 @@ const fn v6_mask(prefix: u8) -> u128 {
 struct ProviderRanges {
     networks: Vec<Network>,
     regions: HashMap<String, String>,
+    /// The unix-second stamp of the last `set_provider_ranges` write (the
+    /// reference `last_updated` entry the status payload serves;
+    /// `None` until the first load).
+    last_refreshed: Option<i64>,
+}
+
+/// One cloud provider's row of the status payload (the reference
+/// `cloud_handler.get_status` shape).
+///
+/// Whether ranges are loaded, the unix-second stamp of the last load, and
+/// how many networks the provider carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderStatus {
+    /// Whether any ranges are loaded (`ready`).
+    pub ready: bool,
+    /// The unix-second stamp of the last range load (`last_refreshed`;
+    /// `None` for a provider that never loaded, the reference's `null`).
+    pub last_refreshed: Option<i64>,
+    /// How many networks the provider carries (`entries`).
+    pub entries: usize,
 }
 
 /// The provider ranges the block check consults.
@@ -303,10 +323,17 @@ impl CloudIpTable {
             }
             networks.push(network);
         }
-        self.inner
-            .write()
-            .expect("cloud provider table")
-            .insert(provider.to_owned(), ProviderRanges { networks, regions });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| i64::try_from(elapsed.as_secs()).unwrap_or(0));
+        self.inner.write().expect("cloud provider table").insert(
+            provider.to_owned(),
+            ProviderRanges {
+                networks,
+                regions,
+                last_refreshed: Some(now),
+            },
+        );
         Ok(())
     }
 
@@ -328,6 +355,30 @@ impl CloudIpTable {
             .expect("cloud provider table")
             .get(provider)
             .is_some_and(|ranges| !ranges.networks.is_empty())
+    }
+
+    /// One provider's status row (the reference `get_status` payload
+    /// shape): `ready`, the `last_refreshed` stamp (`None` = the
+    /// reference's `null`), and the `entries` count. An unloaded provider
+    /// answers `ready:false`, `None`, `0`.
+    #[must_use]
+    pub fn provider_status(&self, provider: &str) -> ProviderStatus {
+        self.inner
+            .read()
+            .expect("cloud provider table")
+            .get(provider)
+            .map_or(
+                ProviderStatus {
+                    ready: false,
+                    last_refreshed: None,
+                    entries: 0,
+                },
+                |ranges| ProviderStatus {
+                    ready: !ranges.networks.is_empty(),
+                    last_refreshed: ranges.last_refreshed,
+                    entries: ranges.networks.len(),
+                },
+            )
     }
 
     /// The reference `is_cloud_ip`: whether `ip` falls inside a blocked
@@ -481,6 +532,58 @@ mod tests {
         let table = CloudIpTable::default();
         assert!(!table.is_cloud_ip(ip("203.0.113.9"), &selectors));
         assert!(!table.provider_is_ready("AWS"));
+    }
+
+    #[test]
+    fn provider_status_answers_the_reference_row_shape() {
+        let table = CloudIpTable::default();
+        // Unloaded: the reference's ready:false / null / 0 row.
+        assert_eq!(
+            table.provider_status("AWS"),
+            ProviderStatus {
+                ready: false,
+                last_refreshed: None,
+                entries: 0,
+            }
+        );
+
+        // Loaded: ready, stamped, and the entry count.
+        table
+            .set_provider_ranges(
+                "AWS",
+                vec![
+                    ("203.0.113.0/24".to_owned(), None),
+                    ("198.51.100.0/24".to_owned(), Some("us-east-1".to_owned())),
+                ],
+            )
+            .expect("valid ranges");
+        let row = table.provider_status("AWS");
+        assert!(row.ready);
+        assert!(row.last_refreshed.is_some(), "the load stamps the row");
+        assert_eq!(row.entries, 2);
+
+        // A replacement reloads the stamp (the refresh's swap shape).
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        table
+            .set_provider_ranges("AWS", vec![("203.0.113.0/24".to_owned(), None)])
+            .expect("valid ranges");
+        let reloaded = table.provider_status("AWS");
+        assert!(
+            reloaded.last_refreshed > row.last_refreshed,
+            "the reload stamps forward"
+        );
+        assert_eq!(reloaded.entries, 1);
+
+        // A cleared provider answers the unloaded row again.
+        table.clear_provider("AWS");
+        assert_eq!(
+            table.provider_status("AWS"),
+            ProviderStatus {
+                ready: false,
+                last_refreshed: None,
+                entries: 0,
+            }
+        );
     }
 
     #[test]
