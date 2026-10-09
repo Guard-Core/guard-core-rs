@@ -553,7 +553,7 @@ mod tests {
             decision.details,
             Some(("GCP".to_owned(), "192.0.2.0/24".to_owned()))
         );
-        let events = seen.lock().expect("sink");
+        let events = seen.lock().expect("sink").clone();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, EVENT_CLOUD_BLOCKED);
         assert_eq!(events[0].metadata["cloud_provider"], "GCP");

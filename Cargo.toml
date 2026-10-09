@@ -22,8 +22,8 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [workspace.dependencies]
-guard-core-rs = { path = "crates/guard-core-rs", version = "4.3.1" }
-guard-core-engine = { path = "crates/guard-core-engine", version = "4.3.1" }
+guard-core-rs = { path = "crates/guard-core-rs", version = "4.3.2" }
+guard-core-engine = { path = "crates/guard-core-engine", version = "4.3.2" }
 
 criterion             = { version = "0.8.2", default-features = false }
 html-escape           = "0.2.13"

@@ -1,6 +1,6 @@
 [package]
 name         = "guard-core-conformance"
-version      = "4.3.1"
+version      = "4.3.2"
 publish      = false
 edition      = { workspace = true }
 license      = { workspace = true }

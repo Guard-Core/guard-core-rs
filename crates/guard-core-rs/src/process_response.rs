@@ -473,7 +473,7 @@ mod tests {
             response.headers.contains_key("X-Content-Type-Options"),
             "the security headers survive the panicking modifier"
         );
-        let seen = seen.lock().expect("sink");
+        let seen = seen.lock().expect("sink").clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, "custom_response_modifier");
     }
