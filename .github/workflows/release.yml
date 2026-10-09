@@ -106,12 +106,15 @@ jobs:
   publish:
     name: Publish to crates.io
     needs: tag-consistency
-    if: github.event_name == 'release'
+    # Trusted publishing (crates.io enforces it for these crates): the job
+    # exchanges the Actions OIDC token via id-token: write. workflow_dispatch
+    # is allowed so a publish can be re-driven after a partial failure
+    # (master's crate versions must match the intended release).
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+      id-token: write
     steps:
       - name: Checkout release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,7 +134,11 @@ jobs:
       - name: Publish guard-core-engine
         run: |
           for attempt in 1 2 3; do
-            if cargo publish -p guard-core-engine; then
+            if cargo publish -p guard-core-engine 2>&1 | tee /tmp/engine.log; then
+              exit 0
+            fi
+            if grep -q "already exists" /tmp/engine.log; then
+              echo "guard-core-engine already published - continuing"
               exit 0
             fi
             echo "attempt $attempt failed; retrying in 30s"
@@ -143,7 +150,11 @@ jobs:
       - name: Publish guard-core-rs
         run: |
           for attempt in 1 2 3; do
-            if cargo publish -p guard-core-rs; then
+            if cargo publish -p guard-core-rs 2>&1 | tee /tmp/facade.log; then
+              exit 0
+            fi
+            if grep -q "already exists" /tmp/facade.log; then
+              echo "guard-core-rs already published - continuing"
               exit 0
             fi
             echo "attempt $attempt failed; retrying in 30s"
