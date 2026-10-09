@@ -127,19 +127,30 @@ jobs:
         with:
           rustflags: ""
 
+      # crates.io trusted publishing: exchange the workflow's OIDC identity
+      # for a short-lived publish token (cargo does not speak OIDC itself).
+      - name: Resolve the crates.io publish token (trusted publishing)
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+
       # guard-core-rs depends on guard-core-engine, so the engine must go
       # first. Each publish is retried up to 3 times (crates.io transient
-      # 5xx). NOTE on reruns: crates.io rejects re-uploading an identical
-      # version, so if guard-core-engine already landed and only the
-      # facade failed, re-run only the "Publish guard-core-rs" step.
+      # 5xx). A version already on crates.io (the partial-failure rerun)
+      # skips via the registry check, so a re-drive never blocks on the
+      # identical-version rejection.
       - name: Publish guard-core-engine
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
+          set -o pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          published=$(curl -fsSL -A "guard-core-rs release (https://github.com/Guard-Core/guard-core-rs)" "https://crates.io/api/v1/crates/guard-core-engine" | jq -r .crate.max_version || true)
+          if [ "$published" = "$tag" ]; then
+            echo "guard-core-engine $tag is already on crates.io; skipping"
+            exit 0
+          fi
           for attempt in 1 2 3; do
             if cargo publish -p guard-core-engine 2>&1 | tee /tmp/engine.log; then
-              exit 0
-            fi
-            if grep -q "already exists" /tmp/engine.log; then
-              echo "guard-core-engine already published - continuing"
               exit 0
             fi
             echo "attempt $attempt failed; retrying in 30s"
@@ -149,7 +160,10 @@ jobs:
           exit 1
 
       - name: Publish guard-core-rs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
+          set -o pipefail
           for attempt in 1 2 3; do
             if cargo publish -p guard-core-rs 2>&1 | tee /tmp/facade.log; then
               exit 0
