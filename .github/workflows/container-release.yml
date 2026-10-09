@@ -1,0 +1,67 @@
+name: Publish Containerized Demo
+
+on:
+  release:
+    types: [created]
+  push:
+    branches:
+      - master
+    paths:
+      - 'examples/**'
+      - '.github/workflows/container-release.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: container-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish-container:
+    name: Build and push the containerized demo
+    runs-on: ubuntu-latest
+    # A cold Rust release build of the demo stack takes several minutes;
+    # keep the budget generous.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set version tag
+        id: set_version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "VERSION=${{ github.event.release.tag_name }}" >> "$GITHUB_ENV"
+            echo "IS_RELEASE=true" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=latest" >> "$GITHUB_ENV"
+            echo "IS_RELEASE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the demo image
+        run: |
+          docker compose -f examples/advanced_app/docker-compose.yml build advanced-app
+
+      - name: Tag and push to GHCR
+        run: |
+          docker tag guard-core-rs-advanced-app:local ghcr.io/guard-core/guard-core-rs-example:latest
+          docker push ghcr.io/guard-core/guard-core-rs-example:latest
+
+          if [[ "${{ env.IS_RELEASE }}" == "true" ]]; then
+            docker tag guard-core-rs-advanced-app:local ghcr.io/guard-core/guard-core-rs-example:${{ env.VERSION }}
+            docker push ghcr.io/guard-core/guard-core-rs-example:${{ env.VERSION }}
+          fi
