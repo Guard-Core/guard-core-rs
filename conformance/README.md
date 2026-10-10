@@ -17,7 +17,7 @@ conformance/
     ├── CORPUS.md                  vendored corpus provenance + sha256 manifest
     └── cases/                     byte-identical copy of guard-core specs/fixtures/cases/
         ├── index.json
-        └── (12 suite files, 184 cases, 0 baselined xfails)
+        └── (22 suite files, 375 cases, engine 4.3.2 stamp, 6 baselined xfails)
 ```
 
 Runner code lives in the `guard-core-conformance` workspace crate

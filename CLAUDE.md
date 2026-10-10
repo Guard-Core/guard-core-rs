@@ -56,9 +56,9 @@ Honest state of the port. Verify rather than trust; numbers below were read from
 
 ### Conformance
 
-- Vendored spec 4.1.0 corpus (`conformance/guard-core-spec-4.1.0/`, pinned at reference commit `0122af02`): **17 suites, 219 cases**, of which the runner consumes the 12 `kind: detect` suites (**184 cases**); the 5 `kind: pipeline` suites (35 cases) are pinned for the go/php/ts pipeline runners.
+- Vendored spec 4.1.0 corpus (`conformance/guard-core-spec-4.1.0/`, regenerated at engine 4.3.2, `engine_commit 5895798` per `cases/index.json`): **22 suites, 375 cases**, of which the runner consumes the 13 `kind: detect` suites (**193 cases**, `cost_bodies` included), the 5 `kind: pipeline` suites (35 cases), and `safety_gates` (94 cases); `event_stream` (39) and `redis_interop` (14) are not consumed by the Rust runner yet (no event-bus capture seam, no Redis driver), documented in `conformance/guard-core-spec-4.1.0/CORPUS.md`.
 - **Pattern translation ledger** (`conformance/pattern_ledger.toml`): every corpus pattern must compile as-is or have a recorded, corpus-verified translation; anything else fails CI.
-- **xfail baseline** (`conformance/xfail_baseline.toml`): **0 baselined cases**. The engine runs the full 4.x detect pipeline (pattern table across the scan views) and passes the detect corpus; the gate reports **184 passed / 0 xfail** with zero drift.
+- **xfail baseline** (`conformance/xfail_baseline.toml`): **6 baselined cases** (the `safety_gates` cost-verdict class: reference Python-re timing facts, not Rust divergences). The engine runs the full 4.x detect pipeline (pattern table across the scan views) and passes the detect corpus; the gates report **193 passed / 0 xfail** (detect), **35 passed / 0 xfail** (pipeline), and **88 passed / 6 xfail** (safety_gates) with zero drift.
 - Drift handling is **fail-closed**: an unbaselined failure fails the gate, a baselined-but-passing (stale) xfail fails the gate, and an unbaselined not-run case fails the gate.
 
 ### Not yet implemented
