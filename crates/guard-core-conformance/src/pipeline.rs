@@ -1729,7 +1729,10 @@ mod tests {
             load_pipeline_suites(&stale_engine)
                 .err()
                 .unwrap()
-                .starts_with("suite pipeline_ip_control engine_version '4.3.1' does not match")
+                .starts_with(&format!(
+                    "suite pipeline_ip_control engine_version '{}' does not match",
+                    shipped_engine_version()
+                ))
         );
 
         // declared case count mismatch
@@ -1761,7 +1764,7 @@ mod tests {
     fn sample_index() -> corpus::IndexFile {
         corpus::IndexFile {
             spec_version: "4.1.0".to_owned(),
-            engine_version: "4.3.1".to_owned(),
+            engine_version: shipped_engine_version(),
             engine_commit: "deadbeef".to_owned(),
             fixed_ip: "10.0.0.1".to_owned(),
             config_knobs: json!({}),
@@ -1947,6 +1950,19 @@ mod tests {
         let suite: PipelineSuiteFile =
             serde_json::from_str(&raw).expect("the vendored suite parses");
         suite.cases.len()
+    }
+
+    /// The `engine_version` stamped on the vendored pipeline suite, so the pin
+    /// tests track the corpus revision instead of hard-coding one.
+    fn shipped_engine_version() -> String {
+        let raw = std::fs::read_to_string(corpus::corpus_dir().join("pipeline_ip_control.json"))
+            .expect("the vendored pipeline suite ships with the crate");
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).expect("the vendored suite parses");
+        value["engine_version"]
+            .as_str()
+            .expect("the vendored suite stamps engine_version")
+            .to_owned()
     }
 }
 

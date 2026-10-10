@@ -415,7 +415,7 @@ respectively), and the trusted-proxies seam stays on the stage builder
 ## What is not implemented (fail-closed honesty)
 
 The port targets spec 4.1.0; the detect stage passes the corpus gate
-(184 cases, zero xfail). The remaining parity gaps are pipeline-side and
+(193 cases, zero xfail). The remaining parity gaps are pipeline-side and
 listed here rather than hidden:
 
 - **Config, pipeline, and handler parity gaps**: no Redis-backed

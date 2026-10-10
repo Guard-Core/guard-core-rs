@@ -9,7 +9,7 @@ pattern detection) plus the pipeline-side surfaces the adapters consume
 (rate limiting, IP bans, geo country rules, cloud provider checks, security
 headers, events, responses), with a spec 4.1.0 conformance harness.
 
-The detect stage passes the vendored spec 4.1.0 corpus (184 cases, zero
+The detect stage passes the vendored spec 4.1.0 corpus (193 cases, zero
 xfail) and the pipeline gate replays the five spec 4.1.0 pipeline suites
 (security headers, CORS, the response-side `process_response` pass with the
 behavior-rule engine, the suspicious-activity `400` answer, and the route
@@ -31,7 +31,7 @@ honesty section rather than hidden.
 - The `detect` pipeline: the spec 4.1.0 `SusPatternsManager.detect`
   equivalent, with reference view passes and scoring semantics
 - A conformance harness pinning behavior against the vendored spec 4.1.0
-  corpus (184 detect cases across 12 suites, zero baselined xfail)
+  corpus (193 detect cases across 13 suites, zero baselined xfail)
 
 ## Ecosystem position
 

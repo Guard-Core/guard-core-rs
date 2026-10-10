@@ -160,7 +160,7 @@ ___
 
 ## Status
 
-Production port of the Python engine, tracked against guard-core 4.1.x with a conformance corpus (spec 4.1.0, 184 detect cases, zero xfail). Used by the Rust adapters: [tower-guard-rs](https://github.com/Guard-Core/tower-guard-rs), [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs), [actix-guard-rs](https://github.com/Guard-Core/actix-guard-rs), and [rocket-guard-rs](https://github.com/Guard-Core/rocket-guard-rs).
+Production port of the Python engine, tracked against guard-core 4.1.x with a conformance corpus (spec 4.1.0, 193 detect cases, zero xfail). Used by the Rust adapters: [tower-guard-rs](https://github.com/Guard-Core/tower-guard-rs), [axum-guard-rs](https://github.com/Guard-Core/axum-guard-rs), [actix-guard-rs](https://github.com/Guard-Core/actix-guard-rs), and [rocket-guard-rs](https://github.com/Guard-Core/rocket-guard-rs).
 
 Docs: https://guard-core.github.io/guard-core-rs/
 
