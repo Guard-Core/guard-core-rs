@@ -2,6 +2,16 @@
 
 All notable changes to this project.
 
+## [4.3.3] - 2026-10-12
+
+### Added
+
+- `guard_core_rs::VERSION`, the crate version constant, so the agent can report which core it runs with.
+
+### Changed
+
+- The workspace moves to 4.3.3 so all five core engines (Python, TypeScript, Rust, Go, PHP) ship the same version.
+
 ## [4.3.2] - 2026-10-09
 
 ### Added

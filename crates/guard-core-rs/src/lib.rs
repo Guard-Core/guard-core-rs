@@ -100,6 +100,8 @@ pub mod sus_patterns;
 pub mod tower;
 pub mod user_agent;
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use guard_core_engine::compiler;
 pub use guard_core_engine::decorators;
 pub use guard_core_engine::detect;
@@ -108,3 +110,13 @@ pub use guard_core_engine::preprocessor;
 pub use guard_core_engine::referrer;
 pub use guard_core_engine::semantic;
 pub use guard_core_engine::time_window;
+
+#[cfg(test)]
+mod tests {
+    use super::VERSION;
+
+    #[test]
+    fn version_is_the_crate_package_version() {
+        assert_eq!(VERSION, "4.3.3");
+    }
+}
