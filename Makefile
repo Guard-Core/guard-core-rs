@@ -13,6 +13,7 @@ test:
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --exclude guard-core-python -- -D warnings
+	cargo clippy -p guard-core-python --all-targets --all-features -- -D warnings
 
 # Auto-fix formatting and clippy suggestions where possible
 fix:
