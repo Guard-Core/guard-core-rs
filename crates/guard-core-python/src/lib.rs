@@ -283,6 +283,8 @@ fn detect_verdict(
         semantic_threshold,
         threat_score_threshold,
         binary_min_run_length,
+        // Scan budgets and JSON depth are not exposed on this boundary: reference defaults.
+        ..guard_core_engine::detect::DetectConfig::default()
     };
     let verdict = guard_core_engine::detect::detect(content, request_context, &config);
 

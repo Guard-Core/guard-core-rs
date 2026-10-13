@@ -59,6 +59,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --exclude guard-core-python -- -D warnings
 
+      - name: Clippy (PyO3 bindings, all features)
+        run: cargo clippy -p guard-core-python --all-targets --all-features -- -D warnings
+
       - name: Test
         run: cargo test --workspace --exclude guard-core-python
 
