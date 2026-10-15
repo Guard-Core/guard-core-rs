@@ -77,7 +77,9 @@ use guard_core_engine::behavior::{
     BehaviorAction, BehaviorRule, BehaviorTracker, DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
     unix_now,
 };
-use guard_core_engine::cors::{CorsConfig, cors_response_headers, downgrade_wildcard_credentials};
+use guard_core_engine::cors::{
+    CorsConfig, cors_handler_headers, cors_response_headers, downgrade_wildcard_credentials,
+};
 
 use guard_core_engine::ip_ban::IpBanManager;
 pub use guard_core_engine::payload::{RequestBits, ResponseBits};
@@ -339,6 +341,15 @@ impl ResponseProcessor {
         // The reference `apply_modifier`: the callback runs LAST over the
         // finished response view.
         self.apply_modifier(request, response);
+
+        // The adapter's `_inject_cors_headers` (the reference
+        // `CorsHandler.build_response_headers`) lands after the modifier:
+        // `Vary: Origin` and the exposed headers.
+        if let Some(cors) = self.cors.as_ref() {
+            for (name, value) in cors_handler_headers(cors, request.origin.as_deref()) {
+                response.headers.insert(name, value);
+            }
+        }
 
         last_action
     }

@@ -162,10 +162,7 @@ fn parse_ip_literal(value: &str) -> Option<(IpAddr, Option<&str>)> {
 /// collapses to its IPv4 text unless it carries a zone (the reference keeps
 /// the zoned spelling distinct).
 fn literal_text(addr: IpAddr, zone: Option<&str>) -> String {
-    match zone {
-        Some(zone) => format!("{addr}%{zone}"),
-        None => canonical_ip_text(addr),
-    }
+    zone.map_or_else(|| canonical_ip_text(addr), |zone| format!("{addr}%{zone}"))
 }
 
 /// `_canonicalize_ip`: canonical text for a parseable address (an
@@ -204,10 +201,12 @@ pub fn forwarded_header_ips(forwarded_for: &str) -> Vec<String> {
         .collect()
 }
 
-/// `_proxy_matches` / `_is_trusted_proxy`: the connecting text must parse
-/// as an address; a bare entry then compares as text (the `unix` token never
-/// matches a real peer, and an IPv4-mapped spelling is a different text from
-/// its IPv4 form), a CIDR entry contains the address within its own family.
+/// `_proxy_matches` / `_is_trusted_proxy`.
+///
+/// The connecting text must parse as an address; a bare entry then compares
+/// as text (the `unix` token never matches a real peer, and an IPv4-mapped
+/// spelling is a different text from its IPv4 form), a CIDR entry contains
+/// the address within its own family.
 #[must_use]
 pub fn is_trusted_proxy(connecting: &str, trusted_proxies: &[String]) -> bool {
     let Some((addr, _zone)) = parse_ip_literal(connecting) else {
@@ -431,7 +430,8 @@ pub struct ClientResolution {
     pub reject: bool,
 }
 
-/// The reference client resolution an adapter runs per request:
+/// The reference client resolution an adapter runs per request.
+///
 /// `extract_client_ip` over the connecting `peer`, the raw
 /// `X-Forwarded-For` header, `trusted_proxies` and `trusted_proxy_depth`,
 /// plus the `handle_passthrough` rule for a request with no peer address

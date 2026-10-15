@@ -209,6 +209,7 @@ mod tests {
     /// `(raw, normalized, excluded by the defaults, excluded by "/",
     /// excluded by ["/static/", "/a/./b/../c"], excluded by "/%73tatic")`,
     /// recorded from the reference `path_matching.py`.
+    #[allow(clippy::type_complexity)]
     const REFERENCE: &[(&str, Option<&str>, bool, bool, bool, bool)] = &[
         (
             "/static/app.js",

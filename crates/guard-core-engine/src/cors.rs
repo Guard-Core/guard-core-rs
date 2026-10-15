@@ -52,6 +52,9 @@ pub struct CorsConfig {
     pub allow_methods: Vec<String>,
     pub allow_headers: Vec<String>,
     pub allow_credentials: bool,
+    /// The reference `cors_expose_headers`: the response headers a browser
+    /// script may read (`Access-Control-Expose-Headers`); empty sends none.
+    pub expose_headers: Vec<String>,
     /// The reference `cors_max_age` (600 by default): the preflight
     /// cache lifetime the `Access-Control-Max-Age` header carries.
     pub max_age: u64,
@@ -68,6 +71,7 @@ impl Default for CorsConfig {
                 .collect(),
             allow_headers: vec!["*".to_owned()],
             allow_credentials: false,
+            expose_headers: Vec::new(),
             max_age: 600,
         }
     }
@@ -146,6 +150,28 @@ pub fn cors_response_headers(cors: &CorsConfig, origin: Option<&str>) -> BTreeMa
     headers
 }
 
+/// The headers `CorsHandler.build_response_headers` adds to the response pass.
+///
+/// The adapter's `_inject_cors_headers` applies them to every response after
+/// the modifier: `Vary: Origin`, and `Access-Control-Expose-Headers` when
+/// `cors_expose_headers` is set. Empty exactly when [`cors_response_headers`]
+/// is (no CORS, no Origin, or a disallowed origin).
+#[must_use]
+pub fn cors_handler_headers(cors: &CorsConfig, origin: Option<&str>) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
+    if cors_response_headers(cors, origin).is_empty() {
+        return headers;
+    }
+    headers.insert("Vary".to_owned(), "Origin".to_owned());
+    if !cors.expose_headers.is_empty() {
+        headers.insert(
+            "Access-Control-Expose-Headers".to_owned(),
+            cors.expose_headers.join(", "),
+        );
+    }
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +184,7 @@ mod tests {
             allow_methods: vec!["GET".to_owned(), "POST".to_owned()],
             allow_headers: vec!["content-type".to_owned(), "x-custom".to_owned()],
             allow_credentials: true,
+            expose_headers: Vec::new(),
             max_age: 900,
         };
         let answer = build_preflight_response(
@@ -213,6 +240,7 @@ mod tests {
             allow_methods: vec!["GET".to_owned()],
             allow_headers: vec!["content-type".to_owned()],
             allow_credentials: false,
+            expose_headers: Vec::new(),
             max_age: 600,
         };
         let answer = build_preflight_response(
@@ -251,6 +279,7 @@ mod tests {
             allow_methods: vec!["PATCH".to_owned()],
             allow_headers: vec!["*".to_owned()],
             allow_credentials: false,
+            expose_headers: Vec::new(),
             max_age: 600,
         };
         let answer = build_preflight_response(
@@ -395,6 +424,31 @@ mod tests {
             Some("true")
         );
     }
+    #[test]
+    fn the_handler_headers_add_vary_and_the_exposed_headers() {
+        let mut cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["https://app.example.com".to_owned()],
+            expose_headers: vec!["X-Request-Id".to_owned(), "X-Trace".to_owned()],
+            ..CorsConfig::default()
+        };
+        let headers = cors_handler_headers(&cors, Some("https://app.example.com"));
+        assert_eq!(headers.get("Vary").map(String::as_str), Some("Origin"));
+        assert_eq!(
+            headers
+                .get("Access-Control-Expose-Headers")
+                .map(String::as_str),
+            Some("X-Request-Id, X-Trace")
+        );
+        // Nothing for a disallowed origin, no origin, or a disabled switch.
+        assert!(cors_handler_headers(&cors, Some("https://evil.example.com")).is_empty());
+        assert!(cors_handler_headers(&cors, None).is_empty());
+        cors.expose_headers.clear();
+        let headers = cors_handler_headers(&cors, Some("https://app.example.com"));
+        assert_eq!(headers.len(), 1, "only Vary without exposed headers");
+        cors.enabled = false;
+        assert!(cors_handler_headers(&cors, Some("https://app.example.com")).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -419,6 +473,7 @@ mod coverage_tests {
             allow_methods: Vec::new(),
             allow_headers: Vec::new(),
             allow_credentials: false,
+            expose_headers: Vec::new(),
             max_age: 600,
         };
         assert!(cors_response_headers(&empty, Some("https://good")).is_empty());
