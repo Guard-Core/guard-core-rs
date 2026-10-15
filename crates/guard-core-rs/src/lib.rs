@@ -119,6 +119,6 @@ mod tests {
 
     #[test]
     fn version_is_the_crate_package_version() {
-        assert_eq!(VERSION, "4.3.3");
+        assert_eq!(VERSION, "4.4.0");
     }
 }

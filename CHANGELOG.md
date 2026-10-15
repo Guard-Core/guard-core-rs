@@ -2,7 +2,15 @@
 
 All notable changes to this project.
 
-## [Unreleased]
+## [4.4.0] - 2026-10-15
+
+### Breaking
+
+- `WiringError` gains the `Config(SecurityConfigError)` variant, so an exhaustive `match` over it needs an arm. The four Rust adapters add the matching `GuardConfigError::Config` and `GuardConfigError::Agent` variants in their releases that move to this engine, which break exhaustive matches the same way.
+- `Wiring::from_security_config` (and `from_security_config_with`) now runs `SecurityConfig::validate` first, as the reference validates at construction. A config the validator rejects used to reach the stage constructors and now returns `WiringError::Config`; in particular an invalid IP list entry reports as `Config` instead of `IpGate`. `Wiring::build_unvalidated` is the unvalidated seam for a config the reference constraints reject.
+- `Threat` gains the `PatternTimeout` variant, so exhaustive matches need an arm.
+- `SecurityConfig` gains the public fields `detection_max_scan_seconds` and `excluded_semantic_detection_headers`, so a struct literal without `..Default::default()` stops compiling. `DetectionExclusionConfig` and `ResolvedExclusions` no longer derive `Eq` (they now carry an `f64`).
+- Behavior to know before upgrading: a route whitelist match no longer overrides a blocked country, the unknown client identity is denied on a route with an `ip_whitelist` or `whitelist_countries`, a dynamic rule version no longer carries over the previous version's changes (every version applies over the base config), a request body that does not arrive within `body_read_timeout` answers 408, and `enable_redis` without the `redis` feature still falls back to per process state instead of failing.
 
 ### Added
 
@@ -17,6 +25,13 @@ All notable changes to this project.
 - `Wiring::build_unvalidated`: the test seam for a config the reference constraints reject (a one second dynamic-rule poll, a value below a validated range). `WiringError::Config` carries the problems of `SecurityConfig::validate`.
 - `UNRESOLVED_ROUTE_STATUS`, `UNRESOLVED_ROUTE_MESSAGE`, `UNRESOLVED_ROUTE_REASON` and `UNRESOLVED_ROUTE_CHECK_NAME` (`route_config`) for `route_resolution_strict`, and `BODY_READ_TIMEOUT_STATUS` and `BODY_READ_TIMEOUT_MESSAGE` (`request_limits`) for the request-body part of `body_read_timeout`, shared by the adapters.
 - The reference's event-loop yield between patterns has no Rust counterpart: the scan is synchronous on the calling task
+- `excluded_semantic_detection_headers` (`SecurityConfig`, `DetectionExclusionConfig`, the route config and the `detection_exclusion` decorator): header names, matched case-insensitively after trimming and merged between the global and route sets, whose values skip the semantic analyzer only; regex category scanning of those headers is unchanged. Default empty. Ports the guard-core reference option
+
+### Fixed
+
+- The Cookie header is scanned one `name=value` pair at a time. As one value the semicolons between cookies counted as command separators in the semantic score, so an ordinary logged-in header (a JWT session cookie plus theme and `_ga`) reached 0.711 against the 0.7 threshold. Each pair now takes the normal header path and counts against the value budget; empty pairs are skipped and only spaces around a pair are trimmed. Ports guard-core #162
+- A passive-mode suspicious log line without trigger info (a rate-limit hit) keeps its reason (`[PASSIVE MODE] Suspicious activity detected ... - Reason: ...`) instead of dropping it under a `Penetration attempt` label, and the rate-limit stage passes its `passive_mode` to the log
+- Dynamic rule versions apply over the base config, not over the previous version (#140, #141). The retained base snapshot is restored before each version applies, so emergency mode no longer halves `auto_ban_threshold` again for every version, a field the new version does not set returns to the base value, and a different rule id no longer inherits the previous rule's changes. A delivery with a zero `auto_ban_threshold` or `auto_ban_duration` is rejected whole like the reference, and hydration only runs when `enable_dynamic_rules` is on. Ports guard-core #169
 
 ### Changed
 

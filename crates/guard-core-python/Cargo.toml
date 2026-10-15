@@ -1,6 +1,6 @@
 [package]
 name         = "guard-core-python"
-version      = "4.3.3"
+version      = "4.4.0"
 publish      = false
 edition      = { workspace = true }
 license      = { workspace = true }
