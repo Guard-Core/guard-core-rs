@@ -146,6 +146,32 @@ pub fn cors_response_headers(cors: &CorsConfig, origin: Option<&str>) -> BTreeMa
     headers
 }
 
+/// The headers `CorsHandler.build_response_headers` adds to the response pass.
+///
+/// The adapter's `_inject_cors_headers` applies them to every response after
+/// the modifier: `Vary: Origin`, and `Access-Control-Expose-Headers` when
+/// `cors_expose_headers` (`expose_headers`) is set. Empty exactly when [`cors_response_headers`]
+/// is (no CORS, no Origin, or a disallowed origin).
+#[must_use]
+pub fn cors_handler_headers(
+    cors: &CorsConfig,
+    expose_headers: &[String],
+    origin: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
+    if cors_response_headers(cors, origin).is_empty() {
+        return headers;
+    }
+    headers.insert("Vary".to_owned(), "Origin".to_owned());
+    if !expose_headers.is_empty() {
+        headers.insert(
+            "Access-Control-Expose-Headers".to_owned(),
+            expose_headers.join(", "),
+        );
+    }
+    headers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +420,30 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+    #[test]
+    fn the_handler_headers_add_vary_and_the_exposed_headers() {
+        let mut cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["https://app.example.com".to_owned()],
+            ..CorsConfig::default()
+        };
+        let expose = vec!["X-Request-Id".to_owned(), "X-Trace".to_owned()];
+        let headers = cors_handler_headers(&cors, &expose, Some("https://app.example.com"));
+        assert_eq!(headers.get("Vary").map(String::as_str), Some("Origin"));
+        assert_eq!(
+            headers
+                .get("Access-Control-Expose-Headers")
+                .map(String::as_str),
+            Some("X-Request-Id, X-Trace")
+        );
+        // Nothing for a disallowed origin, no origin, or a disabled switch.
+        assert!(cors_handler_headers(&cors, &expose, Some("https://evil.example.com")).is_empty());
+        assert!(cors_handler_headers(&cors, &expose, None).is_empty());
+        let headers = cors_handler_headers(&cors, &[], Some("https://app.example.com"));
+        assert_eq!(headers.len(), 1, "only Vary without exposed headers");
+        cors.enabled = false;
+        assert!(cors_handler_headers(&cors, &expose, Some("https://app.example.com")).is_empty());
     }
 }
 

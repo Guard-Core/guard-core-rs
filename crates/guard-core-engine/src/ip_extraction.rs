@@ -53,7 +53,7 @@
 use std::net::IpAddr;
 use std::str::FromStr;
 
-use crate::ip_gate::{canonical, parse_network_entry};
+use crate::ip_gate::IpNet;
 
 /// The reference `UNKNOWN_CLIENT_IDENTITY`: the identity a request with no
 /// connecting peer carries.
@@ -144,11 +144,33 @@ pub fn strip_forwarded_entry_port(value: &str) -> &str {
     }
 }
 
+/// An address literal as the reference `ip_address` reads it: the address,
+/// plus the IPv6 zone identifier when the literal carries one (`fe80::1%eth0`).
+/// `std` parses no zones, so the zone is split off here.
+fn parse_ip_literal(value: &str) -> Option<(IpAddr, Option<&str>)> {
+    match value.split_once('%') {
+        Some((address, zone)) if !zone.is_empty() && address.contains(':') => {
+            let addr = IpAddr::from_str(address).ok()?;
+            addr.is_ipv6().then_some((addr, Some(zone)))
+        }
+        Some(_) => None,
+        None => IpAddr::from_str(value).ok().map(|addr| (addr, None)),
+    }
+}
+
+/// `_canonical_ip_text` over a parsed literal: an IPv4-mapped address
+/// collapses to its IPv4 text unless it carries a zone (the reference keeps
+/// the zoned spelling distinct).
+fn literal_text(addr: IpAddr, zone: Option<&str>) -> String {
+    zone.map_or_else(|| canonical_ip_text(addr), |zone| format!("{addr}%{zone}"))
+}
+
 /// `_canonicalize_ip`: canonical text for a parseable address (an
 /// IPv4-mapped IPv6 collapses to its IPv4 text), the raw value otherwise.
 #[must_use]
 pub fn canonicalize_ip(value: &str) -> String {
-    IpAddr::from_str(strip_ip_brackets(value)).map_or_else(|_| value.to_owned(), canonical_ip_text)
+    parse_ip_literal(strip_ip_brackets(value))
+        .map_or_else(|| value.to_owned(), |(addr, zone)| literal_text(addr, zone))
 }
 
 /// `_canonical_ip_text`.
@@ -179,26 +201,30 @@ pub fn forwarded_header_ips(forwarded_for: &str) -> Vec<String> {
         .collect()
 }
 
-/// `_proxy_matches` / `_is_trusted_proxy`: a bare entry compares exactly
-/// (the `unix` token never matches a real peer), a CIDR entry contains the
-/// canonicalized address.
+/// `_proxy_matches` / `_is_trusted_proxy`.
+///
+/// The connecting text must parse as an address; a bare entry then compares
+/// as text (the `unix` token never matches a real peer, and an IPv4-mapped
+/// spelling is a different text from its IPv4 form), a CIDR entry contains
+/// the address within its own family.
 #[must_use]
 pub fn is_trusted_proxy(connecting: &str, trusted_proxies: &[String]) -> bool {
+    let Some((addr, _zone)) = parse_ip_literal(connecting) else {
+        return false;
+    };
     trusted_proxies.iter().any(|proxy| {
-        parse_network_entry(proxy).map_or_else(
-            || connecting == proxy,
-            |network| {
-                IpAddr::from_str(connecting)
-                    .is_ok_and(|addr| network.contains(canonical(addr)) || network.contains(addr))
-            },
-        )
+        if proxy.contains('/') {
+            IpNet::parse(proxy).is_some_and(|network| network.contains(addr))
+        } else {
+            connecting == proxy
+        }
     })
 }
 
-/// `_forwarded_header_candidate_addr`.
+/// `_forwarded_header_candidate_addr`: the parsed candidate and its text.
 #[must_use]
-fn candidate_addr(candidate: &str) -> Option<IpAddr> {
-    IpAddr::from_str(candidate).ok()
+fn candidate_addr(candidate: &str) -> Option<(IpAddr, Option<&str>)> {
+    parse_ip_literal(candidate)
 }
 
 /// `_forwarded_header_right_side_unlisted_count`.
@@ -324,7 +350,8 @@ pub fn extract_client_ip(
     trusted_proxies: &[String],
     proxy_depth: u32,
 ) -> ClientIpExtraction {
-    let Some(client_host) = client_host else {
+    // An empty peer is no peer (the reference tests `not request.client_host`).
+    let Some(client_host) = client_host.filter(|host| !host.is_empty()) else {
         // The socket arm: with `unix` on the proxy list the chain is still
         // walked, from the unknown identity (the reference `_handle` arm).
         if trusted_proxies.iter().any(|proxy| proxy == "unix") {
@@ -360,7 +387,7 @@ pub fn extract_client_ip(
         };
     }
 
-    if !is_trusted_proxy(&canonical_connecting, trusted_proxies) {
+    if !is_trusted_proxy(client_host, trusted_proxies) {
         return ClientIpExtraction {
             client_ip: canonical_connecting,
             source: ClientIpSource::Connecting,
@@ -375,6 +402,87 @@ pub fn extract_client_ip(
         proxy_depth,
         trusted_proxies,
     )
+}
+
+/// The status of the missing-client-address rejection (the reference
+/// `BypassHandler.handle_passthrough` 403).
+pub const UNRESOLVABLE_CLIENT_ADDRESS_STATUS: u16 = 403;
+
+/// The body of the missing-client-address rejection.
+pub const UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE: &str = "Client address could not be determined";
+
+/// The check name the rejection reports to the `on_block` hook
+/// (`UNRESOLVABLE_CLIENT_ADDRESS_CHECK_NAME`).
+pub const UNRESOLVABLE_CLIENT_ADDRESS_CHECK_NAME: &str = "client_address_unresolved";
+
+/// One request's client resolution: the identity the pipeline runs under
+/// and whether `fail_secure` rejects the request outright.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientResolution {
+    /// The extraction behind the identity (source, spoof flag, warnings).
+    pub extraction: ClientIpExtraction,
+    /// The identity as an address; `None` for the `unknown` identity (the
+    /// pipeline then runs unattributed, the reference's `"unknown"` run).
+    pub ip: Option<IpAddr>,
+    /// A peer-less request that resolves to `unknown` under `fail_secure`:
+    /// answer 403 [`UNRESOLVABLE_CLIENT_ADDRESS_MESSAGE`] before any check
+    /// (the reference `handle_passthrough`).
+    pub reject: bool,
+}
+
+/// The reference client resolution an adapter runs per request.
+///
+/// `extract_client_ip` over the connecting `peer`, the raw
+/// `X-Forwarded-For` header, `trusted_proxies` and `trusted_proxy_depth`,
+/// plus the `handle_passthrough` rule for a request with no peer address
+/// (`fail_secure` rejects it unless the `unix` proxy token lets the chain
+/// resolve it).
+///
+/// # Example
+///
+/// ```
+/// use guard_core_engine::ip_extraction::resolve_client;
+///
+/// // A peer-less request under fail_secure is rejected.
+/// assert!(resolve_client(None, None, &[], 1, true).reject);
+/// // A trusted proxy's chain decides the client.
+/// let resolution = resolve_client(
+///     Some("10.0.0.1".parse().unwrap()),
+///     Some("203.0.113.7"),
+///     &["10.0.0.0/8".to_owned()],
+///     1,
+///     true,
+/// );
+/// assert_eq!(resolution.ip, Some("203.0.113.7".parse().unwrap()));
+/// ```
+#[must_use]
+pub fn resolve_client(
+    peer: Option<IpAddr>,
+    forwarded_for: Option<&str>,
+    trusted_proxies: &[String],
+    proxy_depth: u32,
+    fail_secure: bool,
+) -> ClientResolution {
+    let peer_text = peer.map(|addr| addr.to_string());
+    let extraction = extract_client_ip(
+        peer_text.as_deref(),
+        forwarded_for,
+        trusted_proxies,
+        proxy_depth,
+    );
+    let unknown = extraction.client_ip == UNKNOWN_CLIENT_IDENTITY;
+    let ip = if unknown {
+        None
+    } else {
+        // A zoned identity has no `IpAddr` form (the zone is part of the identity).
+        parse_ip_literal(&extraction.client_ip)
+            .and_then(|(addr, zone)| zone.is_none().then_some(addr))
+    };
+    ClientResolution {
+        reject: peer.is_none() && unknown && fail_secure,
+        extraction,
+        ip,
+    }
 }
 
 #[cfg(test)]
@@ -612,5 +720,154 @@ mod tests {
             &proxies(&["unix", "10.0.0.0/8"])
         ));
         assert!(is_trusted_proxy("10.1.2.3", &proxies(&["10.1.2.3"])));
+    }
+
+    /// `(peer, X-Forwarded-For, trusted_proxies, depth, identity)`, recorded
+    /// from the reference `extract_client_ip`.
+    #[allow(clippy::type_complexity)]
+    const REFERENCE: &[(Option<&str>, Option<&str>, &[&str], u32, &str)] = &[
+        (
+            Some("::ffff:10.0.0.1"),
+            Some("203.0.113.7"),
+            &["10.0.0.0/8"],
+            1,
+            "10.0.0.1",
+        ),
+        (
+            Some("::ffff:10.0.0.1"),
+            Some("203.0.113.7"),
+            &["10.0.0.1"],
+            1,
+            "10.0.0.1",
+        ),
+        (
+            Some("10.0.0.1"),
+            Some("203.0.113.7"),
+            &["10.0.0.0/8"],
+            1,
+            "203.0.113.7",
+        ),
+        (
+            Some("::FFFF:10.0.0.1"),
+            Some("203.0.113.7"),
+            &[],
+            1,
+            "10.0.0.1",
+        ),
+        (Some("FE80::1%eth0"), None, &[], 1, "fe80::1%eth0"),
+        (Some("fe80::1%eth0"), None, &[], 1, "fe80::1%eth0"),
+        (Some("2001:DB8::1"), None, &[], 1, "2001:db8::1"),
+        (
+            Some("10.0.0.1"),
+            Some("[2001:db8::1]:443"),
+            &["10.0.0.1"],
+            1,
+            "2001:db8::1",
+        ),
+        (None, Some("203.0.113.7"), &["unix"], 1, "203.0.113.7"),
+        (None, Some("203.0.113.7"), &[], 1, "unknown"),
+        (None, None, &["unix"], 1, "unknown"),
+        (Some(""), Some("203.0.113.7"), &["unix"], 1, "203.0.113.7"),
+        (Some("not-an-ip"), None, &[], 1, "not-an-ip"),
+        (
+            Some("10.0.0.1"),
+            Some("1.1.1.1, 203.0.113.7"),
+            &["10.0.0.1"],
+            2,
+            "203.0.113.7",
+        ),
+        (
+            Some("10.0.0.1"),
+            Some("203.0.113.7"),
+            &["10.0.0.1"],
+            3,
+            "10.0.0.1",
+        ),
+        (Some("::1"), Some("203.0.113.7"), &["::1"], 1, "203.0.113.7"),
+        (
+            Some("0:0:0:0:0:ffff:a00:1"),
+            Some("9.9.9.9"),
+            &["10.0.0.1"],
+            1,
+            "10.0.0.1",
+        ),
+    ];
+
+    #[test]
+    fn identities_follow_the_reference_table() {
+        for (index, (peer, forwarded, proxy_list, depth, expected)) in REFERENCE.iter().enumerate()
+        {
+            let extraction = extract_client_ip(*peer, *forwarded, &proxies(proxy_list), *depth);
+            assert_eq!(extraction.client_ip, *expected, "reference row {index}");
+        }
+    }
+
+    #[test]
+    fn a_peerless_request_is_rejected_only_when_unresolved_and_fail_secure() {
+        let rejected = resolve_client(None, Some("203.0.113.7"), &[], 1, true);
+        assert!(rejected.reject);
+        assert_eq!(rejected.ip, None);
+        assert_eq!(rejected.extraction.source, ClientIpSource::Unknown);
+
+        let open = resolve_client(None, Some("203.0.113.7"), &[], 1, false);
+        assert!(!open.reject);
+        assert_eq!(open.ip, None);
+
+        let unix = resolve_client(None, Some("203.0.113.7"), &proxies(&["unix"]), 1, true);
+        assert!(!unix.reject);
+        assert_eq!(unix.ip, Some("203.0.113.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_peer_resolves_through_the_trusted_chain_and_never_rejects() {
+        let resolution = resolve_client(
+            Some("10.0.0.1".parse().unwrap()),
+            Some("203.0.113.7"),
+            &proxies(&["10.0.0.0/8"]),
+            1,
+            true,
+        );
+        assert!(!resolution.reject);
+        assert_eq!(resolution.ip, Some("203.0.113.7".parse().unwrap()));
+
+        let untrusted = resolve_client(
+            Some("192.0.2.9".parse().unwrap()),
+            Some("203.0.113.7"),
+            &proxies(&["10.0.0.0/8"]),
+            1,
+            true,
+        );
+        assert_eq!(untrusted.ip, Some("192.0.2.9".parse().unwrap()));
+        assert!(untrusted.extraction.untrusted_forwarded_header);
+
+        // An IPv4-mapped peer canonicalizes to its IPv4 identity.
+        let mapped = resolve_client(
+            Some("::ffff:192.0.2.9".parse().unwrap()),
+            None,
+            &[],
+            1,
+            true,
+        );
+        assert_eq!(mapped.ip, Some("192.0.2.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_zoned_chain_entry_keeps_its_text_but_has_no_address() {
+        let resolution = resolve_client(None, Some("fe80::1%eth0"), &proxies(&["unix"]), 1, true);
+        assert_eq!(resolution.extraction.client_ip, "fe80::1%eth0");
+        assert_eq!(resolution.ip, None);
+        assert!(!resolution.reject);
+    }
+
+    #[test]
+    fn a_malformed_zone_literal_is_not_an_address() {
+        // A zone on an IPv4 literal, an empty zone, and a non-address with a
+        // zone-shaped tail all pass through as raw text and never trust.
+        for raw in ["1.2.3.4%eth0", "fe80::1%", "not:an:ip%eth0"] {
+            assert_eq!(canonicalize_ip(raw), raw);
+            assert!(!is_trusted_proxy(raw, &proxies(&["fe80::/10", raw])));
+        }
+        // A well-formed zoned literal is an address and matches its network.
+        assert!(is_trusted_proxy("fe80::1%eth0", &proxies(&["fe80::/10"])));
     }
 }

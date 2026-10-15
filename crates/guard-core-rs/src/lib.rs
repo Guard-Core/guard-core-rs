@@ -99,6 +99,7 @@ pub mod stage_events;
 pub mod sus_patterns;
 pub mod tower;
 pub mod user_agent;
+pub mod wiring;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
