@@ -164,11 +164,17 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
           toolchain: 1.92.0
+          components: rustfmt, clippy
           rustflags: ""
           cache-shared-key: ci-msrv
 
       - name: Check
         run: cargo check --workspace --exclude guard-core-python --all-targets
+
+      # release.yml lints at the tag on this exact toolchain; run the same
+      # command here so a PR cannot pass and then fail the release gate.
+      - name: Clippy (MSRV, release gate parity)
+        run: cargo clippy --workspace --all-targets --exclude guard-core-python -- -D warnings
 
       - name: Test
         run: cargo test --workspace --exclude guard-core-python

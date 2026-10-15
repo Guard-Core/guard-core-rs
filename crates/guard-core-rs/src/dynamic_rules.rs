@@ -1380,6 +1380,7 @@ mod dynamic_rule_manager_tests {
         payload
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     #[test]
     fn emergency_halving_does_not_compound_across_versions() {
         let (manager, sink, config) = overlay_manager(SecurityConfig {
@@ -1403,6 +1404,7 @@ mod dynamic_rule_manager_tests {
         );
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     #[test]
     fn collection_values_do_not_accumulate_across_versions() {
         let (manager, sink, config) = overlay_manager(SecurityConfig {
@@ -1437,6 +1439,7 @@ mod dynamic_rule_manager_tests {
         );
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     #[test]
     fn a_new_version_drops_the_change_from_the_previous_version() {
         let (manager, sink, config) = overlay_manager(SecurityConfig {
@@ -1488,6 +1491,7 @@ mod dynamic_rule_manager_tests {
         assert_eq!((rate_limit, threshold, emergency_mode), (3, 16, false));
     }
 
+    #[allow(clippy::significant_drop_tightening)]
     #[test]
     fn a_poisoned_config_lock_keeps_the_active_version_and_the_base() {
         let (manager, sink, config) = overlay_manager(SecurityConfig {
