@@ -488,7 +488,6 @@ impl CaseEngine {
                     }
                 },
                 allow_credentials: config_bool(config, "cors_allow_credentials", false),
-                expose_headers: Vec::new(),
                 max_age: config_int(config, "cors_max_age", 600),
             };
             if cors.allow_origins.is_empty() {

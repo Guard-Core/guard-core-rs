@@ -873,7 +873,6 @@ impl Wiring {
             allow_methods: config.cors_allow_methods.clone(),
             allow_headers: config.cors_allow_headers.clone(),
             allow_credentials: config.cors_allow_credentials,
-            expose_headers: config.cors_expose_headers.clone(),
             max_age: config.cors_max_age,
         });
         let mut processor = ResponseProcessor::new(
@@ -886,6 +885,7 @@ impl Wiring {
             config.behavior_max_response_body_inspect_bytes,
             config.passive_mode,
         );
+        processor = processor.with_cors_expose_headers(config.cors_expose_headers.clone());
         if let Some(modifier) = &config.custom_response_modifier {
             processor = processor.with_response_modifier(Arc::clone(modifier));
         }

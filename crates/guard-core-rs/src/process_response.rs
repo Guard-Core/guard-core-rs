@@ -107,6 +107,7 @@ pub struct ResponseProcessor {
     passive_mode: bool,
     metrics: Option<MetricsCollector>,
     response_modifier: Option<guard_core_engine::payload::ResponseModifierFn>,
+    cors_expose_headers: Vec<String>,
     on_error: Option<crate::responses::OnErrorHook>,
 }
 
@@ -142,6 +143,7 @@ impl ResponseProcessor {
             passive_mode,
             metrics: None,
             response_modifier: None,
+            cors_expose_headers: Vec::new(),
             on_error: None,
         }
     }
@@ -153,6 +155,15 @@ impl ResponseProcessor {
     #[must_use]
     pub fn with_metrics(mut self, metrics: MetricsCollector) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Wire the reference `cors_expose_headers`: the headers a browser
+    /// script may read, landed as `Access-Control-Expose-Headers` (with
+    /// `Vary: Origin`) after the modifier for an allowed origin.
+    #[must_use]
+    pub fn with_cors_expose_headers(mut self, headers: Vec<String>) -> Self {
+        self.cors_expose_headers = headers;
         self
     }
 
@@ -346,7 +357,9 @@ impl ResponseProcessor {
         // `CorsHandler.build_response_headers`) lands after the modifier:
         // `Vary: Origin` and the exposed headers.
         if let Some(cors) = self.cors.as_ref() {
-            for (name, value) in cors_handler_headers(cors, request.origin.as_deref()) {
+            for (name, value) in
+                cors_handler_headers(cors, &self.cors_expose_headers, request.origin.as_deref())
+            {
                 response.headers.insert(name, value);
             }
         }
