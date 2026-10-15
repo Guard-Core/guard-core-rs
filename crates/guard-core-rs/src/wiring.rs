@@ -598,9 +598,9 @@ impl Wiring {
             None
         };
 
-        let distributed = Self::distributed(config)?;
-        let (geo_handler, geo) = Self::geo(config, None)?;
-        let (cloud, cloud_refresh) = Self::cloud(config)?;
+        let distributed = Self::build_distributed(config)?;
+        let (geo_handler, geo) = Self::build_geo(config, None)?;
+        let (cloud, cloud_refresh) = Self::build_cloud(config)?;
 
         let https = HttpsEnforcementStage::builder(HttpsEnforcementStageConfig {
             enforce_https: config.enforce_https,
@@ -638,7 +638,7 @@ impl Wiring {
             )
         };
 
-        let (telemetry, events, metrics) = Self::telemetry(config, options);
+        let (telemetry, events, metrics) = Self::build_telemetry(config, options);
 
         let custom_checks = config.custom_request_check.as_ref().map(|check| {
             let mut builder = CustomChecksStage::builder()
@@ -671,10 +671,10 @@ impl Wiring {
             sensitive: sensitive(config),
         });
 
-        let response_processor = Self::response_processor(config, ip_ban.as_ref());
+        let response_processor = Self::build_response_processor(config, ip_ban.as_ref());
 
         let live_config = Arc::new(RwLock::new(config.clone()));
-        let dynamic_rules = Self::dynamic_rules(
+        let dynamic_rules = Self::build_dynamic_rules(
             config,
             telemetry.as_ref(),
             ip_ban.as_ref().map(|(manager, _)| manager),
@@ -725,7 +725,7 @@ impl Wiring {
     }
 
     #[cfg(feature = "redis")]
-    fn distributed(config: &SecurityConfig) -> Result<Option<Distributed>, WiringError> {
+    fn build_distributed(config: &SecurityConfig) -> Result<Option<Distributed>, WiringError> {
         if !config.enable_redis {
             return Ok(None);
         }
@@ -749,12 +749,12 @@ impl Wiring {
 
     #[cfg(not(feature = "redis"))]
     #[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)] // same signature as the redis arm
-    fn distributed(_config: &SecurityConfig) -> Result<Option<Distributed>, WiringError> {
+    fn build_distributed(_config: &SecurityConfig) -> Result<Option<Distributed>, WiringError> {
         Ok(None)
     }
 
     #[allow(clippy::type_complexity)]
-    fn geo(
+    fn build_geo(
         config: &SecurityConfig,
         database_url: Option<&str>,
     ) -> Result<(Option<Arc<dyn GeoIpHandler>>, Option<GeoStage>), WiringError> {
@@ -796,7 +796,7 @@ impl Wiring {
     }
 
     #[allow(clippy::type_complexity)]
-    fn cloud(
+    fn build_cloud(
         config: &SecurityConfig,
     ) -> Result<(Option<CloudProviderStage>, Option<CloudRefresh>), WiringError> {
         let Some(providers) = config
@@ -822,7 +822,7 @@ impl Wiring {
     }
 
     #[allow(clippy::type_complexity)]
-    fn telemetry(
+    fn build_telemetry(
         config: &SecurityConfig,
         options: &WiringOptions,
     ) -> (
@@ -855,7 +855,7 @@ impl Wiring {
         (Some(composite), Some(Arc::new(bus)), Some(metrics))
     }
 
-    fn response_processor(
+    fn build_response_processor(
         config: &SecurityConfig,
         ip_ban: Option<&(IpBanManager, IpBanConfig)>,
     ) -> Option<ResponseProcessor> {
@@ -899,7 +899,7 @@ impl Wiring {
         Some(processor)
     }
 
-    fn dynamic_rules(
+    fn build_dynamic_rules(
         config: &SecurityConfig,
         telemetry: Option<&Arc<CompositeAgentHandler>>,
         bans: Option<&IpBanManager>,
@@ -1225,21 +1225,23 @@ mod tests {
         // lazy_init: the load runs on a background thread (the unroutable
         // endpoint fails it), the stage and handler exist immediately.
         config.lazy_init = true;
-        let (handler, stage) = Wiring::geo(&config, Some("http://127.0.0.1:1/db")).expect("geo");
+        let (handler, stage) =
+            Wiring::build_geo(&config, Some("http://127.0.0.1:1/db")).expect("geo");
         let handler = handler.expect("handler");
         assert!(stage.is_some());
         assert_eq!(handler.get_country("203.0.113.9".parse().unwrap()), None);
 
         // Eager: the load runs before the wiring returns.
         config.lazy_init = false;
-        let (handler, _stage) = Wiring::geo(&config, None).expect("geo");
+        let (handler, _stage) = Wiring::build_geo(&config, None).expect("geo");
         assert!(handler.is_some());
         let _ = std::fs::remove_dir_all(&dir);
 
         // A token without country rules still builds the handler.
         config.blocked_countries.clear();
         config.lazy_init = true;
-        let (handler, stage) = Wiring::geo(&config, Some("http://127.0.0.1:1/db")).expect("geo");
+        let (handler, stage) =
+            Wiring::build_geo(&config, Some("http://127.0.0.1:1/db")).expect("geo");
         assert!(handler.is_some() && stage.is_none());
     }
 
