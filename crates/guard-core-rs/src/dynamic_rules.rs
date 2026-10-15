@@ -319,7 +319,11 @@ impl DynamicRuleManager {
     /// `_hydrate_last_known_rules`: the last-known rules from the cache
     /// file, applied before the first poll (unexpired ones only).
     pub fn hydrate_last_known_rules(&self) -> Result<Option<(String, u64)>, SnapshotLoadFailure> {
-        let Some(path) = &self.cache_path else {
+        let enabled = self
+            .config
+            .read()
+            .is_ok_and(|config| config.enable_dynamic_rules);
+        let Some(path) = self.cache_path.as_ref().filter(|_| enabled) else {
             return Ok(None);
         };
         let payload = std::fs::read_to_string(path).map_err(|_| SnapshotLoadFailure {
@@ -338,6 +342,7 @@ impl DynamicRuleManager {
             });
         }
         self.apply_rule(&rules);
+        self.persist_last_known(&rules);
         let identity = (rules.rule_id.clone(), rules.version);
         {
             let mut state = self.state.lock().expect("manager state");
@@ -374,6 +379,12 @@ impl DynamicRuleManager {
                 outcome.skipped_expired = true;
                 return outcome;
             }
+        }
+
+        // The pydantic `ge=1` constraints: an invalid delivery is rejected
+        // whole and the active rules stay.
+        if !rules.auto_ban_overrides_valid() {
+            return outcome;
         }
 
         // `_should_update_rules`: the version gate.
@@ -469,11 +480,16 @@ impl DynamicRuleManager {
                 .write()
                 .ok()
                 .map_or_else(AppliedDynamicRules::default, |mut config| {
-                    // `_capture_active_base_snapshot`: only before the first
-                    // rule lands.
+                    // Every version applies over the base config, never over
+                    // the previous version's result (`_apply_rules`): the
+                    // retained base is restored first;
+                    // `_capture_active_base_snapshot` takes the base only
+                    // before the first rule lands.
                     {
                         let mut state = self.state.lock().expect("manager state");
-                        if state.current_rules.is_none() && state.base_snapshot.is_none() {
+                        if let Some(base) = state.base_snapshot.clone() {
+                            base.restore(&mut config);
+                        } else if state.current_rules.is_none() {
                             state.base_snapshot = Some(SnapshotConfig::capture(&config));
                         }
                     }
@@ -1003,6 +1019,7 @@ mod dynamic_rule_manager_tests {
         )]));
         let config = Arc::new(RwLock::new(SecurityConfig {
             enable_dynamic_rules: true,
+            ipinfo_token: Some(String::from("token")),
             ..SecurityConfig::default()
         }));
         let manager = Arc::new(DynamicRuleManager::new(Arc::clone(&config)).with_sink(sink));
@@ -1102,6 +1119,7 @@ mod dynamic_rule_manager_tests {
         let config = Arc::new(RwLock::new(SecurityConfig {
             dynamic_rules_cache_path: Some(path.clone()),
             enable_dynamic_rules: true,
+            ipinfo_token: Some(String::from("token")),
             ..SecurityConfig::default()
         }));
         let sink = Arc::new(ScriptedSink::new(vec![Some(
@@ -1114,6 +1132,8 @@ mod dynamic_rule_manager_tests {
         // A fresh manager hydrates from the file before any poll.
         let hydrated_config = Arc::new(RwLock::new(SecurityConfig {
             dynamic_rules_cache_path: Some(path.clone()),
+            enable_dynamic_rules: true,
+            ipinfo_token: Some(String::from("token")),
             ..SecurityConfig::default()
         }));
         let hydrated = DynamicRuleManager::new(Arc::clone(&hydrated_config));
@@ -1232,6 +1252,7 @@ mod dynamic_rule_manager_tests {
         std::fs::write(&path, dump_last_known_rules_snapshot(&r).expect("dumps")).expect("writes");
         let config = Arc::new(RwLock::new(SecurityConfig {
             dynamic_rules_cache_path: Some(path),
+            enable_dynamic_rules: true,
             ..SecurityConfig::default()
         }));
         // No sink wired: the emergency emission is the None arm.
@@ -1276,5 +1297,300 @@ mod dynamic_rule_manager_tests {
         assert_eq!(failure.to_string(), "last-known rules hydration: boom");
         assert_eq!(NoopStore.get_key("p", "ns", "k"), Ok(None));
         assert_eq!(NoopStore.set_key("p", "ns", "k", "v", None), Ok(()));
+    }
+
+    fn overlay_rules(version: u64, rule_id: &str) -> serde_json::Value {
+        serde_json::to_value(DynamicRules {
+            rule_id: rule_id.to_owned(),
+            version,
+            ..DynamicRules::default()
+        })
+        .expect("serializes")
+    }
+
+    /// Apply `payload` through one poll of a sink that answers it.
+    fn poll(
+        manager: &DynamicRuleManager,
+        sink: &ScriptedSink,
+        payload: serde_json::Value,
+    ) -> UpdateOutcome {
+        sink.rules.lock().expect("rules").push(Some(payload));
+        manager.update_rules()
+    }
+
+    fn overlay_manager(
+        base: SecurityConfig,
+    ) -> (
+        Arc<DynamicRuleManager>,
+        Arc<ScriptedSink>,
+        Arc<RwLock<SecurityConfig>>,
+    ) {
+        let (manager, sink, config, _clock) = overlay_manager_with_clock(base);
+        (manager, sink, config)
+    }
+
+    type SharedClock = Arc<Mutex<DateTime<Utc>>>;
+
+    fn overlay_manager_with_clock(
+        base: SecurityConfig,
+    ) -> (
+        Arc<DynamicRuleManager>,
+        Arc<ScriptedSink>,
+        Arc<RwLock<SecurityConfig>>,
+        SharedClock,
+    ) {
+        let sink = Arc::new(ScriptedSink::new(Vec::new()));
+        let config = Arc::new(RwLock::new(SecurityConfig {
+            enable_dynamic_rules: true,
+            ..base
+        }));
+        let clock: SharedClock = Arc::new(Mutex::new(at(1000)));
+        let reader = Arc::clone(&clock);
+        let manager = Arc::new(
+            DynamicRuleManager::new(Arc::clone(&config))
+                .with_sink(Arc::clone(&sink) as _)
+                .with_clock(Arc::new(move || *reader.lock().expect("clock"))),
+        );
+        (manager, sink, config, clock)
+    }
+
+    fn emergency(version: u64, rule_id: &str) -> serde_json::Value {
+        let mut payload = overlay_rules(version, rule_id);
+        payload["emergency_mode"] = true.into();
+        payload
+    }
+
+    #[test]
+    fn emergency_halving_does_not_compound_across_versions() {
+        let (manager, sink, config) = overlay_manager(SecurityConfig {
+            auto_ban_threshold: 16,
+            ..SecurityConfig::default()
+        });
+        let mut seen = Vec::new();
+        for version in 1..=3 {
+            poll(&manager, &sink, emergency(version, "r1"));
+            seen.push(config.read().expect("config").auto_ban_threshold);
+        }
+        assert_eq!(seen, vec![8, 8, 8]);
+        let state = manager.state.lock().expect("state");
+        assert_eq!(
+            state
+                .base_snapshot
+                .as_ref()
+                .expect("base")
+                .auto_ban_threshold,
+            16
+        );
+    }
+
+    #[test]
+    fn collection_values_do_not_accumulate_across_versions() {
+        let (manager, sink, config) = overlay_manager(SecurityConfig {
+            ipinfo_token: Some(String::from("token")),
+            blocked_user_agents: vec![String::from("base-bot")],
+            block_cloud_providers: Some(["AWS".to_owned()].into()),
+            ..SecurityConfig::default()
+        });
+        let mut v1 = overlay_rules(1, "r1");
+        v1["blocked_user_agents"] = serde_json::json!(["bot-a"]);
+        v1["blocked_cloud_providers"] = serde_json::json!(["GCP"]);
+        v1["blocked_countries"] = serde_json::json!(["AA"]);
+        v1["endpoint_rate_limits"] = serde_json::json!({"/a": [1, 60]});
+        poll(&manager, &sink, v1);
+        let mut v2 = overlay_rules(2, "r1");
+        v2["blocked_user_agents"] = serde_json::json!(["bot-b"]);
+        v2["blocked_cloud_providers"] = serde_json::json!(["Azure"]);
+        v2["blocked_countries"] = serde_json::json!(["BB"]);
+        v2["endpoint_rate_limits"] = serde_json::json!({"/b": [2, 60]});
+        poll(&manager, &sink, v2);
+
+        let config = config.read().expect("config");
+        assert_eq!(config.blocked_user_agents, vec![String::from("bot-b")]);
+        assert_eq!(
+            config.block_cloud_providers,
+            Some(["Azure".to_owned()].into())
+        );
+        assert_eq!(config.blocked_countries, ["BB".to_owned()].into());
+        assert_eq!(
+            config.endpoint_rate_limits,
+            std::collections::BTreeMap::from([(String::from("/b"), (2, 60))])
+        );
+    }
+
+    #[test]
+    fn a_new_version_drops_the_change_from_the_previous_version() {
+        let (manager, sink, config) = overlay_manager(SecurityConfig {
+            rate_limit: 100,
+            enable_ip_banning: true,
+            auto_ban_threshold: 5,
+            ..SecurityConfig::default()
+        });
+        let mut v1 = overlay_rules(1, "r1");
+        v1["global_rate_limit"] = 7.into();
+        v1["enable_ip_banning"] = false.into();
+        v1["auto_ban_threshold"] = 2.into();
+        poll(&manager, &sink, v1);
+        {
+            let config = config.read().expect("config");
+            assert_eq!((config.rate_limit, config.enable_ip_banning), (7, false));
+        }
+
+        let mut v2 = overlay_rules(2, "r1");
+        v2["global_rate_limit"] = 9.into();
+        poll(&manager, &sink, v2);
+
+        let config = config.read().expect("config");
+        assert_eq!(config.rate_limit, 9);
+        assert!(config.enable_ip_banning);
+        assert_eq!(config.auto_ban_threshold, 5);
+    }
+
+    #[test]
+    fn a_different_rule_id_overlays_the_base() {
+        let (manager, sink, config) = overlay_manager(SecurityConfig {
+            rate_limit: 100,
+            auto_ban_threshold: 16,
+            ..SecurityConfig::default()
+        });
+        poll(&manager, &sink, emergency(1, "r1"));
+        let mut r2 = overlay_rules(1, "r2");
+        r2["global_rate_limit"] = 3.into();
+        poll(&manager, &sink, r2);
+
+        let (rate_limit, threshold, emergency_mode) = {
+            let config = config.read().expect("config");
+            (
+                config.rate_limit,
+                config.auto_ban_threshold,
+                config.emergency_mode,
+            )
+        };
+        assert_eq!((rate_limit, threshold, emergency_mode), (3, 16, false));
+    }
+
+    #[test]
+    fn a_poisoned_config_lock_keeps_the_active_version_and_the_base() {
+        let (manager, sink, config) = overlay_manager(SecurityConfig {
+            rate_limit: 100,
+            auto_ban_threshold: 16,
+            ..SecurityConfig::default()
+        });
+        let mut v1 = overlay_rules(1, "r1");
+        v1["global_rate_limit"] = 7.into();
+        v1["auto_ban_threshold"] = 4.into();
+        poll(&manager, &sink, v1);
+
+        // The application itself is infallible here; a poisoned config lock
+        // is the one failure left, and it must leave everything as it was.
+        let poisoner = Arc::clone(&config);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.write().expect("lock");
+            panic!("poison the config lock");
+        })
+        .join();
+        let mut v2 = overlay_rules(2, "r1");
+        v2["global_rate_limit"] = 9.into();
+        let outcome = poll(&manager, &sink, v2);
+        config.clear_poison();
+
+        assert_eq!(outcome.applied, None);
+        assert_eq!(manager.current_identity(), Some((String::from("r1"), 1)));
+        {
+            let config = config.read().expect("config");
+            assert_eq!(config.rate_limit, 7);
+            assert_eq!(config.auto_ban_threshold, 4);
+        }
+        let state = manager.state.lock().expect("state");
+        assert_eq!(state.base_snapshot.as_ref().expect("base").rate_limit, 100);
+    }
+
+    #[test]
+    fn expiry_restores_the_true_base_after_several_versions() {
+        let (manager, sink, config, clock) = overlay_manager_with_clock(SecurityConfig {
+            auto_ban_threshold: 16,
+            ..SecurityConfig::default()
+        });
+        poll(&manager, &sink, emergency(1, "r1"));
+        let mut v2 = emergency(2, "r1");
+        v2["expires_at"] = serde_json::json!(at(1500));
+        poll(&manager, &sink, v2);
+        assert_eq!(config.read().expect("config").auto_ban_threshold, 8);
+
+        *clock.lock().expect("clock") = at(2000);
+        assert!(manager.expire_current_rule());
+
+        let (threshold, emergency_mode) = {
+            let config = config.read().expect("config");
+            (config.auto_ban_threshold, config.emergency_mode)
+        };
+        assert_eq!((threshold, emergency_mode), (16, false));
+        assert_eq!(manager.current_identity(), None);
+        assert!(manager.state.lock().expect("state").base_snapshot.is_none());
+    }
+
+    #[test]
+    fn a_new_version_after_hydration_overlays_the_base() {
+        let dir =
+            std::env::temp_dir().join(format!("guard-dyn-overlay-hydrate-{}", std::process::id()));
+        let path = dir.join("cache.json");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let hydrated: DynamicRules = serde_json::from_value(emergency(1, "r1")).expect("rules");
+        std::fs::write(
+            &path,
+            dump_last_known_rules_snapshot(&hydrated).expect("dumps"),
+        )
+        .expect("writes");
+        let (_unused, sink, config) = overlay_manager(SecurityConfig {
+            auto_ban_threshold: 16,
+            dynamic_rules_cache_path: Some(path),
+            ..SecurityConfig::default()
+        });
+        // The cache path rides the config handle read at construction.
+        let manager = Arc::new(
+            DynamicRuleManager::new(Arc::clone(&config)).with_sink(Arc::clone(&sink) as _),
+        );
+        drop(manager.hydrate_last_known_rules().expect("hydrates"));
+        assert_eq!(config.read().expect("config").auto_ban_threshold, 8);
+
+        poll(&manager, &sink, emergency(2, "r1"));
+
+        assert_eq!(manager.current_identity(), Some((String::from("r1"), 2)));
+        assert_eq!(config.read().expect("config").auto_ban_threshold, 8);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn suspicious_patterns_are_not_duplicated_across_versions() {
+        let patterns = Arc::new(SusPatternsManager::new());
+        let sink = Arc::new(ScriptedSink::new(Vec::new()));
+        let config = Arc::new(RwLock::new(SecurityConfig {
+            enable_dynamic_rules: true,
+            ..SecurityConfig::default()
+        }));
+        let manager = DynamicRuleManager::new(Arc::clone(&config))
+            .with_sink(Arc::clone(&sink) as _)
+            .with_patterns(Arc::clone(&patterns));
+        for version in 1..=3 {
+            let mut payload = overlay_rules(version, "r1");
+            payload["suspicious_patterns"] = serde_json::json!(["overlay-unique-marker-[0-9]{3}"]);
+            poll(&manager, &sink, payload);
+        }
+        assert_eq!(
+            patterns.get_custom_patterns(),
+            vec![String::from("overlay-unique-marker-[0-9]{3}")]
+        );
+    }
+
+    #[test]
+    fn a_zero_auto_ban_override_rejects_the_whole_delivery() {
+        let (manager, sink, config) = overlay_manager(SecurityConfig::default());
+        poll(&manager, &sink, overlay_rules(1, "r1"));
+        let mut v2 = overlay_rules(2, "r1");
+        v2["global_rate_limit"] = 9.into();
+        v2["auto_ban_threshold"] = 0.into();
+        let outcome = poll(&manager, &sink, v2);
+        assert_eq!(outcome.applied, None);
+        assert_eq!(manager.current_identity(), Some((String::from("r1"), 1)));
+        assert_ne!(config.read().expect("config").rate_limit, 9);
     }
 }
