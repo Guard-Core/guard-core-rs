@@ -795,12 +795,10 @@ mod tests {
 
     #[test]
     fn identities_follow_the_reference_table() {
-        for (peer, forwarded, trusted, depth, expected) in REFERENCE {
-            let extraction = extract_client_ip(*peer, *forwarded, &proxies(trusted), *depth);
-            assert_eq!(
-                extraction.client_ip, *expected,
-                "peer {peer:?} xff {forwarded:?} trusted {trusted:?} depth {depth}"
-            );
+        for (index, (peer, forwarded, proxy_list, depth, expected)) in REFERENCE.iter().enumerate()
+        {
+            let extraction = extract_client_ip(*peer, *forwarded, &proxies(proxy_list), *depth);
+            assert_eq!(extraction.client_ip, *expected, "reference row {index}");
         }
     }
 
