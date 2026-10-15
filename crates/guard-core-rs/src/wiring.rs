@@ -948,7 +948,7 @@ mod tests {
     struct Client;
     impl crate::composite::LogfireClient for Client {
         fn is_configured(&self) -> bool {
-            true
+            false
         }
 
         fn configure(&self, _service_name: &str) -> Result<(), TelemetryError> {
@@ -1119,12 +1119,10 @@ mod tests {
         config
             .endpoint_rate_limits
             .insert("/zero".to_owned(), (0, 60));
-        match wire_err(&config) {
-            WiringError::RateLimit(error) => {
-                assert!(error.field.contains("endpoint_rate_limits[/zero]"));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+        assert!(matches!(
+            wire_err(&config),
+            WiringError::RateLimit(error) if error.field.contains("endpoint_rate_limits[/zero]")
+        ));
         config.endpoint_rate_limits.clear();
         config.rate_limit = 0;
         assert!(matches!(wire_err(&config), WiringError::RateLimit(_)));
@@ -1194,15 +1192,21 @@ mod tests {
     fn country_rules_need_a_handler_or_a_token() {
         let mut config = config();
         config.whitelist_countries = set(&["US"]);
-        match wire_err(&config) {
-            WiringError::Geo(message) => assert!(message.contains("ipinfo_token")),
-            other => panic!("unexpected {other:?}"),
-        }
+        assert!(matches!(
+            wire_err(&config),
+            WiringError::Geo(message) if message.contains("ipinfo_token")
+        ));
 
         config.geo_ip_handler = Some(Arc::new(Fixed));
         let wiring = wire(&config);
         assert!(wiring.geo.is_some());
-        assert!(wiring.geo_handler.is_some());
+        let handler = wiring.geo_handler.as_ref().expect("handler");
+        assert_eq!(
+            handler
+                .get_country("203.0.113.9".parse().unwrap())
+                .as_deref(),
+            Some("US")
+        );
 
         // A handler with no country rules builds the handler, no stage.
         config.whitelist_countries.clear();
@@ -1332,6 +1336,10 @@ mod tests {
         config.on_block = Some(Arc::new(|_payload| {}));
         config.custom_request_check = Some(Arc::new(|_context| None));
         config.auth_verifier = Some(Arc::new(|_credential| false));
+        // With a bus installed the custom check emits through it.
+        config.agent_enable_events = true;
+        let (wiring, _sink) = with_agent(&config);
+        assert!(wiring.custom_checks.is_some());
         let wiring = wire(&config);
         assert!(wiring.emergency.is_some());
         assert!(wiring.user_agent.is_some());
@@ -1473,7 +1481,7 @@ mod tests {
         config.agent_enable_metrics = true;
         config.enable_enrichment = true;
         let (wiring, sink) = with_agent(&config);
-        assert!(wiring.telemetry.is_some());
+        wiring.telemetry.as_ref().expect("fan-out").start();
         wiring.events.as_ref().expect("bus").send_middleware_event(
             "rate_limited",
             "192.0.2.1",
@@ -1526,7 +1534,26 @@ mod tests {
             },
         )
         .expect("wired");
-        assert!(wiring.telemetry.is_some());
+        let telemetry = wiring.telemetry.as_ref().expect("fan-out");
+        telemetry.start();
+        assert!(telemetry.health_check());
+        assert!(
+            telemetry
+                .send_event(&SecurityEvent::new("e", "1.1.1.1", "a", "r", "h"))
+                .is_empty()
+        );
+        assert!(
+            telemetry
+                .send_metric(&SecurityMetric {
+                    timestamp: std::time::SystemTime::now(),
+                    metric_type: "request_count".to_owned(),
+                    value: 1.0,
+                    endpoint: None,
+                    tags: std::collections::BTreeMap::new(),
+                })
+                .is_empty()
+        );
+        assert!(telemetry.stop().is_empty());
     }
 
     #[test]
@@ -1573,6 +1600,7 @@ mod tests {
         ));
         let adapter = CompositeSink(composite);
         assert_eq!(adapter.handler_name(), "CompositeAgentHandler");
+        assert_eq!(sink.handler_name(), "CountingSink");
         adapter.start().expect("start");
         adapter
             .send_event(&SecurityEvent::new("e", "1.1.1.1", "a", "r", "h"))

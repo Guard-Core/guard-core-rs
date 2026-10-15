@@ -860,4 +860,16 @@ mod tests {
         assert_eq!(resolution.ip, None);
         assert!(!resolution.reject);
     }
+
+    #[test]
+    fn a_malformed_zone_literal_is_not_an_address() {
+        // A zone on an IPv4 literal, an empty zone, and a non-address with a
+        // zone-shaped tail all pass through as raw text and never trust.
+        for raw in ["1.2.3.4%eth0", "fe80::1%", "not:an:ip%eth0"] {
+            assert_eq!(canonicalize_ip(raw), raw);
+            assert!(!is_trusted_proxy(raw, &proxies(&["fe80::/10", raw])));
+        }
+        // A well-formed zoned literal is an address and matches its network.
+        assert!(is_trusted_proxy("fe80::1%eth0", &proxies(&["fe80::/10"])));
+    }
 }
