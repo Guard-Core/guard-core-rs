@@ -438,6 +438,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#scan-time-budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scan time budget
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#scoring-semantics" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -642,6 +653,17 @@
     <span class="md-ellipsis">
       
         DetectConfig
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scan-time-budget" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scan time budget
       
     </span>
   </a>
@@ -1037,6 +1059,9 @@ reference pipeline's behavior.</p>
 </tr>
 </tbody>
 </table>
+<h2 id="scan-time-budget">Scan time budget</h2>
+<p><code>detection_max_scan_seconds</code> (<code>SecurityConfig</code>, default <code>10.0</code>, valid 0.1 to 60) caps the CPU time one request may spend regex scanning, summed across every value and every pattern and checked between patterns. It reaches the engine through <code>DetectionExclusionConfig::max_scan_seconds</code> (<code>None</code> is the default of 10.0), so existing <code>DetectConfig</code> literals keep compiling. It is thread CPU time, not wall time, so a busy or CPU-starved host does not exhaust it on ordinary requests (<code>clock_gettime(CLOCK_THREAD_CPUTIME_ID)</code> on Linux, Android and macOS; other targets fall back to wall time). Once the budget is spent, the remaining patterns and values are skipped and the scan records a weighted <code>pattern_timeout</code> threat named <code>scan_time_budget_exhausted</code> (<code>Threat::PatternTimeout</code>: empty match, position 0, category <code>custom</code>, weight 1.0), so padding a request cannot skip detection.</p>
+<p><code>scan_request</code> shares one budget across all values of the request. The budget threat is an ordinary weighted threat: it counts toward the regex anomaly with its weight of 1.0 and <code>is_threat</code> follows the normal <code>detection_threat_score_threshold</code> rule, exactly like the reference. A value that is a threat is reported with the reason <code>Pattern exceeded scan time budget: 'scan_time_budget_exhausted'</code> (appended after another threat's reason when one matched), and the enabled-category filter does not drop it. <code>detect</code> on its own gives each call a fresh default budget; <code>detect_with_budget</code> takes a caller-owned <code>ScanTimeBudget</code>. The reference also yields to its event loop between patterns; the Rust scan is synchronous on the calling task, so there is no counterpart.</p>
 <h2 id="scoring-semantics">Scoring semantics</h2>
 <p><code>is_threat</code> is <code>sum(regex weights) &gt;= threat_score_threshold</code> or any semantic
 threat. <code>threat_score</code> is <code>min(max(regex anomaly, semantic max), 1.0)</code> when
