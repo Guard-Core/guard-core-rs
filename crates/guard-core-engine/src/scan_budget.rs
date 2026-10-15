@@ -8,7 +8,7 @@
 //! CPU-starved hosts exhaust it falsely on ordinary requests. Once spent,
 //! the remaining patterns and values are skipped and the scan records a
 //! weighted `pattern_timeout` threat named
-//! [`SCAN_TIME_BUDGET_EXHAUSTED_PATTERN`] (fail closed), so padding a
+//! [`SCAN_TIME_BUDGET_EXHAUSTED_PATTERN`] (it counts toward the anomaly score), so padding a
 //! request cannot skip detection.
 //!
 //! The reference also yields to its event loop every couple of

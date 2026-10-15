@@ -93,7 +93,7 @@ pub enum Threat {
     Semantic(SemanticThreat),
     /// The reference `pattern_timeout` shape for a spent scan time budget:
     /// pattern `scan_time_budget_exhausted`, empty match, position 0,
-    /// category `custom`, weighted (fail closed). See
+    /// category `custom`, weighted 1.0 like any `custom` threat. See
     /// [`crate::scan_budget`].
     PatternTimeout(RegexThreat),
 }

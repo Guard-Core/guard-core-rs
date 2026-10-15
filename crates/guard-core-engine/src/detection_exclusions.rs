@@ -576,18 +576,20 @@ pub fn scan_request(
             value.skip_semantic,
             &mut time_budget,
         );
-        // A spent time budget blocks regardless of the anomaly threshold and
-        // the enabled-category filter: the weighted `pattern_timeout` threat
-        // is the fail-closed signal that the scan could not finish.
+        if !verdict.is_threat {
+            continue;
+        }
+        // The budget threat is an ordinary weighted regex-side threat (it
+        // counts toward `is_threat` through the normal threshold rule above).
+        // Like every threat in the reference `_check_value_enhanced`, a value
+        // that is a threat is reported: the enabled-category filter does not
+        // drop the budget threat, and the reason names the budget.
         if verdict
             .threats
             .iter()
             .any(|threat| matches!(threat, Threat::PatternTimeout(_)))
         {
             return budget_exhausted_verdict(&verdict, exclusions, value.skip_categories);
-        }
-        if !verdict.is_threat {
-            continue;
         }
         let mut categories: Vec<String> = Vec::new();
         for threat in &verdict.threats {
@@ -1103,11 +1105,22 @@ mod tests {
     }
 
     #[test]
-    fn the_exhausted_budget_still_blocks_with_the_category_filter_and_a_high_threshold() {
+    fn the_budget_threat_follows_the_normal_threshold_rule() {
+        // Reference parity: the budget threat weighs 1.0 like any `custom`
+        // threat, so a threshold of 5.0 leaves a budget-only value clean.
         let mut config = corpus_config();
         config.threat_score_threshold = 5.0;
+        let verdict = scan_request(&benign_surfaces(), &zero_budget_exclusions(None), &config);
+        assert!(!verdict.is_threat);
+        assert!(verdict.reason.is_empty());
+    }
+
+    #[test]
+    fn the_budget_threat_is_not_dropped_by_the_category_filter() {
+        // The reference does not post-filter a threat value by enabled
+        // category, so the budget threat reports under a filter too.
         let exclusions = zero_budget_exclusions(Some(vec!["xss".to_owned()]));
-        let verdict = scan_request(&benign_surfaces(), &exclusions, &config);
+        let verdict = scan_request(&benign_surfaces(), &exclusions, &corpus_config());
         assert!(verdict.is_threat);
         assert!(verdict.reason.contains("scan time budget"));
     }
