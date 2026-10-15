@@ -24,6 +24,9 @@
 use crate::patterns::binary;
 use crate::patterns::{self, RegexThreat, ViewFilter};
 use crate::preprocessor;
+use crate::scan_budget::{
+    DEFAULT_MAX_SCAN_SECONDS, SCAN_TIME_BUDGET_EXHAUSTED_PATTERN, ScanTimeBudget,
+};
 use crate::semantic::{self, AnalysisResult, AttackKeywords, AttackStructures};
 
 /// Knob mapping for one detect call (spec `config_knobs`).
@@ -88,6 +91,11 @@ impl Default for DetectConfig {
 pub enum Threat {
     Regex(RegexThreat),
     Semantic(SemanticThreat),
+    /// The reference `pattern_timeout` shape for a spent scan time budget:
+    /// pattern `scan_time_budget_exhausted`, empty match, position 0,
+    /// category `custom`, weighted (fail closed). See
+    /// [`crate::scan_budget`].
+    PatternTimeout(RegexThreat),
 }
 
 /// Semantic threat with the full analysis payload (`_check_semantic_threats`).
@@ -146,14 +154,16 @@ fn scan_pass(
     filter: ViewFilter,
     normalized_context: &str,
     validator_context: &str,
+    budget: &mut ScanTimeBudget,
 ) -> Vec<RegexThreat> {
     let skip_filter = matches!(normalized_context, "unknown" | "request_body");
-    patterns::scan_view(
+    patterns::scan_view_budgeted(
         view_content,
         filter,
         normalized_context,
         skip_filter,
         validator_context,
+        budget,
     )
 }
 
@@ -224,7 +234,8 @@ fn semantic_threats(
     threats
 }
 
-/// The reference `detect` pipeline over one request content.
+/// The reference `detect` pipeline over one request content, under a fresh
+/// default scan time budget ([`DEFAULT_MAX_SCAN_SECONDS`]) for this call.
 #[must_use]
 pub fn detect(content: &str, request_context: &str, config: &DetectConfig) -> DetectVerdict {
     detect_with_semantic_skip(content, request_context, config, false)
@@ -241,6 +252,23 @@ pub fn detect_with_semantic_skip(
     request_context: &str,
     config: &DetectConfig,
     skip_semantic: bool,
+) -> DetectVerdict {
+    let mut budget = ScanTimeBudget::new(DEFAULT_MAX_SCAN_SECONDS);
+    detect_with_budget(content, request_context, config, skip_semantic, &mut budget)
+}
+
+/// [`detect_with_semantic_skip`] over a caller-owned [`ScanTimeBudget`].
+///
+/// One budget spans every value of a request (the reference carries it in a
+/// context variable). Once the budget is spent each remaining view pass
+/// records one [`Threat::PatternTimeout`] and stops scanning.
+#[must_use]
+pub fn detect_with_budget(
+    content: &str,
+    request_context: &str,
+    config: &DetectConfig,
+    skip_semantic: bool,
+    budget: &mut ScanTimeBudget,
 ) -> DetectVerdict {
     let original_length = content.chars().count();
     let (processed, decoded, decode_budget_exhausted) = preprocessor::preprocess_with_decoded(
@@ -266,6 +294,7 @@ pub fn detect_with_semantic_skip(
         ViewFilter::Processed,
         normalized,
         &validator_context,
+        budget,
     ));
 
     // raw signal-preserving view (raw_view_only = True)
@@ -275,7 +304,13 @@ pub fn detect_with_semantic_skip(
         config.preserve_attack_patterns,
         config.max_content_length,
     );
-    let raw_pass = scan_pass(&raw_view, ViewFilter::Raw, normalized, &validator_context);
+    let raw_pass = scan_pass(
+        &raw_view,
+        ViewFilter::Raw,
+        normalized,
+        &validator_context,
+        budget,
+    );
     // Threats and matched patterns are parallel lists in the reference (one
     // append per match), so a raw-view sighting of a pattern over text the
     // processed views already matched is the same evidence and must not
@@ -300,6 +335,7 @@ pub fn detect_with_semantic_skip(
         ViewFilter::UrlDecoded,
         normalized,
         &validator_context,
+        budget,
     ));
 
     if decode_budget_exhausted {
@@ -319,6 +355,7 @@ pub fn detect_with_semantic_skip(
             ViewFilter::All,
             normalized,
             &validator_context,
+            budget,
         ));
     }
 
@@ -328,6 +365,24 @@ pub fn detect_with_semantic_skip(
         semantic_threats(&processed, content, config)
     };
 
+    score_verdict(
+        regex_threats,
+        semantic,
+        config,
+        original_length,
+        processed_length,
+    )
+}
+
+/// Fold the regex and semantic threats into the verdict (`_regex_anomaly`
+/// and `_calculate_threat_score`).
+fn score_verdict(
+    regex_threats: Vec<RegexThreat>,
+    semantic: Vec<SemanticThreat>,
+    config: &DetectConfig,
+    original_length: usize,
+    processed_length: usize,
+) -> DetectVerdict {
     let anomaly = regex_anomaly(&regex_threats);
     let is_threat = anomaly >= config.threat_score_threshold || !semantic.is_empty();
 
@@ -338,7 +393,16 @@ pub fn detect_with_semantic_skip(
         (anomaly.max(semantic_max)).min(1.0)
     };
 
-    let mut threats: Vec<Threat> = regex_threats.into_iter().map(Threat::Regex).collect();
+    let mut threats: Vec<Threat> = regex_threats
+        .into_iter()
+        .map(|threat| {
+            if threat.pattern == SCAN_TIME_BUDGET_EXHAUSTED_PATTERN {
+                Threat::PatternTimeout(threat)
+            } else {
+                Threat::Regex(threat)
+            }
+        })
+        .collect();
     threats.extend(semantic.into_iter().map(Threat::Semantic));
 
     DetectVerdict {
@@ -460,7 +524,7 @@ mod tests {
             .iter()
             .chain(std::iter::once(semantic_threat))
             .filter_map(|t| match t {
-                Threat::Regex(r) => Some(r.weight),
+                Threat::Regex(r) | Threat::PatternTimeout(r) => Some(r.weight),
                 Threat::Semantic(_) => None,
             })
             .sum();
@@ -478,7 +542,7 @@ mod tests {
             .threats
             .iter()
             .filter_map(|t| match t {
-                Threat::Regex(r) => Some(r.weight),
+                Threat::Regex(r) | Threat::PatternTimeout(r) => Some(r.weight),
                 Threat::Semantic(_) => None,
             })
             .sum();
@@ -605,17 +669,126 @@ mod gap_tests {
             .iter()
             .filter_map(|t| match t {
                 Threat::Semantic(s) => Some(s.score),
-                Threat::Regex(_) => None,
+                Threat::Regex(_) | Threat::PatternTimeout(_) => None,
             })
             .fold(0.0_f64, f64::max);
         let anomaly = v
             .threats
             .iter()
             .filter_map(|t| match t {
-                Threat::Regex(r) => Some(r.weight),
+                Threat::Regex(r) | Threat::PatternTimeout(r) => Some(r.weight),
                 Threat::Semantic(_) => None,
             })
             .sum::<f64>();
         assert!((v.threat_score - anomaly.max(semantic_max).min(1.0)).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod scan_budget_tests {
+    use super::*;
+    use crate::scan_budget::{SCAN_TIME_BUDGET_EXHAUSTED_PATTERN, ScanTimeBudget};
+    use std::cell::Cell;
+
+    thread_local! {
+        static NOW: Cell<f64> = const { Cell::new(0.0) };
+    }
+
+    /// One fake CPU second per clock read, so every measured scan costs 1 s.
+    fn fake_clock() -> f64 {
+        NOW.with(|now| {
+            now.set(now.get() + 1.0);
+            now.get()
+        })
+    }
+
+    fn budget_threats(verdict: &DetectVerdict) -> Vec<&RegexThreat> {
+        verdict
+            .threats
+            .iter()
+            .filter_map(|t| match t {
+                Threat::PatternTimeout(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_exhausted_budget_records_the_reference_pattern_timeout_threat() {
+        let mut budget = ScanTimeBudget::with_clock(Some(0.1), fake_clock);
+        let verdict = detect_with_budget(
+            "hello world",
+            "query_param",
+            &DetectConfig::default(),
+            false,
+            &mut budget,
+        );
+        let threats = budget_threats(&verdict);
+        assert!(!threats.is_empty(), "verdict: {verdict:?}");
+        let threat = threats[0];
+        assert_eq!(threat.pattern, SCAN_TIME_BUDGET_EXHAUSTED_PATTERN);
+        assert_eq!(threat.match_text, "");
+        assert_eq!(threat.position, 0);
+        assert_eq!(threat.category, "custom");
+        assert!((threat.weight - 1.0).abs() < f64::EPSILON);
+        assert!(verdict.is_threat, "the weighted threat blocks");
+        assert!(
+            !verdict
+                .threats
+                .iter()
+                .any(|t| matches!(t, Threat::Regex(_))),
+            "the scan stopped after the first pattern"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_shared_across_values() {
+        let mut budget = ScanTimeBudget::with_clock(Some(2.5), fake_clock);
+        let config = DetectConfig::default();
+        let first = detect_with_budget("hello", "query_param", &config, false, &mut budget);
+        let second = detect_with_budget("world", "query_param", &config, false, &mut budget);
+        let recorded = budget_threats(&first)
+            .into_iter()
+            .chain(budget_threats(&second))
+            .any(|t| t.pattern == SCAN_TIME_BUDGET_EXHAUSTED_PATTERN);
+        assert!(recorded);
+        assert!(second.is_threat);
+    }
+
+    #[test]
+    fn within_budget_nothing_changes() {
+        let config = DetectConfig::default();
+        let benign = detect("page=2&sort=asc", "query_param", &config);
+        assert!(!benign.is_threat);
+        assert!(budget_threats(&benign).is_empty());
+
+        let attack = detect("<script>alert(1)</script>", "query_param", &config);
+        assert!(attack.is_threat);
+        assert!(budget_threats(&attack).is_empty());
+        assert!(
+            attack
+                .threats
+                .iter()
+                .any(|t| matches!(t, Threat::Regex(r) if r.category == "xss"))
+        );
+    }
+
+    #[test]
+    fn a_zero_cap_exhausts_before_the_first_pattern() {
+        let verdict = detect_with_budget(
+            "hello world",
+            "query_param",
+            &DetectConfig::default(),
+            false,
+            &mut ScanTimeBudget::new(0.0),
+        );
+        // One per view pass that ran (the raw pass's duplicate is dropped).
+        assert_eq!(budget_threats(&verdict).len(), 2, "verdict: {verdict:?}");
+        assert!(
+            verdict
+                .threats
+                .iter()
+                .all(|t| matches!(t, Threat::PatternTimeout(_)))
+        );
     }
 }

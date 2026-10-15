@@ -53,6 +53,15 @@ fn threat_json(threat: &Threat) -> Value {
             "category": r.category,
             "weight": r.weight,
         }),
+        Threat::PatternTimeout(r) => json!({
+            "type": "pattern_timeout",
+            "pattern": r.pattern,
+            "match": r.match_text,
+            "position": r.position,
+            "execution_time": 0.0,
+            "category": r.category,
+            "weight": r.weight,
+        }),
         Threat::Semantic(s) => {
             if s.fallback {
                 json!({
@@ -195,6 +204,25 @@ mod unit_twins {
             "detection_threat_score_threshold": 1.0
         }))
         .expect("corpus knobs must map")
+    }
+
+    #[test]
+    fn a_spent_scan_budget_serializes_the_reference_pattern_timeout_shape() {
+        let threat = Threat::PatternTimeout(
+            guard_core_engine::patterns::scan_time_budget_exhausted_threat(),
+        );
+        assert_eq!(
+            threat_json(&threat),
+            json!({
+                "type": "pattern_timeout",
+                "pattern": "scan_time_budget_exhausted",
+                "match": "",
+                "position": 0,
+                "execution_time": 0.0,
+                "category": "custom",
+                "weight": 1.0,
+            })
+        );
     }
 
     #[test]

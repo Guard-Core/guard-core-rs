@@ -2,6 +2,17 @@
 
 All notable changes to this project.
 
+## [Unreleased]
+
+### Added
+
+- `detection_max_scan_seconds` (`SecurityConfig`, default 10.0, valid 0.1 to 60) and `DetectionExclusionConfig::max_scan_seconds` / `ResolvedExclusions::max_scan_seconds` (`None` is the default): a per-request cap on the summed regex scan CPU time (thread CPU time, not wall time), checked between patterns, ported from guard-core. Once spent, the remaining patterns and values are skipped and a weighted `pattern_timeout` threat named `scan_time_budget_exhausted` is recorded (the new `Threat::PatternTimeout`), and `scan_request` blocks with a reason naming the budget. The `scan_budget` module carries `ScanTimeBudget`, `detect_with_budget` charges a caller-owned budget and `patterns::scan_view_budgeted` is the budgeted view pass. The thread CPU clock is `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` through the safe `rustix` wrapper on Linux, Android and macOS (the engine forbids `unsafe`); other targets fall back to wall time
+- The reference's event-loop yield between patterns has no Rust counterpart: the scan is synchronous on the calling task
+
+### Changed
+
+- `Threat` gains the `PatternTimeout` variant, so exhaustive matches need an arm. `DetectionExclusionConfig` and `ResolvedExclusions` no longer derive `Eq` (they now carry an `f64`); `DetectConfig` is unchanged, so existing literals keep compiling
+
 ## [4.3.3] - 2026-10-12
 
 ### Added

@@ -306,6 +306,14 @@ fn detect_verdict(
                 entry.set_item("category", &r.category)?;
                 entry.set_item("weight", r.weight)?;
             }
+            guard_core_engine::detect::Threat::PatternTimeout(r) => {
+                entry.set_item("type", "pattern_timeout")?;
+                entry.set_item("pattern", &r.pattern)?;
+                entry.set_item("match", &r.match_text)?;
+                entry.set_item("position", r.position)?;
+                entry.set_item("category", &r.category)?;
+                entry.set_item("weight", r.weight)?;
+            }
             guard_core_engine::detect::Threat::Semantic(sm) => {
                 entry.set_item("type", "semantic")?;
                 entry.set_item("attack_type", &sm.attack_type)?;

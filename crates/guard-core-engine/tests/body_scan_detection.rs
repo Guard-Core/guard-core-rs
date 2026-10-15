@@ -67,7 +67,7 @@ fn categories(verdict: &detect::DetectVerdict) -> Vec<&str> {
         .iter()
         .filter_map(|t| match t {
             Threat::Regex(r) => Some(r.category.as_str()),
-            Threat::Semantic(_) => None,
+            Threat::Semantic(_) | Threat::PatternTimeout(_) => None,
         })
         .collect()
 }

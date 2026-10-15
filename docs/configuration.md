@@ -175,6 +175,12 @@ reference pipeline's behavior.
 | `semantic_threshold` | `f64` | `0.7` | `detection_semantic_threshold`: per-attack-type semantic threats fire at or above this probability |
 | `threat_score_threshold` | `f64` | `1.0` | `detection_threat_score_threshold`: the regex-anomaly weight sum at or above which the verdict is a threat |
 
+## Scan time budget
+
+`detection_max_scan_seconds` (`SecurityConfig`, default `10.0`, valid 0.1 to 60) caps the CPU time one request may spend regex scanning, summed across every value and every pattern and checked between patterns. It reaches the engine through `DetectionExclusionConfig::max_scan_seconds` (`None` is the default of 10.0), so existing `DetectConfig` literals keep compiling. It is thread CPU time, not wall time, so a busy or CPU-starved host does not exhaust it on ordinary requests (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)` on Linux, Android and macOS; other targets fall back to wall time). Once the budget is spent, the remaining patterns and values are skipped and the scan records a weighted `pattern_timeout` threat named `scan_time_budget_exhausted` (`Threat::PatternTimeout`: empty match, position 0, category `custom`, weight 1.0), so padding a request cannot skip detection.
+
+`scan_request` shares one budget across all values of the request and returns a threat verdict whose reason reads `Pattern exceeded scan time budget: 'scan_time_budget_exhausted'`, regardless of the anomaly threshold and the enabled-category filter. `detect` on its own gives each call a fresh default budget; `detect_with_budget` takes a caller-owned `ScanTimeBudget`. The reference also yields to its event loop between patterns; the Rust scan is synchronous on the calling task, so there is no counterpart.
+
 ## Scoring semantics
 
 `is_threat` is `sum(regex weights) >= threat_score_threshold` or any semantic

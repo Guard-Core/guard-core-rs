@@ -58,6 +58,7 @@ use std::collections::HashSet;
 
 use crate::body_scan::BodyScanValue;
 use crate::detect::{self, DetectConfig, Threat};
+use crate::scan_budget::{DEFAULT_MAX_SCAN_SECONDS, ScanTimeBudget, budget_exhausted_message};
 
 /// The categories an excluded header skips for a value known to
 /// false-positive them.
@@ -118,7 +119,7 @@ const ADDRESS_HEADER_NAMES: &[&str] = &[
 /// The reference `SecurityConfig` fields of the same names. The category
 /// set is `None` when nothing is configured (every category scans); the
 /// scan-body flag is `None` for the reference default (`true`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DetectionExclusionConfig {
     /// `excluded_detection_headers` (merged with the defaults, never a
     /// replacement).
@@ -135,6 +136,10 @@ pub struct DetectionExclusionConfig {
     pub enabled_detection_categories: Option<Vec<String>>,
     /// `detection_scan_body`: `None` is the reference default (`true`).
     pub detection_scan_body: Option<bool>,
+    /// `detection_max_scan_seconds` (valid 0.1 to 60): the per-request cap on
+    /// the summed regex scan CPU time; `None` is the reference default
+    /// ([`DEFAULT_MAX_SCAN_SECONDS`], 10.0). See [`crate::scan_budget`].
+    pub max_scan_seconds: Option<f64>,
 }
 
 /// The route decorator's detection-exclusion surface.
@@ -165,7 +170,7 @@ pub struct RouteDetectionExclusions {
 
 /// The resolved exclusion sets for one request (`routeDetectionExclusions`
 /// in the Go port).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedExclusions {
     /// Lowercased: query-param names the scan skips.
     pub excluded_params: HashSet<String>,
@@ -182,6 +187,9 @@ pub struct ResolvedExclusions {
     pub enabled_categories: Option<HashSet<String>>,
     /// Whether the body surface scans at all.
     pub scan_body: bool,
+    /// The per-request scan time cap in seconds; `None` is the reference
+    /// default ([`DEFAULT_MAX_SCAN_SECONDS`]).
+    pub max_scan_seconds: Option<f64>,
 }
 
 /// Merge, trim and lowercase one list into the set
@@ -264,6 +272,10 @@ pub fn resolve(
         .and_then(|route| route.detection_scan_body)
         .or_else(|| config.and_then(|config| config.detection_scan_body))
         .unwrap_or(true);
+
+    // `_resolve_max_scan_seconds`: global only, `None` is the reference
+    // default.
+    resolved.max_scan_seconds = config.and_then(|config| config.max_scan_seconds);
 
     resolved
 }
@@ -546,16 +558,34 @@ pub fn scan_request(
     // cap is crossed the remaining request values are not scanned (the
     // reference's fail-open signal, logged once per request there).
     let mut budget = ScanBudget::new(config);
+    // One scan time budget (`detection_max_scan_seconds`) spans every value
+    // of the request.
+    let mut time_budget = ScanTimeBudget::new(
+        exclusions
+            .max_scan_seconds
+            .unwrap_or(DEFAULT_MAX_SCAN_SECONDS),
+    );
     for value in &values {
         if !budget.admit(value.content) {
             continue;
         }
-        let verdict = detect::detect_with_semantic_skip(
+        let verdict = detect::detect_with_budget(
             value.content,
             value.context,
             config,
             value.skip_semantic,
+            &mut time_budget,
         );
+        // A spent time budget blocks regardless of the anomaly threshold and
+        // the enabled-category filter: the weighted `pattern_timeout` threat
+        // is the fail-closed signal that the scan could not finish.
+        if verdict
+            .threats
+            .iter()
+            .any(|threat| matches!(threat, Threat::PatternTimeout(_)))
+        {
+            return budget_exhausted_verdict(&verdict, exclusions, value.skip_categories);
+        }
         if !verdict.is_threat {
             continue;
         }
@@ -566,7 +596,7 @@ pub fn scan_request(
                 // Semantic threats carry no category (the reference's
                 // semantic payloads have no `category` key and are
                 // skipped by the `category == ""` guard).
-                Threat::Semantic(_) => None,
+                Threat::Semantic(_) | Threat::PatternTimeout(_) => None,
             };
             let Some(category) = category else {
                 continue;
@@ -589,6 +619,46 @@ pub fn scan_request(
     }
 
     RequestScanVerdict::default()
+}
+
+/// The verdict for a request whose scan time budget ran out: the threat is
+/// reported under its own `custom` category, together with any enabled
+/// category the same value already matched, and the reason names the
+/// budget the way the reference `_build_threats_message` does.
+fn budget_exhausted_verdict(
+    verdict: &detect::DetectVerdict,
+    exclusions: &ResolvedExclusions,
+    skip_categories: &[&str],
+) -> RequestScanVerdict {
+    let mut matched: Vec<String> = Vec::new();
+    for threat in &verdict.threats {
+        if let Threat::Regex(regex) = threat
+            && category_enabled(&regex.category, exclusions.enabled_categories.as_ref())
+            && !skip_categories.contains(&regex.category.as_str())
+            && !matched.contains(&regex.category)
+        {
+            matched.push(regex.category.clone());
+        }
+    }
+    let budget_message = budget_exhausted_message();
+    let reason = if matched.is_empty() {
+        budget_message
+    } else {
+        matched.sort();
+        format!(
+            "Penetration patterns detected: {}; {budget_message}",
+            matched.join(", ")
+        )
+    };
+    let mut categories = matched;
+    categories.push("custom".to_owned());
+    categories.sort();
+    categories.dedup();
+    RequestScanVerdict {
+        is_threat: true,
+        categories,
+        reason,
+    }
 }
 
 /// Forced-category verdict (`_mongo_operator_key_hit`): the category
@@ -981,6 +1051,123 @@ mod tests {
         );
     }
 
+    fn benign_surfaces() -> RequestSurfaces<'static> {
+        RequestSurfaces {
+            url_path: Some("/items"),
+            query_params: &[],
+            headers: &[],
+            content_type: "",
+            raw_body: "",
+        }
+    }
+
+    fn zero_budget_exclusions(categories: Option<Vec<String>>) -> ResolvedExclusions {
+        resolve(
+            Some(&DetectionExclusionConfig {
+                enabled_detection_categories: categories,
+                max_scan_seconds: Some(0.0),
+                ..DetectionExclusionConfig::default()
+            }),
+            None,
+        )
+    }
+
+    #[test]
+    fn the_scan_time_cap_resolves_from_the_global_config_only() {
+        assert_eq!(resolve(None, None).max_scan_seconds, None);
+        let global = DetectionExclusionConfig {
+            max_scan_seconds: Some(2.5),
+            ..DetectionExclusionConfig::default()
+        };
+        assert_eq!(resolve(Some(&global), None).max_scan_seconds, Some(2.5));
+        let route = RouteDetectionExclusions::default();
+        assert_eq!(
+            resolve(Some(&global), Some(&route)).max_scan_seconds,
+            Some(2.5)
+        );
+    }
+
+    #[test]
+    fn an_exhausted_scan_time_budget_blocks_and_names_the_budget() {
+        let verdict = scan_request(
+            &benign_surfaces(),
+            &zero_budget_exclusions(None),
+            &corpus_config(),
+        );
+        assert!(verdict.is_threat);
+        assert_eq!(verdict.categories, vec!["custom".to_owned()]);
+        assert_eq!(
+            verdict.reason,
+            "Pattern exceeded scan time budget: 'scan_time_budget_exhausted'"
+        );
+    }
+
+    #[test]
+    fn the_exhausted_budget_still_blocks_with_the_category_filter_and_a_high_threshold() {
+        let mut config = corpus_config();
+        config.threat_score_threshold = 5.0;
+        let exclusions = zero_budget_exclusions(Some(vec!["xss".to_owned()]));
+        let verdict = scan_request(&benign_surfaces(), &exclusions, &config);
+        assert!(verdict.is_threat);
+        assert!(verdict.reason.contains("scan time budget"));
+    }
+
+    #[test]
+    fn the_budget_reason_keeps_the_categories_the_value_already_matched() {
+        // The first pattern is cheap to match; the fake-free route: a zero
+        // cap trips before any pattern runs, so drive the verdict builder
+        // with a verdict that carries both threat kinds.
+        let verdict = crate::detect::DetectVerdict {
+            is_threat: true,
+            threat_score: 1.0,
+            threats: vec![
+                Threat::Regex(crate::patterns::RegexThreat {
+                    pattern: "p".to_owned(),
+                    match_text: "m".to_owned(),
+                    position: 0,
+                    category: "xss".to_owned(),
+                    weight: 1.0,
+                }),
+                Threat::PatternTimeout(crate::patterns::scan_time_budget_exhausted_threat()),
+            ],
+            original_length: 1,
+            processed_length: 1,
+        };
+        let out = budget_exhausted_verdict(&verdict, &resolve(None, None), &[]);
+        assert_eq!(out.categories, vec!["custom".to_owned(), "xss".to_owned()]);
+        assert_eq!(
+            out.reason,
+            "Penetration patterns detected: xss; Pattern exceeded scan time budget: \
+             'scan_time_budget_exhausted'"
+        );
+        // A filtered-out category does not name itself in the reason.
+        let filtered = budget_exhausted_verdict(&verdict, &resolve(None, None), &["xss"]);
+        assert_eq!(filtered.categories, vec!["custom".to_owned()]);
+    }
+
+    #[test]
+    fn the_scan_time_budget_is_shared_by_every_value_of_the_request() {
+        let surfaces = RequestSurfaces {
+            url_path: Some("/items"),
+            query_params: &[("q".to_owned(), "benign".to_owned())],
+            headers: &[],
+            content_type: "",
+            raw_body: "",
+        };
+        let verdict = scan_request(&surfaces, &zero_budget_exclusions(None), &corpus_config());
+        assert!(
+            verdict.is_threat,
+            "the first value already trips the budget"
+        );
+    }
+
+    #[test]
+    fn the_default_scan_time_budget_leaves_a_benign_request_clean() {
+        let verdict = scan_request(&benign_surfaces(), &resolve(None, None), &corpus_config());
+        assert!(!verdict.is_threat);
+        assert!(verdict.reason.is_empty());
+    }
+
     #[test]
     fn the_scan_value_budget_caps_the_values_scanned() {
         let mut config = corpus_config();
@@ -1322,6 +1509,7 @@ mod gap_tests {
             semantic_headers: std::collections::HashSet::new(),
             enabled_categories: None,
             scan_body: false,
+            max_scan_seconds: None,
         };
         let headers = vec![
             ("x-empty".to_owned(), String::new()),
@@ -1354,6 +1542,7 @@ mod gap_tests {
             semantic_headers: std::collections::HashSet::new(),
             enabled_categories: None,
             scan_body: false,
+            max_scan_seconds: None,
         };
         let headers = vec![(
             "x-forwarded-for".to_owned(),
@@ -1400,6 +1589,7 @@ mod gap_tests {
                 semantic_headers: std::collections::HashSet::new(),
                 enabled_categories: None,
                 scan_body: true,
+                max_scan_seconds: None,
             },
             &config(),
         );

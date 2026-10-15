@@ -505,7 +505,9 @@ pub const PATTERNS_CUSTOM_KEY_NAME: &str = PATTERNS_CUSTOM_KEY;
 /// `semantic:{attack_type}`.
 fn threat_identity(threat: &Threat, sensitive: &SensitiveNames) -> String {
     match threat {
-        Threat::Regex(regex) => redact_blob_for_display(&regex.pattern, sensitive),
+        Threat::Regex(regex) | Threat::PatternTimeout(regex) => {
+            redact_blob_for_display(&regex.pattern, sensitive)
+        }
         Threat::Semantic(semantic) => format!("semantic:{}", semantic.attack_type),
     }
 }
@@ -797,7 +799,7 @@ mod tests {
     /// `None` and is exercised by the constructed threat below).
     fn regex_source(threat: &Threat) -> Option<&str> {
         match threat {
-            Threat::Regex(regex) => Some(&regex.pattern),
+            Threat::Regex(regex) | Threat::PatternTimeout(regex) => Some(&regex.pattern),
             Threat::Semantic(_) => None,
         }
     }
