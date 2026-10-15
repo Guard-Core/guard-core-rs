@@ -636,9 +636,10 @@ pub fn scan_view_budgeted(
     threats
 }
 
-/// The synthetic `pattern_timeout` threat recorded when the scan time
-/// budget is spent (reference `_scan_time_budget_exhausted_threat`): empty
-/// match, position 0, category `custom`, the `custom` category weight.
+/// The synthetic `pattern_timeout` threat for a spent scan time budget.
+///
+/// Mirrors the reference `_scan_time_budget_exhausted_threat`: empty match,
+/// position 0, category `custom`, the `custom` category weight.
 #[must_use]
 pub fn scan_time_budget_exhausted_threat() -> RegexThreat {
     RegexThreat {
