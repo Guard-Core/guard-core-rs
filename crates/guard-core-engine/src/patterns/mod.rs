@@ -25,6 +25,7 @@ pub mod xml_xxe;
 
 use std::sync::LazyLock;
 
+use crate::scan_budget::{SCAN_TIME_BUDGET_EXHAUSTED_PATTERN, ScanTimeBudget};
 use pyregex::{Candidate, PyRegex};
 
 /// A regex threat exactly as the reference `_build_regex_threat` emits it.
@@ -576,6 +577,7 @@ fn size_gated(content: &str) -> bool {
 
 /// One view pass of `_check_regex_patterns`: context filter, per-pattern
 /// dispatch, validator and binary-density gates, first accepted threat each.
+/// Runs with no scan time cap.
 #[must_use]
 pub fn scan_view(
     content: &str,
@@ -584,10 +586,38 @@ pub fn scan_view(
     skip_filter: bool,
     validator_context: &str,
 ) -> Vec<RegexThreat> {
+    scan_view_budgeted(
+        content,
+        filter,
+        normalized_context,
+        skip_filter,
+        validator_context,
+        &mut ScanTimeBudget::unbounded(),
+    )
+}
+
+/// [`scan_view`] under a per-request scan time budget.
+///
+/// Every pattern scan is charged to `budget`, and once it is spent the pass
+/// records the [`scan_time_budget_exhausted_threat`] and stops (the
+/// reference checks `_scan_time_budget_exhausted` between patterns).
+#[must_use]
+pub fn scan_view_budgeted(
+    content: &str,
+    filter: ViewFilter,
+    normalized_context: &str,
+    skip_filter: bool,
+    validator_context: &str,
+    budget: &mut ScanTimeBudget,
+) -> Vec<RegexThreat> {
     let binary_prefix = binary::build_binary_prefix(content);
     let gating = size_gated(content);
     let mut threats = Vec::new();
     for entry in COMPILED_TABLE.iter() {
+        if budget.exhausted() {
+            threats.push(scan_time_budget_exhausted_threat());
+            break;
+        }
         if is_excluded_from_view(entry.entry.source, filter) {
             continue;
         }
@@ -597,13 +627,27 @@ pub fn scan_view(
         if gating && SIZE_GATED_IDS.contains(&entry.entry.id) {
             continue;
         }
-        if let Some(threat) =
-            find_first_threat(entry, content, validator_context, Some(&binary_prefix))
+        if let Some(threat) = budget
+            .measure(|| find_first_threat(entry, content, validator_context, Some(&binary_prefix)))
         {
             threats.push(threat);
         }
     }
     threats
+}
+
+/// The synthetic `pattern_timeout` threat recorded when the scan time
+/// budget is spent (reference `_scan_time_budget_exhausted_threat`): empty
+/// match, position 0, category `custom`, the `custom` category weight.
+#[must_use]
+pub fn scan_time_budget_exhausted_threat() -> RegexThreat {
+    RegexThreat {
+        pattern: SCAN_TIME_BUDGET_EXHAUSTED_PATTERN.to_owned(),
+        match_text: String::new(),
+        position: 0,
+        category: "custom".to_owned(),
+        weight: 1.0,
+    }
 }
 
 /// `_check_decoded_view_path_traversal`: the `\.\.[\\/]` shape fires only

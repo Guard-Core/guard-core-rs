@@ -369,6 +369,12 @@ pub struct SecurityConfig {
     pub endpoint_rate_limits: BTreeMap<String, (u32, u64)>,
     /// `detection_compiler_timeout` (seconds, 0.1..=10.0).
     pub detection_compiler_timeout: f64,
+    /// `detection_max_scan_seconds` (seconds, 0.1..=60.0): the per-request
+    /// cap on the summed regex scan CPU time, not wall time. Once spent the
+    /// remaining patterns and values are skipped and a weighted
+    /// `pattern_timeout` threat blocks the request. See
+    /// [`crate::scan_budget`].
+    pub detection_max_scan_seconds: f64,
     /// `detection_pattern_validation_cache_path`.
     pub detection_pattern_validation_cache_path: Option<String>,
     /// `detection_max_content_length` (1000..=100000).
@@ -562,6 +568,7 @@ impl Default for SecurityConfig {
             emergency_whitelist: Vec::new(),
             endpoint_rate_limits: BTreeMap::new(),
             detection_compiler_timeout: 2.0,
+            detection_max_scan_seconds: 10.0,
             detection_pattern_validation_cache_path: None,
             detection_max_content_length: 10_000,
             detection_max_body_inspect_bytes: 262_144,
@@ -685,6 +692,9 @@ impl SecurityConfig {
         }
         if !(2..=100_000).contains(&self.detection_max_scan_values) {
             problems.push("detection_max_scan_values must be between 2 and 100000".to_owned());
+        }
+        if !(0.1..=60.0).contains(&self.detection_max_scan_seconds) {
+            problems.push("detection_max_scan_seconds must be between 0.1 and 60.0".to_owned());
         }
         if !(1024..=262_144).contains(&self.detection_max_scan_chars) {
             problems.push("detection_max_scan_chars must be between 1024 and 262144".to_owned());
@@ -969,6 +979,7 @@ mod tests {
         assert!(config.emergency_whitelist.is_empty());
         assert!(config.endpoint_rate_limits.is_empty());
         assert!((config.detection_compiler_timeout - 2.0).abs() < f64::EPSILON);
+        assert!((config.detection_max_scan_seconds - 10.0).abs() < f64::EPSILON);
         assert_eq!(config.detection_pattern_validation_cache_path, None);
         assert_eq!(config.detection_max_content_length, 10_000);
         assert_eq!(config.detection_max_body_inspect_bytes, 262_144);
@@ -1125,6 +1136,14 @@ mod tests {
                 }),
             ),
             (
+                "detection_max_scan_seconds",
+                Box::new(|config: &mut SecurityConfig| config.detection_max_scan_seconds = 0.09),
+            ),
+            (
+                "detection_max_scan_seconds",
+                Box::new(|config: &mut SecurityConfig| config.detection_max_scan_seconds = 60.1),
+            ),
+            (
                 "detection_max_scan_values",
                 Box::new(|config: &mut SecurityConfig| config.detection_max_scan_values = 1),
             ),
@@ -1212,6 +1231,15 @@ mod tests {
                 "{field}: {:?}",
                 error.problems
             );
+        }
+    }
+
+    #[test]
+    fn detection_max_scan_seconds_accepts_its_inclusive_bounds() {
+        for ok in [0.1, 10.0, 60.0] {
+            let mut config = SecurityConfig::default();
+            config.detection_max_scan_seconds = ok;
+            assert!(config.validate().is_ok(), "{ok}");
         }
     }
 

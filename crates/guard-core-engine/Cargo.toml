@@ -20,6 +20,11 @@ serde                 = { workspace = true }
 serde_json            = { workspace = true }
 unicode-normalization = { workspace = true }
 
+# Safe per-thread CPU clock for the scan time budget (the crate forbids
+# `unsafe`, so no direct libc call). Elsewhere the budget falls back to wall time.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
+rustix = { version = "1", default-features = false, features = ["time"] }
+
 # The killable probe child: the pattern-safety chain self-execs this
 # binary (hidden subcommand) so a runaway backtracking loop can be killed
 # on deadline.
