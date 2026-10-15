@@ -192,7 +192,21 @@ pub fn load_last_known_rules_snapshot(payload: &str) -> Result<DynamicRules, Sna
             snapshot.schema_version
         )));
     }
+    if !snapshot.rules.auto_ban_overrides_valid() {
+        return Err(SnapshotError(String::from(
+            "snapshot decode: auto_ban_threshold and auto_ban_duration must be >= 1",
+        )));
+    }
     Ok(snapshot.rules)
+}
+
+impl DynamicRules {
+    /// The pydantic `ge=1` constraints on the auto-ban overrides: the
+    /// reference rejects the whole delivery when either is zero.
+    #[must_use]
+    pub const fn auto_ban_overrides_valid(&self) -> bool {
+        !matches!(self.auto_ban_threshold, Some(0)) && !matches!(self.auto_ban_duration, Some(0))
+    }
 }
 
 /// `_has_rule_expired`: past `expires_at` at `now` (an absent expiry
@@ -356,15 +370,22 @@ pub fn apply_to_config_with_validation_cache(
         }
     }
 
-    // `_apply_country_rules`: the uppercased sets.
-    if !rules.blocked_countries.is_empty() {
+    // `_apply_country_rules`: the uppercased sets. Without a geo handler
+    // or an ipinfo token nothing can resolve an IP to a country, so the
+    // reference skips the rules (it warns) instead of installing them.
+    let countries_resolvable = config.geo_ip_handler.is_some()
+        || config
+            .ipinfo_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
+    if countries_resolvable && !rules.blocked_countries.is_empty() {
         config.blocked_countries = rules
             .blocked_countries
             .iter()
             .map(|c| c.to_uppercase())
             .collect::<BTreeSet<_>>();
     }
-    if !rules.whitelist_countries.is_empty() {
+    if countries_resolvable && !rules.whitelist_countries.is_empty() {
         config.whitelist_countries = rules
             .whitelist_countries
             .iter()
@@ -375,9 +396,11 @@ pub fn apply_to_config_with_validation_cache(
     // `_apply_rate_limit_rules`: the global tier (the window only moves
     // with a limit) and the endpoint tiers (clamped to the config's u32
     // limit width).
-    if let Some(limit) = rules.global_rate_limit {
+    // Zero is falsy in the reference (`if rules.global_rate_limit:`), so a
+    // zero limit or window leaves the config alone.
+    if let Some(limit) = rules.global_rate_limit.filter(|limit| *limit > 0) {
         config.rate_limit = u32::try_from(limit).unwrap_or(u32::MAX);
-        if let Some(window) = rules.global_rate_window {
+        if let Some(window) = rules.global_rate_window.filter(|window| *window > 0) {
             config.rate_limit_window = window;
         }
     }
@@ -597,9 +620,58 @@ mod dynamic_rules_tests {
     }
 
     #[test]
+    fn country_rules_need_a_resolver_and_zero_rate_limits_are_ignored() {
+        let mut config = SecurityConfig {
+            rate_limit: 100,
+            rate_limit_window: 60,
+            ..SecurityConfig::default()
+        };
+        let mut r = rules();
+        r.blocked_countries = vec![String::from("cn")];
+        r.whitelist_countries = vec![String::from("us")];
+        r.global_rate_limit = Some(0);
+        apply_to_config(&mut config, &r);
+        assert!(config.blocked_countries.is_empty());
+        assert!(config.whitelist_countries.is_empty());
+        assert_eq!(config.rate_limit, 100);
+
+        config.ipinfo_token = Some(String::new());
+        apply_to_config(&mut config, &r);
+        assert!(
+            config.blocked_countries.is_empty(),
+            "an empty token is falsy"
+        );
+
+        config.ipinfo_token = Some(String::from("token"));
+        r.global_rate_limit = Some(5);
+        r.global_rate_window = Some(0);
+        apply_to_config(&mut config, &r);
+        assert_eq!(
+            config.blocked_countries,
+            BTreeSet::from([String::from("CN")])
+        );
+        assert_eq!((config.rate_limit, config.rate_limit_window), (5, 60));
+    }
+
+    #[test]
+    fn a_zero_auto_ban_override_is_an_invalid_delivery() {
+        let mut r = rules();
+        assert!(r.auto_ban_overrides_valid());
+        r.auto_ban_threshold = Some(0);
+        assert!(!r.auto_ban_overrides_valid());
+        r.auto_ban_threshold = None;
+        r.auto_ban_duration = Some(0);
+        assert!(!r.auto_ban_overrides_valid());
+        let payload = dump_last_known_rules_snapshot(&r).expect("dumps");
+        let error = load_last_known_rules_snapshot(&payload).expect_err("rejects");
+        assert!(error.to_string().contains(">= 1"));
+    }
+
+    #[test]
     fn the_application_lands_every_config_surface() {
         let mut config = SecurityConfig {
             auto_ban_threshold: 10,
+            ipinfo_token: Some(String::from("token")),
             ..SecurityConfig::default()
         };
 
