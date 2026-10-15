@@ -343,7 +343,17 @@ pub struct SecurityConfig {
     pub agent_install_id: Option<String>,
     /// `agent_payload_signing_secret`.
     pub agent_payload_signing_secret: Option<String>,
-    /// `enable_dynamic_rules` (requires `enable_agent`).
+    /// `enable_dynamic_rules` (requires `enable_agent`). Lets the `SaaS`
+    /// dashboard change protection at runtime without a code change: a rule
+    /// bans the IPs in its `ip_blacklist` (for `ip_ban_duration` seconds),
+    /// unbans the IPs in its `ip_whitelist`, adds its `suspicious_patterns`
+    /// to detection, and replaces `blocked_countries`, `whitelist_countries`,
+    /// `rate_limit`, `rate_limit_window`, `endpoint_rate_limits`,
+    /// `block_cloud_providers`, `blocked_user_agents`,
+    /// `enable_penetration_detection`, `enable_ip_banning`,
+    /// `enable_rate_limiting`, `enable_rate_limit_auto_ban`,
+    /// `auto_ban_threshold`, `auto_ban_duration`, `emergency_mode` and
+    /// `emergency_whitelist`. A rule cannot change any other setting.
     pub enable_dynamic_rules: bool,
     /// `dynamic_rule_interval` (seconds, at least 60).
     pub dynamic_rule_interval: u64,
