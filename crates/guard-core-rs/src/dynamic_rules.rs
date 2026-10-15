@@ -89,9 +89,9 @@ pub const DYNAMIC_RULES_HANDLER_NAME: &str = "dynamic_rules";
 /// The pre-rule config snapshot (`_SNAPSHOT_FIELDS`): the fifteen
 /// fields a rule may mutate, captured before the first application and
 /// restored when the rule expires.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_field_names, clippy::struct_excessive_bools)]
-struct SnapshotConfig {
+pub(crate) struct SnapshotConfig {
     blocked_countries: std::collections::BTreeSet<String>,
     whitelist_countries: std::collections::BTreeSet<String>,
     rate_limit: u32,
@@ -110,7 +110,7 @@ struct SnapshotConfig {
 }
 
 impl SnapshotConfig {
-    fn capture(config: &SecurityConfig) -> Self {
+    pub(crate) fn capture(config: &SecurityConfig) -> Self {
         Self {
             blocked_countries: config.blocked_countries.clone(),
             whitelist_countries: config.whitelist_countries.clone(),
@@ -128,6 +128,26 @@ impl SnapshotConfig {
             auto_ban_duration: config.auto_ban_duration,
             enable_rate_limit_auto_ban: config.enable_rate_limit_auto_ban,
         }
+    }
+
+    /// Whether `config` still carries exactly the captured values (no
+    /// clone: the per-request staleness check of the live stages).
+    pub(crate) fn matches(&self, config: &SecurityConfig) -> bool {
+        self.blocked_countries == config.blocked_countries
+            && self.whitelist_countries == config.whitelist_countries
+            && self.rate_limit == config.rate_limit
+            && self.rate_limit_window == config.rate_limit_window
+            && self.endpoint_rate_limits == config.endpoint_rate_limits
+            && self.block_cloud_providers == config.block_cloud_providers
+            && self.blocked_user_agents == config.blocked_user_agents
+            && self.enable_penetration_detection == config.enable_penetration_detection
+            && self.enable_ip_banning == config.enable_ip_banning
+            && self.enable_rate_limiting == config.enable_rate_limiting
+            && self.emergency_mode == config.emergency_mode
+            && self.emergency_whitelist == config.emergency_whitelist
+            && self.auto_ban_threshold == config.auto_ban_threshold
+            && self.auto_ban_duration == config.auto_ban_duration
+            && self.enable_rate_limit_auto_ban == config.enable_rate_limit_auto_ban
     }
 
     fn restore(self, config: &mut SecurityConfig) {

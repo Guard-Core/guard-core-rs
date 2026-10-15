@@ -14,6 +14,13 @@
 //! and detection groups; the bridge methods hand them out so the existing
 //! resolver seams consume one carrier.
 //!
+//! # Strict route resolution
+//!
+//! The reference `RouteConfigCheck` answers a request the adapter reported
+//! as unresolved (`guard_route_unresolved`) with a `500` when
+//! `route_resolution_strict` is set (a log-only event under `passive_mode`).
+//! The constants below are that answer, shared by the adapters.
+//!
 //! # Example
 //!
 //! ```
@@ -217,6 +224,22 @@ impl RouteConfig {
 /// reference `RouteConfigResolver` resolves the same tuple; the adapter's
 /// router is the authority on the match.
 pub type RouteConfigResolver = Arc<dyn Fn(&str, &str) -> Option<Arc<RouteConfig>> + Send + Sync>;
+
+/// The status of the strict-route-resolution rejection.
+pub const UNRESOLVED_ROUTE_STATUS: u16 = 500;
+
+/// The body of the strict-route-resolution rejection (the reference
+/// `create_error_response` default message).
+pub const UNRESOLVED_ROUTE_MESSAGE: &str = "Route resolution failed";
+
+/// The reason the unresolved-route log line and event carry
+/// (`UNRESOLVED_ROUTE_REASON`).
+pub const UNRESOLVED_ROUTE_REASON: &str =
+    "Route resolution failed; per-route decorator config could not be applied";
+
+/// The check name the rejection reports to the `on_block` hook
+/// (`RouteConfigCheck.check_name`).
+pub const UNRESOLVED_ROUTE_CHECK_NAME: &str = "route_config";
 
 #[cfg(test)]
 mod tests {

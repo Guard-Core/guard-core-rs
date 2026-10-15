@@ -84,6 +84,7 @@ pub mod geo;
 pub mod geo_lifecycle;
 pub mod headers_auth;
 pub mod https_enforcement;
+pub mod live;
 pub mod logging;
 pub mod metrics;
 pub mod mmdb;

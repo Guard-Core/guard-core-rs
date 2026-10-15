@@ -559,6 +559,24 @@ impl RateLimiter {
         })
     }
 
+    /// A limiter over `config` that shares this one's window store, clock
+    /// and distributed store: the live-config swap a dynamic rule drives
+    /// (the limits change, the recorded windows stay).
+    ///
+    /// # Errors
+    ///
+    /// Same fail-closed validation as [`RateLimiter::new`].
+    pub fn with_config(&self, config: RateLimitConfig) -> Result<Self, RateLimitConfigError> {
+        let fresh = Self::with_config_and_clock(config, Arc::clone(&self.clock))?;
+        Ok(Self {
+            windows: Arc::clone(&self.windows),
+            store: self.store.clone(),
+            redis_prefix: self.redis_prefix.clone(),
+            redis_fail_open: self.redis_fail_open,
+            ..fresh
+        })
+    }
+
     /// Swap the wall clock. Test seam: production builds use the system
     /// clock; deterministic window-sliding coverage injects a fake.
     /// Run the limiter over a distributed window store (the reference
