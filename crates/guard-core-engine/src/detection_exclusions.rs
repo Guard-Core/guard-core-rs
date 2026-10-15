@@ -338,6 +338,25 @@ pub fn value_looks_like_address_chain(value: &str) -> bool {
     })
 }
 
+/// The values one header contributes to the scan (`_header_items_to_scan`).
+///
+/// The `Cookie` header scans one `name=value` pair at a time: as one value,
+/// the semicolons between cookies count as command separators in the
+/// semantic score. Only spaces around a pair are trimmed (so a CR or LF
+/// stays in the scanned value) and empty pairs are skipped. Every other
+/// header is a single value.
+fn header_items_to_scan<'a>(name: &str, value: &'a str) -> Vec<&'a str> {
+    if name.trim().eq_ignore_ascii_case("cookie") {
+        value
+            .split(';')
+            .map(|pair| pair.trim_matches(' '))
+            .filter(|pair| !pair.is_empty())
+            .collect()
+    } else {
+        vec![value]
+    }
+}
+
 /// The request surfaces one scan pass covers (the `detectThreat` input
 /// shape). Headers and query params are `(name, value)` pairs; body values
 /// are the [`crate::body_scan`] extraction's output.
@@ -408,11 +427,53 @@ impl ScanBudget {
         true
     }
 }
+/// One candidate value of the multi-surface scan.
+struct ScanValue<'a> {
+    content: &'a str,
+    context: &'a str,
+    skip_categories: &'static [&'static str],
+    skip_semantic: bool,
+}
+
+/// The header surface: one [`ScanValue`] per [`header_items_to_scan`] item,
+/// carrying the excluded-header category skips and the semantic-only skip.
+fn push_header_values<'a>(
+    values: &mut Vec<ScanValue<'a>>,
+    headers: &'a [(String, String)],
+    exclusions: &ResolvedExclusions,
+) {
+    for (name, value) in headers {
+        if value.is_empty() {
+            continue;
+        }
+        let skip_semantic = exclusions
+            .semantic_headers
+            .contains(&name.trim().to_ascii_lowercase());
+        let excluded = exclusions
+            .excluded_headers
+            .contains(&name.to_ascii_lowercase());
+        for pair in header_items_to_scan(name, value) {
+            values.push(ScanValue {
+                content: pair,
+                context: "header",
+                skip_categories: if excluded {
+                    excluded_header_skip_categories(name, pair)
+                } else {
+                    &[]
+                },
+                skip_semantic,
+            });
+        }
+    }
+}
+
 /// The multi-surface scan (`detectThreat`).
 ///
 /// Scan the request surfaces in the reference order - URL path, query
 /// params (skipping excluded names), headers (excluded names scan with
-/// their known-false-positive categories suppressed), then the body surface
+/// their known-false-positive categories suppressed, the `Cookie` header one
+/// `name=value` pair at a time, headers in the semantic-only set skipping
+/// the semantic analyzer), then the body surface
 /// when [`ResolvedExclusions::scan_body`] is set - and return the first
 /// value that produces an enabled category.
 ///
@@ -428,16 +489,9 @@ pub fn scan_request(
     exclusions: &ResolvedExclusions,
     config: &DetectConfig,
 ) -> RequestScanVerdict {
-    struct Value<'a> {
-        content: &'a str,
-        context: &'a str,
-        skip_categories: &'static [&'static str],
-        skip_semantic: bool,
-    }
-
-    let mut values: Vec<Value<'_>> = Vec::new();
+    let mut values: Vec<ScanValue<'_>> = Vec::new();
     if let Some(path) = surfaces.url_path.filter(|path| !path.is_empty()) {
-        values.push(Value {
+        values.push(ScanValue {
             content: path,
             context: "url_path",
             skip_categories: &[],
@@ -451,37 +505,14 @@ pub fn scan_request(
         {
             continue;
         }
-        values.push(Value {
+        values.push(ScanValue {
             content: value,
             context: "query_param",
             skip_categories: &[],
             skip_semantic: false,
         });
     }
-    for (name, value) in surfaces.headers {
-        if value.is_empty() {
-            continue;
-        }
-        let skip_semantic = exclusions
-            .semantic_headers
-            .contains(&name.trim().to_ascii_lowercase());
-        let excluded = exclusions
-            .excluded_headers
-            .contains(&name.to_ascii_lowercase());
-        let skip_categories = |value: &str| -> &'static [&'static str] {
-            if excluded {
-                excluded_header_skip_categories(name, value)
-            } else {
-                &[]
-            }
-        };
-        values.push(Value {
-            content: value,
-            context: "header",
-            skip_categories: skip_categories(value),
-            skip_semantic,
-        });
-    }
+    push_header_values(&mut values, surfaces.headers, exclusions);
     // The body values borrow the extraction's owned strings, so the owned
     // vector is kept in a binding that outlives the scan loop.
     let body_values: Vec<BodyScanValue> = if exclusions.scan_body {
@@ -501,7 +532,7 @@ pub fn scan_request(
             // categories.
             return forced_verdict(core::slice::from_ref(&forced));
         }
-        values.push(Value {
+        values.push(ScanValue {
             content: &value.content,
             context: &value.context,
             skip_categories: &[],
@@ -853,6 +884,101 @@ mod tests {
         };
         let verdict = scan_header_with_xss_body("X-Session", SESSION_COOKIE, None, Some(&route));
         assert_eq!(verdict.categories, vec!["xss".to_owned()]);
+    }
+
+    /// One cookie pair that trips the semantic analyzer alone (no regex
+    /// category), to prove the semantic opt-out applies per pair.
+    const SEMANTIC_ONLY_PAIR: &str = "${x} <t> (y) [z] {w} a://b c://d <b>call(f(x))</b> {{render(jinja(template(mustache(handlebars(ejs(pug(twig)))))))}}";
+
+    fn scan_headers(headers: &[(&str, &str)], config: &DetectConfig) -> RequestScanVerdict {
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        scan_request(
+            &RequestSurfaces {
+                url_path: None,
+                query_params: &[],
+                headers: &headers,
+                content_type: "",
+                raw_body: "",
+            },
+            &resolve(None, None),
+            config,
+        )
+    }
+
+    #[test]
+    fn a_logged_in_cookie_header_is_not_flagged() {
+        let cookie = scan_header_with_xss_body("Cookie", SESSION_COOKIE, None, None);
+        assert_eq!(
+            cookie.categories,
+            vec!["xss".to_owned()],
+            "each pair scans on its own, so the session cookie is not a threat"
+        );
+        let other = scan_header_with_xss_body("x-session", SESSION_COOKIE, None, None);
+        assert!(
+            other.categories.is_empty(),
+            "control: the same value in another header scans as one value"
+        );
+    }
+
+    #[test]
+    fn an_attack_in_one_cookie_is_still_detected() {
+        for (cookie, category) in [
+            ("theme=dark; q=<script>alert(1)</script>", "xss"),
+            ("theme=dark; id=1' OR 1=1--", "sqli"),
+            ("theme=dark;\r\nSet-Cookie: admin=1", "http_split"),
+        ] {
+            let verdict = scan_headers(&[("Cookie", cookie)], &corpus_config());
+            assert!(
+                verdict.categories.iter().any(|found| found == category),
+                "{cookie:?} must detect {category}, got {:?}",
+                verdict.categories
+            );
+        }
+    }
+
+    #[test]
+    fn the_semantic_exclusion_applies_to_each_cookie_pair() {
+        let cookie = format!("theme=dark; {SEMANTIC_ONLY_PAIR}");
+        let blocked = scan_header_with_xss_body("cookie", &cookie, None, None);
+        assert!(
+            blocked.categories.is_empty(),
+            "control: the pair trips the semantic analyzer and ends the scan"
+        );
+        let global = DetectionExclusionConfig {
+            excluded_semantic_detection_headers: vec!["Cookie".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let verdict = scan_header_with_xss_body("cookie", &cookie, Some(&global), None);
+        assert_eq!(verdict.categories, vec!["xss".to_owned()]);
+    }
+
+    #[test]
+    fn each_cookie_pair_counts_against_the_value_budget() {
+        let mut config = corpus_config();
+        config.max_scan_values = 2;
+        let verdict = scan_headers(
+            &[("cookie", "a=1; b=2; c=<script>alert(1)</script>")],
+            &config,
+        );
+        assert!(
+            verdict.categories.is_empty(),
+            "the pair holding the attack is the third value, past the cap"
+        );
+    }
+
+    #[test]
+    fn empty_cookie_pairs_are_skipped_and_only_spaces_are_trimmed() {
+        let mut config = corpus_config();
+        config.max_scan_values = 1;
+        let verdict = scan_headers(&[("cookie", " ; ;; <script>alert(1)</script> ;")], &config);
+        assert_eq!(
+            verdict.categories,
+            vec!["xss".to_owned()],
+            "empty pairs take no budget"
+        );
     }
 
     #[test]
