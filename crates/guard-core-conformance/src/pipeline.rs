@@ -856,18 +856,23 @@ impl CaseEngine {
             }
             let mut contributing: Vec<String> = Vec::new();
             for threat in &verdict.threats {
-                if let detect::Threat::Regex(regex) = threat
-                    && !skip_categories.contains(&regex.category.as_str())
-                    && !contributing.contains(&regex.category.clone())
-                {
-                    contributing.push(regex.category.clone());
+                let category = match threat {
+                    detect::Threat::Regex(regex) | detect::Threat::PatternTimeout(regex) => {
+                        if skip_categories.contains(&regex.category.as_str()) {
+                            continue;
+                        }
+                        regex.category.clone()
+                    }
+                    detect::Threat::Semantic(semantic) => semantic.attack_type.clone(),
+                };
+                if !contributing.contains(&category) {
+                    contributing.push(category);
                 }
             }
             if contributing.is_empty() {
-                // The reference's per-value category filter is terminal:
-                // a threat whose categories are all filtered out ends the
-                // scan clean.
-                break;
+                // Every threat of this value was filtered out: not a
+                // threat, keep scanning the later values.
+                continue;
             }
             for category in contributing {
                 if !categories.contains(&category) {
@@ -1535,7 +1540,7 @@ mod tests {
     }
 
     #[test]
-    fn excluded_headers_end_the_scan_clean_and_plain_headers_scan() {
+    fn excluded_headers_report_nothing_and_plain_headers_scan() {
         let routes = BTreeMap::from([(
             "/api".to_owned(),
             json!({"excluded_detection_headers": ["x-forwarded"]}),
@@ -1545,7 +1550,7 @@ mod tests {
             .headers
             .insert("X-Forwarded".to_owned(), "10.0.0.1, 10.0.0.2".to_owned());
         let observed = run_case(&excluded, &knobs()).unwrap();
-        // the ssrf-only finding is filtered out entirely: the scan ends clean
+        // the ssrf-only finding is filtered out entirely: nothing is reported
         assert_eq!(observed[0].status, None);
 
         // a plain header still reaches the detection feed unexcluded
@@ -2007,15 +2012,14 @@ mod unit_twins {
     }
 
     fn semantic_body_drive() -> PipelineDrive {
-        // a body whose verdict is semantic-only: the per-value category
-        // filter ends the scan clean
+        // a body whose verdict is semantic-only
         PipelineDrive {
             client_ip: "10.0.0.1".to_owned(),
             method: Some("POST".to_owned()),
             url_path: Some("/api".to_owned()),
             headers: BTreeMap::new(),
             body: Some(String::from(
-                "from where drop select WhetherOrNotThisIsPaddingTextWithLetters ({}$x==) foo(",
+                "session=eyJhbGciOiAiRVMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAiM2YyYzFiOWUtOGE0Ny00ZDJlLTljMWYtNWI2YTdkOGU5ZjAxIiwgIm5hbWUiOiAiSmFuZSBEb2UgKEFjbWUpIiwgImVtYWlsIjogImphbmUuZG9lQGV4YW1wbGUuY29tIiwgInJvbGVzIjogWyJhZG1pbiJdLCAiaWF0IjogMTc5MjAwMDAwMCwgImV4cCI6IDE3OTIwMDA5MDB9.AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw; theme=system; _ga=GA1.1.123456789.1792000000",
             )),
             stage: None,
             response_status: None,
@@ -2099,7 +2103,7 @@ mod unit_twins {
     }
 
     #[test]
-    fn a_semantic_only_body_ends_the_scan_clean() {
+    fn a_semantic_only_body_is_reported_by_attack_type() {
         let case = PipelineCase {
             id: "semantic_case".to_owned(),
             config: Value::Null,
@@ -2111,10 +2115,31 @@ mod unit_twins {
         let engine = CaseEngine::new(&case, detect_config()).expect("valid config");
         let finding = engine.scan(&semantic_body_drive(), None);
         assert!(
-            !finding.is_threat,
-            "semantic-only evidence is not a regex finding: {finding:?}"
+            finding.is_threat,
+            "semantic evidence is a finding: {finding:?}"
         );
-        assert!(finding.categories.is_empty());
-        assert!(finding.trigger_info.is_empty());
+        assert!(!finding.categories.is_empty());
+    }
+
+    #[test]
+    fn a_semantic_body_does_not_hide_a_later_header_threat() {
+        let case = PipelineCase {
+            id: "semantic_then_header".to_owned(),
+            config: Value::Null,
+            geo_countries: BTreeMap::new(),
+            routes: BTreeMap::new(),
+            drives: vec![semantic_body_drive()],
+            expected: Vec::new(),
+        };
+        let engine = CaseEngine::new(&case, detect_config()).expect("valid config");
+        let mut drive = semantic_body_drive();
+        drive
+            .headers
+            .insert("x-probe".to_owned(), "<script>alert(1)</script>".to_owned());
+        let finding = engine.scan(&drive, None);
+        assert!(
+            finding.categories.iter().any(|c| c == "xss"),
+            "the later header is still scanned: {finding:?}"
+        );
     }
 }
