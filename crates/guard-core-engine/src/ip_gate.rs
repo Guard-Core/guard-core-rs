@@ -69,6 +69,8 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use crate::geo::{CountryGate, GeoIpHandler, check_route_country};
 use std::str::FromStr;
 
 /// The skip state a request carries after it passed the global IP gate.
@@ -362,8 +364,28 @@ impl IpGateConfig {
     }
 }
 
+impl IpGateConfig {
+    /// Evaluate the unknown client identity (no resolvable client address;
+    /// the reference `UNKNOWN_CLIENT_IDENTITY`, its
+    /// `_check_unknown_identity_access`): with a non-empty whitelist the
+    /// identity can never match it, so it is denied; otherwise it passes
+    /// with no skip state (it is neither whitelisted nor exempt, and the
+    /// blacklist is not consulted). Callers skip this exactly where they
+    /// skip [`IpGateConfig::evaluate`] (a route whitelist overriding the
+    /// global lists).
+    #[must_use]
+    pub fn evaluate_unknown(&self) -> IpGateVerdict {
+        if self.whitelist.is_empty() {
+            IpGateVerdict::Allowed(IpGateDecision::default())
+        } else {
+            IpGateVerdict::Denied(IpGateDenial::NotInWhitelist)
+        }
+    }
+}
+
 /// The outcome of the route-level IP gate for one request IP
-/// (`check_route_ip_access`'s tri-state, the country arms aside).
+/// (`check_route_ip_access`'s tri-state, the country arms aside; see
+/// [`RouteIpGate::evaluate_access`] for the combined verdict).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteIpVerdict {
     /// The route IP lists leave the request alone: neither list matched in a
@@ -376,6 +398,21 @@ pub enum RouteIpVerdict {
     /// A route blacklist match, or a miss under a configured route
     /// whitelist: the route stage denies.
     Denied,
+}
+
+/// The combined route verdict of [`RouteIpGate::evaluate_access`]: the
+/// reference `check_route_ip_access` result plus the skip flag the
+/// reference derives from the route's country verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteAccess {
+    /// `Denied` is the reference `False`, `Allowed` is `True`,
+    /// `Unrestricted` is `None`.
+    pub verdict: RouteIpVerdict,
+    /// The route country verdict was `True` (a configured route
+    /// `whitelist_countries` matched): the reference
+    /// `_route_country_whitelist_matched`, the `skip_countries` flag of the
+    /// global stage.
+    pub country_whitelist_matched: bool,
 }
 
 /// The route-level IP gate: a route decorator's `ip_whitelist` and
@@ -498,6 +535,58 @@ impl RouteIpGate {
             return RouteIpVerdict::Denied;
         }
         RouteIpVerdict::Unrestricted
+    }
+}
+
+impl RouteIpGate {
+    /// The full reference `check_route_ip_access`: the IP-list verdict
+    /// combined with the route's country verdict
+    /// ([`check_route_country`]). `Denied` if either arm is false,
+    /// `Allowed` if either is true, otherwise `Unrestricted`, so a route
+    /// whitelist match no longer overrides a blocked country.
+    ///
+    /// `ip` is `None` for the unknown client identity: it is denied when
+    /// the route configures an `ip_whitelist` or a `whitelist_countries`
+    /// and unrestricted otherwise (the reference
+    /// `_route_whitelist_configured`). `countries` carries the route's
+    /// `blocked_countries` / `whitelist_countries`; no `handler` leaves the
+    /// country arm without a verdict.
+    #[must_use]
+    pub fn evaluate_access(
+        &self,
+        ip: Option<IpAddr>,
+        countries: &CountryGate,
+        handler: Option<&dyn GeoIpHandler>,
+    ) -> RouteAccess {
+        let Some(ip) = ip else {
+            let restricted =
+                self.whitelist_configured() || !countries.whitelist_countries.is_empty();
+            return RouteAccess {
+                verdict: if restricted {
+                    RouteIpVerdict::Denied
+                } else {
+                    RouteIpVerdict::Unrestricted
+                },
+                country_whitelist_matched: false,
+            };
+        };
+        let ip_result = match self.evaluate(ip) {
+            RouteIpVerdict::Unrestricted => None,
+            RouteIpVerdict::Allowed => Some(true),
+            RouteIpVerdict::Denied => Some(false),
+        };
+        let country_result = check_route_country(ip, countries, handler);
+        let verdict = if ip_result == Some(false) || country_result == Some(false) {
+            RouteIpVerdict::Denied
+        } else if ip_result == Some(true) || country_result == Some(true) {
+            RouteIpVerdict::Allowed
+        } else {
+            RouteIpVerdict::Unrestricted
+        };
+        RouteAccess {
+            verdict,
+            country_whitelist_matched: country_result == Some(true),
+        }
     }
 }
 

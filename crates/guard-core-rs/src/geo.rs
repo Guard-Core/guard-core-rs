@@ -39,13 +39,13 @@
 //!   `UNKNOWN_CLIENT_IDENTITY` sentinel (list checks apply); the Rust
 //!   family has one representation for both, and this stage takes the
 //!   fail-closed reading for restrictive whitelists.
-//! - **Not mirrored**: the reference's per-route country rules
-//!   (`RouteConfig.blocked_countries` / `whitelist_countries` via
-//!   `check_country_access` - no route system yet, so this stage is the
-//!   global rules only), the `log_country_check_level` verdict logging and
+//! - **Not mirrored**: the `log_country_check_level` verdict logging and
 //!   the `EVENT_IP_BLOCKED` emission, and the geolocation itself (the
 //!   reference reads an `IPInfo` `MMDB`; the adapter supplies the
-//!   [`GeoIpHandler`] verdicts).
+//!   [`GeoIpHandler`] verdicts). This stage is the global rules only: the
+//!   per-route country rules (`RouteConfig.blocked_countries` /
+//!   `whitelist_countries`, the reference `check_country_access`) live in the
+//!   engine's `RouteIpGate::evaluate_access` and the adapters compose them.
 //!
 //! # Example
 //!
