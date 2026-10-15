@@ -210,8 +210,71 @@ impl ResponseProcessor {
         body_prefix: Option<&[u8]>,
         now: SystemTime,
     ) -> Option<BehaviorAction> {
+        self.run(request, response, body_prefix, now, false)
+    }
+
+    /// The pass for an `exclude_paths` request (the reference
+    /// `guard_exclusion_scoped` run): the behavioral tracker is withheld, so
+    /// no return rule is evaluated, while the metrics, the security headers,
+    /// the CORS verdict and the modifier run exactly as for any request.
+    pub fn process_scoped(
+        &self,
+        request: &RequestBits,
+        response: &mut ResponseBits,
+        now: SystemTime,
+    ) -> Option<BehaviorAction> {
+        self.run(request, response, None, now, true)
+    }
+
+    /// The reference `apply_modifier` on its own: only the
+    /// `custom_response_modifier` runs (the all-checks-bypass route calls
+    /// the real downstream and applies nothing else).
+    pub fn apply_modifier(&self, request: &RequestBits, response: &mut ResponseBits) {
+        let Some(modifier) = &self.response_modifier else {
+            return;
+        };
+        let unmodified = response.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            modifier(response);
+        }));
+        if outcome.is_err() {
+            *response = unmodified;
+            self.report_error(
+                "custom_response_modifier",
+                "the response modifier panicked; returning unmodified response",
+                &[("path", request.url_path.as_str())],
+            );
+        }
+    }
+
+    /// Whether a response body capture can change the outcome: the body is
+    /// scanned (`behavior_scan_response_body`) and a `return_pattern` rule
+    /// matches on the body (a `status:` rule never reads it).
+    #[must_use]
+    pub fn needs_response_body(&self) -> bool {
+        self.scan_response_body
+            && self.global_rules.iter().any(|rule| {
+                rule.rule_type == "return_pattern" && !rule.pattern.starts_with("status:")
+            })
+    }
+
+    /// The reference `behavior_max_response_body_inspect_bytes` budget: the
+    /// most body bytes the rules read.
+    #[must_use]
+    pub const fn max_inspect_bytes(&self) -> usize {
+        self.max_inspect_bytes
+    }
+
+    fn run(
+        &self,
+        request: &RequestBits,
+        response: &mut ResponseBits,
+        body_prefix: Option<&[u8]>,
+        now: SystemTime,
+        scoped: bool,
+    ) -> Option<BehaviorAction> {
         let mut last_action = None;
-        if !self.global_rules.is_empty() {
+        if !scoped && !self.global_rules.is_empty() {
             let prefix = self.scan_response_body.then_some(body_prefix).flatten();
             let mut tracker = self.tracker.lock().expect("behavior tracker");
             for rule in &self.global_rules {
@@ -274,23 +337,8 @@ impl ResponseProcessor {
         }
 
         // The reference `apply_modifier`: the callback runs LAST over the
-        // finished response view. A panicking callback restores the
-        // unmodified response (the reference's except arm) and reports
-        // through the on_error hook.
-        if let Some(modifier) = &self.response_modifier {
-            let unmodified = response.clone();
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                modifier(response);
-            }));
-            if outcome.is_err() {
-                *response = unmodified;
-                self.report_error(
-                    "custom_response_modifier",
-                    "the response modifier panicked; returning unmodified response",
-                    &[("path", request.url_path.as_str())],
-                );
-            }
-        }
+        // finished response view.
+        self.apply_modifier(request, response);
 
         last_action
     }
@@ -419,6 +467,103 @@ pub fn process_response(
 mod tests {
     use super::*;
     use guard_core_engine::security_headers::HstsConfig;
+
+    fn body_rule(pattern: &str) -> BehaviorRule {
+        BehaviorRule {
+            pattern: pattern.to_owned(),
+            ..ban_rule(1)
+        }
+    }
+
+    #[test]
+    fn the_scoped_pass_skips_the_return_rules_but_keeps_the_rest() {
+        let bans = IpBanManager::new();
+        let scoped = processor(
+            vec![ban_rule(0)],
+            Some(SecurityHeadersConfig::reference_default()),
+            None,
+            bans.clone(),
+        )
+        .with_response_modifier(Arc::new(|response: &mut ResponseBits| {
+            response
+                .headers
+                .insert("X-Modified".to_owned(), "yes".to_owned());
+        }));
+        let request = request(None);
+        let mut response = ResponseBits {
+            status: 404,
+            body: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        let action = scoped.process_scoped(&request, &mut response, std::time::SystemTime::now());
+        assert_eq!(action, None, "an excluded path never trips a return rule");
+        assert!(!bans.is_banned(ip("192.0.2.10")), "nothing was banned");
+        assert!(response.headers.contains_key("X-Content-Type-Options"));
+        assert_eq!(
+            response.headers.get("X-Modified").map(String::as_str),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn the_modifier_alone_runs_without_the_rest_of_the_pass() {
+        let modifier_only = processor(
+            vec![ban_rule(0)],
+            Some(SecurityHeadersConfig::reference_default()),
+            None,
+            IpBanManager::new(),
+        )
+        .with_response_modifier(Arc::new(|response: &mut ResponseBits| {
+            response.status = 202;
+        }));
+        let mut response = ResponseBits {
+            status: 200,
+            body: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        modifier_only.apply_modifier(&request(None), &mut response);
+        assert_eq!(response.status, 202);
+        assert!(response.headers.is_empty(), "no security headers land");
+    }
+
+    #[test]
+    fn the_body_capture_is_needed_only_for_body_return_rules() {
+        let status_only = processor(
+            vec![body_rule("status:404")],
+            None,
+            None,
+            IpBanManager::new(),
+        );
+        assert!(!status_only.needs_response_body());
+        let with_body = processor(
+            vec![body_rule("Not Found")],
+            None,
+            None,
+            IpBanManager::new(),
+        );
+        assert!(with_body.needs_response_body());
+        assert_eq!(
+            with_body.max_inspect_bytes(),
+            DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES
+        );
+        let no_scan = ResponseProcessor::new(
+            None,
+            None,
+            vec![body_rule("Not Found")],
+            Arc::new(Mutex::new(BehaviorTracker::new())),
+            IpBanManager::new(),
+            false,
+            DEFAULT_MAX_RESPONSE_BODY_INSPECT_BYTES,
+            false,
+        );
+        assert!(!no_scan.needs_response_body());
+        let usage = BehaviorRule {
+            rule_type: "usage".to_owned(),
+            ..body_rule("Not Found")
+        };
+        let usage_only = processor(vec![usage], None, None, IpBanManager::new());
+        assert!(!usage_only.needs_response_body());
+    }
     #[test]
     fn the_response_modifier_runs_last_and_restores_on_panic() {
         let hooked = processor(

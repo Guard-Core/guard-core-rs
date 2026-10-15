@@ -27,6 +27,7 @@ pub mod ip_extraction;
 pub mod ip_gate;
 pub mod json_walk;
 pub mod multipart_scan;
+pub mod path_matching;
 pub mod patterns;
 pub mod payload;
 pub mod performance_monitor;
