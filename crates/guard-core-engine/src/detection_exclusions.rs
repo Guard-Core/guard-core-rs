@@ -489,12 +489,13 @@ fn push_header_values<'a>(
 /// when [`ResolvedExclusions::scan_body`] is set - and return the first
 /// value that produces an enabled category.
 ///
-/// A value that is a threat but whose categories are all filtered out ends
-/// the scan with a clean verdict, exactly like the reference: the
-/// per-value category filter is terminal, not a reason to keep scanning
-/// later values. Regex threats carry the category; semantic threats carry
-/// none (the reference's semantic payloads have no `category` and never
-/// contribute here), but still mark the value a threat.
+/// A value none of whose threats is reportable (every category filtered out
+/// or skipped) is not a threat: the scan continues with the next value,
+/// like the reference's `_check_value_enhanced` miss. Regex threats count
+/// only when their category is enabled and not skipped for the value;
+/// semantic threats are never category-filtered and report their attack
+/// type as the category (`_threat_category`). A threat with no threats list
+/// reports as `uncategorized`.
 #[must_use]
 pub fn scan_request(
     surfaces: &RequestSurfaces<'_>,
@@ -594,29 +595,28 @@ pub fn scan_request(
         let mut categories: Vec<String> = Vec::new();
         for threat in &verdict.threats {
             let category = match threat {
-                Threat::Regex(regex) => Some(regex.category.clone()),
-                // Semantic threats carry no category (the reference's
-                // semantic payloads have no `category` key and are
-                // skipped by the `category == ""` guard).
-                Threat::Semantic(_) | Threat::PatternTimeout(_) => None,
+                Threat::Regex(regex) | Threat::PatternTimeout(regex) => {
+                    if !category_enabled(&regex.category, exclusions.enabled_categories.as_ref())
+                        || value.skip_categories.contains(&regex.category.as_str())
+                    {
+                        continue;
+                    }
+                    regex.category.clone()
+                }
+                Threat::Semantic(semantic) => semantic.attack_type.clone(),
             };
-            let Some(category) = category else {
-                continue;
-            };
-            if !category_enabled(&category, exclusions.enabled_categories.as_ref())
-                || value.skip_categories.contains(&category.as_str())
-                || categories.contains(&category)
-            {
-                continue;
+            if !categories.contains(&category) {
+                categories.push(category);
             }
-            categories.push(category);
+        }
+        if verdict.threats.is_empty() {
+            categories.push("uncategorized".to_owned());
         }
         if categories.is_empty() {
-            // A threat whose categories are all filtered out ends the scan
-            // clean, exactly the reference's terminal per-value filter.
-            return RequestScanVerdict::default();
+            // Every threat of this value was filtered out: not a threat,
+            // keep scanning the later values.
+            continue;
         }
-        categories.sort();
         return verdict_from(categories);
     }
 
@@ -858,9 +858,9 @@ mod tests {
             .count()
     }
 
-    /// Scan one header next to an xss body: a semantic-only hit on the
-    /// header ends the scan clean (the terminal per-value filter), so the
-    /// xss body is reached only when the header is not a threat.
+    /// Scan one header next to an xss body. A semantic hit on the header is
+    /// reported (its attack type is a category) and the xss body is still
+    /// scanned, so the verdict names both when the semantic analyzer runs.
     fn scan_header_with_xss_body(
         name: &str,
         value: &str,
@@ -990,8 +990,11 @@ mod tests {
         );
         let other = scan_header_with_xss_body("x-session", SESSION_COOKIE, None, None);
         assert!(
-            other.categories.is_empty(),
-            "control: the same value in another header scans as one value"
+            other.is_threat
+                && !other.categories.is_empty()
+                && other.categories != cookie.categories,
+            "control: the same value in another header scans as one value and is reported on its own: {:?}",
+            other.categories
         );
     }
 
@@ -1016,8 +1019,9 @@ mod tests {
         let cookie = format!("theme=dark; {SEMANTIC_ONLY_PAIR}");
         let blocked = scan_header_with_xss_body("cookie", &cookie, None, None);
         assert!(
-            blocked.categories.is_empty(),
-            "control: the pair trips the semantic analyzer and ends the scan"
+            blocked.is_threat && !blocked.categories.is_empty() && blocked.categories != ["xss"],
+            "control: the pair trips the semantic analyzer and is reported: {:?}",
+            blocked.categories
         );
         let global = DetectionExclusionConfig {
             excluded_semantic_detection_headers: vec!["Cookie".to_owned()],
@@ -1406,10 +1410,9 @@ mod tests {
     }
 
     #[test]
-    fn filtered_out_threat_ends_the_scan_clean() {
-        // The reference's terminal per-value filter: a threat whose
-        // categories are all disabled ends the scan with a clean verdict
-        // instead of continuing to later values.
+    fn filtered_out_threat_alone_is_clean() {
+        // A value whose threats are all filtered out is not a threat; with
+        // no later value to carry one, the verdict is clean.
         let route = RouteDetectionExclusions {
             enabled_detection_categories: Some(vec!["xss".to_owned()]),
             ..RouteDetectionExclusions::default()
@@ -1425,6 +1428,88 @@ mod tests {
         let verdict = scan_request(&surfaces, &exclusions, &corpus_config());
         assert!(!verdict.is_threat);
         assert!(verdict.categories.is_empty());
+    }
+
+    const XSS: &str = "<script>alert(1)</script>";
+
+    fn semantic_only_value() -> String {
+        SESSION_COOKIE.to_owned()
+    }
+
+    fn scan_surfaces(
+        exclusions: &ResolvedExclusions,
+        query: &[(String, String)],
+        headers: &[(String, String)],
+    ) -> RequestScanVerdict {
+        let surfaces = RequestSurfaces {
+            url_path: Some("/x"),
+            query_params: query,
+            headers,
+            content_type: "",
+            raw_body: "",
+        };
+        scan_request(&surfaces, exclusions, &corpus_config())
+    }
+
+    #[test]
+    fn semantic_only_value_is_reported() {
+        let query = [("q".to_owned(), semantic_only_value())];
+        let verdict = scan_surfaces(&resolve(None, None), &query, &[]);
+        assert!(verdict.is_threat, "semantic-only threat must be reported");
+        assert!(!verdict.categories.is_empty());
+    }
+
+    #[test]
+    fn filtered_out_value_does_not_end_the_scan() {
+        let headers = [
+            (
+                "x-forwarded-host".to_owned(),
+                "http://169.254.169.254/latest/meta-data/".to_owned(),
+            ),
+            ("x-evil".to_owned(), XSS.to_owned()),
+        ];
+        let verdict = scan_surfaces(&resolve(None, None), &[], &headers);
+        assert_eq!(verdict.categories, vec!["xss".to_owned()]);
+    }
+
+    #[test]
+    fn disabled_category_does_not_end_the_scan() {
+        let route = RouteDetectionExclusions {
+            enabled_detection_categories: Some(vec!["xss".to_owned()]),
+            ..RouteDetectionExclusions::default()
+        };
+        let query = [("q".to_owned(), "1 UNION SELECT password".to_owned())];
+        let headers = [("x-evil".to_owned(), XSS.to_owned())];
+        let verdict = scan_surfaces(&resolve(None, Some(&route)), &query, &headers);
+        assert_eq!(verdict.categories, vec!["xss".to_owned()]);
+    }
+
+    #[test]
+    fn a_threat_without_a_threats_list_reports_as_uncategorized() {
+        // a zero score threshold makes any value a threat with no threats
+        let config = DetectConfig {
+            threat_score_threshold: 0.0,
+            ..corpus_config()
+        };
+        let query = [("q".to_owned(), "hello".to_owned())];
+        let surfaces = RequestSurfaces {
+            url_path: None,
+            query_params: &query,
+            headers: &[],
+            content_type: "",
+            raw_body: "",
+        };
+        let verdict = scan_request(&surfaces, &resolve(None, None), &config);
+        assert!(verdict.is_threat);
+        assert_eq!(verdict.categories, vec!["uncategorized".to_owned()]);
+    }
+
+    #[test]
+    fn semantic_then_header_xss_is_still_reported() {
+        let query = [("q".to_owned(), semantic_only_value())];
+        let headers = [("x-evil".to_owned(), XSS.to_owned())];
+        let verdict = scan_surfaces(&resolve(None, None), &query, &headers);
+        assert!(verdict.is_threat);
     }
 
     #[test]
@@ -1572,16 +1657,17 @@ mod gap_tests {
             &exclusions,
             &config(),
         );
-        // the ssrf category is filtered out, and with nothing left the scan
-        // ends clean (the terminal per-value filter)
+        // the ssrf category is filtered out and no later value carries a
+        // threat, so the verdict is clean
         assert!(!verdict.is_threat);
         assert!(verdict.categories.is_empty());
     }
 
     #[test]
-    fn a_semantic_threat_contributes_no_category_to_the_reason() {
+    fn a_semantic_threat_reports_its_attack_type_beside_the_regex_categories() {
         // the obfuscated keyword blob trips the semantic analyzer alongside
-        // the regex sqli hits: only the regex categories are reportable
+        // the regex sqli hits: the semantic attack_type is a category too
+        // (`_threat_category`)
         let content = format!(
             "select union insert update delete drop from where order group having concat \
              substring database table column (1 OR 1=1) {}",
@@ -1607,6 +1693,9 @@ mod gap_tests {
             &config(),
         );
         assert!(verdict.is_threat);
-        assert_eq!(verdict.categories, vec!["sqli".to_owned()]);
+        assert_eq!(
+            verdict.categories,
+            vec!["sql".to_owned(), "sqli".to_owned()]
+        );
     }
 }

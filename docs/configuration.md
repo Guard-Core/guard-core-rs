@@ -226,11 +226,11 @@ suppressed, `ssrf` for the address-carrying proxy headers and for
 whole-address-chain values, so a payload in the same header still
 detects), then the body surface when `scan_body` is set (form pairs,
 multipart parts, JSON walks, and the blob fallback, each honoring the
-excluded body fields). A value that is a threat but whose categories are
-all filtered out ends the scan clean - the reference's per-value filter is
-terminal, not a reason to keep scanning later values. Regex threats carry
-the category; semantic threats carry none (the reference's semantic
-payloads have no `category` key). Mongo-operator JSON keys
+excluded body fields). A value none of whose threats is reportable (every category disabled or
+skipped for it) is not a threat and the scan continues with the next
+value. Regex threats count only when their category is enabled and not
+skipped; semantic threats are never category-filtered and report their
+attack type as the category. Mongo-operator JSON keys
 (`$where`, `$ne`, ...) hit from the walk unfiltered by the category set.
 
 Route toggles: `detection_enabled(global, route)` applies the route's
