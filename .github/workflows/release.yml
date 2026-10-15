@@ -1,125 +1,130 @@
-name: Release Gate
+name: Release
 
+# Publishes guard-core-engine and guard-core-rs to crates.io for a release
+# tag. Nothing is linted or tested here: the tagged commit must already have
+# passed the push workflows listed in REQUIRED_WORKFLOWS (ci.yml runs fmt,
+# clippy on stable and on the MSRV, tests, coverage and conformance). A
+# release can therefore never fail on a check its pull request did not run.
+#
+# Re-drive: run this workflow by hand (Actions > Release > Run workflow) with
+# the tag, for example v4.4.0. It checks out that tag, so a fixed workflow on
+# master can publish an existing tag. Crates already on crates.io are skipped.
 on:
-  push:
-    tags:
-      - 'v*'
   release:
     types: [created]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish, for example v4.4.0'
+        required: true
 
 permissions: {}
 
+concurrency:
+  group: release-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+
 env:
-  CARGO_INCREMENTAL: 0
-  CARGO_NET_RETRY: 10
   CARGO_TERM_COLOR: always
+  REQUIRED_WORKFLOWS: >-
+    .github/workflows/ci.yml
+    .github/workflows/ecosystem-gate.yml
+    .github/workflows/live-smoke.yml
+    .github/workflows/fuzz.yml
 
 jobs:
-  test:
-    name: Test at tag (${{ matrix.rust }})
+  verify:
+    name: Tagged commit passed CI
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        rust: ['stable', '1.92.0']
+      actions: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
-      - name: Checkout tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          toolchain: ${{ matrix.rust }}
-          components: rustfmt, clippy
-          rustflags: ""
-
-      - name: cargo fmt check
-        run: cargo fmt --all -- --check
-
-      - name: cargo clippy
-        run: cargo clippy --workspace --all-targets --exclude guard-core-python -- -D warnings
-
-      - name: cargo test
-        run: cargo test --workspace --exclude guard-core-python
-
-  conformance:
-    name: Conformance gate at tag (spec 4.1.0)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          rustflags: ""
-
-      - name: Build the pattern-probe child
-        run: cargo build -p guard-core-engine --bins
-
-      - name: Ledger integrity
-        run: cargo test -p guard-core-conformance --test ledger_integrity -- --nocapture
-
-      - name: Conformance gate
-        run: cargo test -p guard-core-conformance --test conformance -- --nocapture
-
-  tag-consistency:
-    name: Tag matches crate version
-    needs: [test, conformance]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout tag
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install the Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          rustflags: ""
-
-      # Publishing is automated: the publish job below runs on GitHub
-      # release creation. This tag/version consistency gate remains the
-      # cheap check that the tag matches the published crate versions.
-      - name: Verify tag equals the crate versions
+      - name: Resolve the tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
-          tag="${GITHUB_REF_NAME#v}"
-          for crate in guard-core-rs guard-core-engine; do
+          tag="${INPUT_TAG:-$RELEASE_TAG}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag '$tag' is not of the form v1.2.3"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          rustflags: ""
+
+      - name: Verify the tag equals the crate versions
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          for crate in guard-core-engine guard-core-rs; do
             version=$(cargo metadata --no-deps --format-version 1 | jq -r --arg c "$crate" '.packages[] | select(.name == $c) | .version')
-            if [ "$tag" != "$version" ]; then
-              echo "tag v$tag does not match $crate version $version"
+            if [ "${TAG#v}" != "$version" ]; then
+              echo "::error::tag $TAG does not match $crate version $version"
               exit 1
             fi
-            echo "ok: tag v$tag matches $crate version $version"
+            echo "ok: $TAG matches $crate $version"
           done
+
+      # The newest push run of each required workflow on the tagged commit
+      # must have succeeded. A release created right after a merge waits for
+      # them (up to an hour) instead of failing.
+      - name: Require green CI on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          for _ in $(seq 1 60); do
+            runs=$(gh api "repos/$REPO/actions/runs?head_sha=$sha&event=push&per_page=100" \
+              --jq '[.workflow_runs | group_by(.path)[] | max_by(.run_number) | {path, status, conclusion}]')
+            waiting=0
+            for wf in $REQUIRED_WORKFLOWS; do
+              run=$(jq -c --arg p "$wf" '.[] | select(.path == $p)' <<< "$runs")
+              if [ -z "$run" ]; then
+                echo "$wf: no push run on $sha yet"; waiting=1; continue
+              fi
+              status=$(jq -r .status <<< "$run"); conclusion=$(jq -r .conclusion <<< "$run")
+              if [ "$status" != "completed" ]; then
+                echo "$wf: $status"; waiting=1
+              elif [ "$conclusion" != "success" ]; then
+                echo "::error::$wf concluded $conclusion on $sha; fix master and release a new tag"
+                exit 1
+              else
+                echo "ok: $wf success on $sha"
+              fi
+            done
+            [ "$waiting" = "0" ] && exit 0
+            sleep 60
+          done
+          echo "::error::required workflows did not finish on $sha within an hour"
+          exit 1
 
   publish:
     name: Publish to crates.io
-    needs: tag-consistency
-    # Trusted publishing (crates.io enforces it for these crates): the job
-    # exchanges the Actions OIDC token via id-token: write. workflow_dispatch
-    # is allowed so a publish can be re-driven after a partial failure
-    # (master's crate versions must match the intended release).
-    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Checkout release tag
+      - name: Checkout the tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ needs.verify.outputs.tag }}
           persist-credentials: false
 
       - name: Install the Rust toolchain
@@ -133,47 +138,29 @@ jobs:
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
         id: auth
 
-      # guard-core-rs depends on guard-core-engine, so the engine must go
-      # first. Each publish is retried up to 3 times (crates.io transient
-      # 5xx). A version already on crates.io (the partial-failure rerun)
-      # skips via the registry check, so a re-drive never blocks on the
-      # identical-version rejection.
-      - name: Publish guard-core-engine
+      # guard-core-rs depends on guard-core-engine, so the engine goes first
+      # (cargo publish waits until it is in the index). A version already on
+      # crates.io is skipped, so a re-drive after a partial failure is safe.
+      - name: Publish guard-core-engine, then guard-core-rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          TAG: ${{ needs.verify.outputs.tag }}
         run: |
-          set -o pipefail
-          tag="${GITHUB_REF_NAME#v}"
-          published=$(curl -fsSL -A "guard-core-rs release (https://github.com/Guard-Core/guard-core-rs)" "https://crates.io/api/v1/crates/guard-core-engine" | jq -r .crate.max_version || true)
-          if [ "$published" = "$tag" ]; then
-            echo "guard-core-engine $tag is already on crates.io; skipping"
-            exit 0
-          fi
-          for attempt in 1 2 3; do
-            if cargo publish -p guard-core-engine 2>&1 | tee /tmp/engine.log; then
-              exit 0
+          version="${TAG#v}"
+          for crate in guard-core-engine guard-core-rs; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -A "guard-core-rs release (https://github.com/Guard-Core/guard-core-rs)" \
+              "https://crates.io/api/v1/crates/$crate/$version")
+            if [ "$code" = "200" ]; then
+              echo "$crate $version is already on crates.io; skipping"
+              continue
             fi
-            echo "attempt $attempt failed; retrying in 30s"
-            sleep 30
+            for attempt in 1 2 3; do
+              if cargo publish -p "$crate" --locked; then
+                continue 2
+              fi
+              echo "attempt $attempt failed; retrying in 30s"
+              sleep 30
+            done
+            echo "::error::$crate publish failed after 3 attempts"
+            exit 1
           done
-          echo "guard-core-engine publish failed after 3 attempts"
-          exit 1
-
-      - name: Publish guard-core-rs
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          set -o pipefail
-          for attempt in 1 2 3; do
-            if cargo publish -p guard-core-rs 2>&1 | tee /tmp/facade.log; then
-              exit 0
-            fi
-            if grep -q "already exists" /tmp/facade.log; then
-              echo "guard-core-rs already published - continuing"
-              exit 0
-            fi
-            echo "attempt $attempt failed; retrying in 30s"
-            sleep 30
-          done
-          echo "guard-core-rs publish failed after 3 attempts"
-          exit 1
