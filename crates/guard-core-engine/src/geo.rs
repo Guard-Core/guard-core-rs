@@ -260,6 +260,49 @@ pub fn check_countries(
     None
 }
 
+/// The route-level country verdict: the reference `check_country_access`
+/// (`guard_core/core/checks/helpers.py`), the country arm of
+/// `check_route_ip_access`.
+///
+/// ```text
+/// no handler:                                       None (no verdict)
+/// blocked_countries non-empty, country listed:      Some(false)
+/// whitelist_countries non-empty:
+///     country resolved and listed:                  Some(true)
+///     anything else (unresolved, unlisted):         Some(false)
+/// otherwise:                                        None
+/// ```
+///
+/// Unlike [`check_countries`] this has no loopback exemption and no
+/// "whitelist outranks blocklist" shortcut: `blocked_countries` is asked
+/// first, so a country in both lists is `Some(false)`, and the verdict is
+/// tri-state because a route whitelist match (`Some(true)`) also skips the
+/// global country stage. An empty country string reads as unresolved.
+#[must_use]
+pub fn check_route_country(
+    ip: IpAddr,
+    gate: &CountryGate,
+    handler: Option<&dyn GeoIpHandler>,
+) -> Option<bool> {
+    let handler = handler?;
+    let resolve = || handler.get_country(ip).filter(|code| !code.is_empty());
+    let mut country = None;
+    if !gate.blocked_countries.is_empty() {
+        country = resolve();
+        if country
+            .as_ref()
+            .is_some_and(|code| gate.blocked_countries.contains(code))
+        {
+            return Some(false);
+        }
+    }
+    if !gate.whitelist_countries.is_empty() {
+        let country = country.or_else(resolve);
+        return Some(country.is_some_and(|code| gate.whitelist_countries.contains(&code)));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
