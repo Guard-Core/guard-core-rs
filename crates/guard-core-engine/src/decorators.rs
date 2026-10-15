@@ -555,8 +555,10 @@ impl SecurityDecorator {
         self
     }
 
-    /// `@detection_exclusion`: the route's five detection knobs; every
-    /// `None` leaves that knob untouched.
+    /// `@detection_exclusion`: the route's six detection knobs; every
+    /// `None` leaves that knob untouched. `semantic_headers` adds header
+    /// names whose values skip the semantic analyzer only.
+    #[allow(clippy::too_many_arguments)]
     pub fn detection_exclusion(
         &mut self,
         route_id: &str,
@@ -565,9 +567,11 @@ impl SecurityDecorator {
         body_fields: Option<BTreeSet<String>>,
         categories: Option<BTreeSet<String>>,
         scan_body: Option<bool>,
+        semantic_headers: Option<BTreeSet<String>>,
     ) -> &mut Self {
         let present = [
             headers.is_some(),
+            semantic_headers.is_some(),
             params.is_some(),
             body_fields.is_some(),
             categories.is_some(),
@@ -579,6 +583,9 @@ impl SecurityDecorator {
         let route = self.ensure_route_config(route_id);
         if let Some(headers) = headers {
             route.excluded_detection_headers = Some(headers);
+        }
+        if let Some(semantic_headers) = semantic_headers {
+            route.excluded_semantic_detection_headers = Some(semantic_headers);
         }
         if let Some(params) = params {
             route.excluded_detection_params = Some(params);
@@ -1125,8 +1132,13 @@ mod tests {
             None,
             Some(BTreeSet::from([String::from("xss")])),
             Some(false),
+            Some(BTreeSet::from([String::from("cookie")])),
         );
         let route = decorator.get_route_config("POST /scan-me").expect("route");
+        assert_eq!(
+            route.excluded_semantic_detection_headers,
+            Some(BTreeSet::from([String::from("cookie")]))
+        );
         assert_eq!(
             route.excluded_detection_headers,
             Some(BTreeSet::from([String::from("x-api-key")]))
@@ -1175,6 +1187,7 @@ mod tests {
             None,
             Some(BTreeSet::from([String::from("token")])),
             Some(BTreeSet::from([String::from("password")])),
+            None,
             None,
             None,
         );

@@ -14,7 +14,10 @@
 //!   `Suspicious activity detected from {ip}: {method} {url} - Reason: {reason} - Headers: {headers}`
 //! - `suspicious` (passive):
 //!   `[PASSIVE MODE] Penetration attempt detected from {ip}: {method} {url} - Trigger: {trigger} - Headers: {headers}`
-//!   (no `Trigger:` segment when `trigger_info` is empty)
+//!   when `trigger_info` is set; when it is empty (a passive rate-limit
+//!   hit, for example) the line is
+//!   `[PASSIVE MODE] Suspicious activity detected from {ip}: {method} {url} - Reason: {reason} - Headers: {headers}`,
+//!   so the reason is never dropped
 //! - any other `log_type`: `{Type} from {ip}: {method} {url} - Details: {reason} - Headers: {headers}`
 //!
 //! URL and headers run through [`crate::redact`] with the merged
@@ -165,8 +168,13 @@ pub fn log_activity(
         ),
         LogType::Suspicious => {
             if passive_mode {
+                let label = if trigger_info.is_empty() {
+                    "Suspicious activity"
+                } else {
+                    "Penetration attempt"
+                };
                 format!(
-                    "[PASSIVE MODE] Penetration attempt detected from {ip}: {} {}",
+                    "[PASSIVE MODE] {label} detected from {ip}: {} {}",
                     method.unwrap_or_default(),
                     redacted_url.as_deref().unwrap_or_default()
                 )
@@ -192,15 +200,12 @@ pub fn log_activity(
         }
         LogType::Suspicious => {
             if passive_mode {
-                let mut message = String::new();
-                if !trigger_info.is_empty() {
-                    message.push_str("Trigger: ");
-                    message.push_str(trigger_info);
-                    message.push_str(" - ");
+                let headers = display_headers(redacted_headers.as_ref());
+                if trigger_info.is_empty() {
+                    format!("Reason: {reason} - Headers: {headers}")
+                } else {
+                    format!("Trigger: {trigger_info} - Headers: {headers}")
                 }
-                message.push_str("Headers: ");
-                message.push_str(&display_headers(redacted_headers.as_ref()));
-                message
             } else {
                 format!(
                     "Reason: {reason} - Headers: {}",
@@ -497,7 +502,36 @@ mod tests {
             &names(),
         )
         .expect("logged");
-        assert!(line.ends_with("/q - Headers: {}"));
+        assert_eq!(
+            line,
+            "[PASSIVE MODE] Suspicious activity detected from 192.0.2.1: GET /q - \
+             Reason:  - Headers: {}"
+        );
+    }
+
+    #[test]
+    fn passive_without_trigger_keeps_the_reason() {
+        let line = log_activity(
+            LogType::Suspicious,
+            Some(LogLevel::Warning),
+            "Rate limit exceeded for IP: 192.0.2.1",
+            Some("192.0.2.1"),
+            Some("GET"),
+            Some("/q"),
+            None,
+            true,
+            "",
+            None,
+            None,
+            &names(),
+        )
+        .expect("logged");
+        assert_eq!(
+            line,
+            "[PASSIVE MODE] Suspicious activity detected from 192.0.2.1: GET /q - \
+             Reason: Rate limit exceeded for IP: 192.0.2.1 - Headers: {}"
+        );
+        assert!(!line.contains("Penetration attempt"));
     }
 
     #[test]

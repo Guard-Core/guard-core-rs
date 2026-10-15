@@ -100,6 +100,8 @@ pub struct RouteConfig {
     pub geo_rate_limits: Option<BTreeMap<String, (u32, u64)>>,
     /// `excluded_detection_headers`.
     pub excluded_detection_headers: Option<BTreeSet<String>>,
+    /// `excluded_semantic_detection_headers`.
+    pub excluded_semantic_detection_headers: Option<BTreeSet<String>>,
     /// `excluded_detection_params`.
     pub excluded_detection_params: Option<BTreeSet<String>>,
     /// `excluded_detection_body_fields`.
@@ -141,6 +143,7 @@ impl Default for RouteConfig {
             authorization_header_required: None,
             geo_rate_limits: None,
             excluded_detection_headers: None,
+            excluded_semantic_detection_headers: None,
             excluded_detection_params: None,
             excluded_detection_body_fields: None,
             enabled_detection_categories: None,
@@ -184,6 +187,10 @@ impl RouteConfig {
         RouteDetectionExclusions {
             excluded_detection_headers: self
                 .excluded_detection_headers
+                .as_ref()
+                .map(|set| set.iter().cloned().collect()),
+            excluded_semantic_detection_headers: self
+                .excluded_semantic_detection_headers
                 .as_ref()
                 .map(|set| set.iter().cloned().collect()),
             excluded_detection_params: self

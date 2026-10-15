@@ -418,6 +418,7 @@ impl CaseEngine {
                 excluded_detection_body_fields: list_at("excluded_detection_body_fields"),
                 enabled_detection_categories: None,
                 detection_scan_body: None,
+                ..RouteDetectionExclusions::default()
             };
             let exclusions = if overrides.get("excluded_detection_headers").is_some()
                 || overrides.get("excluded_detection_params").is_some()

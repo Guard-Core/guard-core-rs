@@ -343,7 +343,17 @@ pub struct SecurityConfig {
     pub agent_install_id: Option<String>,
     /// `agent_payload_signing_secret`.
     pub agent_payload_signing_secret: Option<String>,
-    /// `enable_dynamic_rules` (requires `enable_agent`).
+    /// `enable_dynamic_rules` (requires `enable_agent`). Lets the `SaaS`
+    /// dashboard change protection at runtime without a code change: a rule
+    /// bans the IPs in its `ip_blacklist` (for `ip_ban_duration` seconds),
+    /// unbans the IPs in its `ip_whitelist`, adds its `suspicious_patterns`
+    /// to detection, and replaces `blocked_countries`, `whitelist_countries`,
+    /// `rate_limit`, `rate_limit_window`, `endpoint_rate_limits`,
+    /// `block_cloud_providers`, `blocked_user_agents`,
+    /// `enable_penetration_detection`, `enable_ip_banning`,
+    /// `enable_rate_limiting`, `enable_rate_limit_auto_ban`,
+    /// `auto_ban_threshold`, `auto_ban_duration`, `emergency_mode` and
+    /// `emergency_whitelist`. A rule cannot change any other setting.
     pub enable_dynamic_rules: bool,
     /// `dynamic_rule_interval` (seconds, at least 60).
     pub dynamic_rule_interval: u64,
@@ -419,6 +429,12 @@ pub struct SecurityConfig {
     pub enable_enrichment: bool,
     /// `excluded_detection_headers`.
     pub excluded_detection_headers: BTreeSet<String>,
+    /// `excluded_semantic_detection_headers` (opt-in, default empty):
+    /// header names whose values skip the semantic analyzer only, matched
+    /// case-insensitively; regex category scanning is unchanged. Useful for
+    /// apps whose JWT session cookies score near the semantic threshold
+    /// (for example `cookie`, `authorization`).
+    pub excluded_semantic_detection_headers: BTreeSet<String>,
     /// `excluded_detection_params`.
     pub excluded_detection_params: BTreeSet<String>,
     /// `excluded_detection_body_fields`.
@@ -576,6 +592,7 @@ impl Default for SecurityConfig {
             logfire_service_name: String::from("guard-core"),
             enable_enrichment: false,
             excluded_detection_headers: BTreeSet::new(),
+            excluded_semantic_detection_headers: BTreeSet::new(),
             excluded_detection_params: BTreeSet::new(),
             excluded_detection_body_fields: BTreeSet::new(),
             detection_scan_body: true,
@@ -982,6 +999,7 @@ mod tests {
         assert_eq!(config.logfire_service_name, "guard-core");
         assert!(!config.enable_enrichment);
         assert!(config.excluded_detection_headers.is_empty());
+        assert!(config.excluded_semantic_detection_headers.is_empty());
         assert!(config.excluded_detection_params.is_empty());
         assert!(config.excluded_detection_body_fields.is_empty());
         assert!(config.detection_scan_body);

@@ -227,6 +227,21 @@ fn semantic_threats(
 /// The reference `detect` pipeline over one request content.
 #[must_use]
 pub fn detect(content: &str, request_context: &str, config: &DetectConfig) -> DetectVerdict {
+    detect_with_semantic_skip(content, request_context, config, false)
+}
+
+/// [`detect`] with the semantic analyzer optionally skipped.
+///
+/// The reference `_context_header_is_semantic_excluded`: the regex passes
+/// still run on the value, only the semantic threats are left out. The
+/// opt-in `excluded_semantic_detection_headers` path.
+#[must_use]
+pub fn detect_with_semantic_skip(
+    content: &str,
+    request_context: &str,
+    config: &DetectConfig,
+    skip_semantic: bool,
+) -> DetectVerdict {
     let original_length = content.chars().count();
     let (processed, decoded, decode_budget_exhausted) = preprocessor::preprocess_with_decoded(
         content,
@@ -307,7 +322,11 @@ pub fn detect(content: &str, request_context: &str, config: &DetectConfig) -> De
         ));
     }
 
-    let semantic = semantic_threats(&processed, content, config);
+    let semantic = if skip_semantic {
+        Vec::new()
+    } else {
+        semantic_threats(&processed, content, config)
+    };
 
     let anomaly = regex_anomaly(&regex_threats);
     let is_threat = anomaly >= config.threat_score_threshold || !semantic.is_empty();
