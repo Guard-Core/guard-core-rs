@@ -31,7 +31,7 @@
 //! | `on_error`, `custom_response_modifier`, `security_headers`, `enable_cors`, `cors_*`, `global_behavior_rules`, `behavior_scan_response_body`, `behavior_max_response_body_inspect_bytes` | [`Wiring::response_processor`] (the response pass) |
 //! | `log_suspicious_level`, `log_request_level`, `log_country_check_level`, `muted_check_logs`, `log_sensitive_*` | [`Wiring::request_logging`], [`Wiring::observability`] |
 //! | `enable_agent`, `agent_enable_events`, `agent_enable_metrics`, `muted_event_types`, `muted_metric_types`, `enable_otel`, `otel_*`, `enable_logfire`, `logfire_service_name`, `enable_enrichment`, `agent_project_id` | [`Wiring::telemetry`], [`Wiring::events`], [`Wiring::metrics`] over the injected [`WiringOptions::agent`] |
-//! | `enable_dynamic_rules`, `dynamic_rule_interval`, `dynamic_rules_cache_path`, `detection_pattern_validation_cache_path` | [`Wiring::dynamic_rules`] |
+//! | `enable_dynamic_rules`, `dynamic_rule_interval`, `dynamic_rules_cache_path`, `detection_pattern_validation_cache_path` | [`Wiring::dynamic_rules`], and [`Wiring::live`] for the fields a rule changes |
 //! | `route_resolution_strict`, `body_read_timeout`, `log_format`, `custom_log_file`, `sync_body_read_max_concurrent`, `lazy_init` | [`Wiring::config`] (the adapters read these where they own the seam) |
 //!
 //! The remaining fields have no engine-side consumer in a Rust adapter and
@@ -66,7 +66,9 @@ use guard_core_engine::path_matching::PathExclusions;
 use guard_core_engine::rate_limit::{
     RateLimitConfig, RateLimitConfigError, RateLimitEntry, RateLimiter,
 };
-use guard_core_engine::security_config::{LogLevel as ConfigLogLevel, SecurityConfig};
+use guard_core_engine::security_config::{
+    LogLevel as ConfigLogLevel, SecurityConfig, SecurityConfigError,
+};
 use guard_core_engine::user_agent::UserAgentFilter;
 
 use crate::cloud_provider::{CloudProviderStage, CloudProviderStageConfig};
@@ -79,6 +81,7 @@ use crate::geo::{GeoStage, GeoStageConfig};
 use crate::geo_lifecycle::{CloudRefreshScheduler, IpInfoManager};
 use crate::headers_auth::HeadersAuthStage;
 use crate::https_enforcement::{HttpsEnforcementStage, HttpsEnforcementStageConfig};
+use crate::live::LiveContext;
 use crate::logging::LogLevel;
 use crate::metrics::{MetricsCollector, SecurityMetric};
 use crate::process_response::ResponseProcessor;
@@ -121,6 +124,9 @@ pub enum WiringError {
     Redis(String),
     /// `ipinfo_token` is required to fetch the country database.
     Geo(String),
+    /// [`SecurityConfig::validate`] rejected the config (the reference
+    /// validates at construction).
+    Config(SecurityConfigError),
 }
 
 impl std::fmt::Display for WiringError {
@@ -133,6 +139,7 @@ impl std::fmt::Display for WiringError {
             Self::Cloud(error) => write!(f, "block_cloud_providers: {error}"),
             Self::Redis(message) => write!(f, "redis: {message}"),
             Self::Geo(message) => write!(f, "geo: {message}"),
+            Self::Config(error) => write!(f, "config: {}", error.problems.join("; ")),
         }
     }
 }
@@ -145,6 +152,7 @@ impl std::error::Error for WiringError {
             Self::UserAgent(error) => Some(error),
             Self::Ban(error) => Some(error),
             Self::Cloud(error) => Some(error),
+            Self::Config(error) => Some(error),
             Self::Redis(_) | Self::Geo(_) => None,
         }
     }
@@ -171,6 +179,12 @@ impl From<UserAgentConfigError> for WiringError {
 impl From<IpBanConfigError> for WiringError {
     fn from(error: IpBanConfigError) -> Self {
         Self::Ban(error)
+    }
+}
+
+impl From<SecurityConfigError> for WiringError {
+    fn from(error: SecurityConfigError) -> Self {
+        Self::Config(error)
     }
 }
 
@@ -353,8 +367,11 @@ pub struct Wiring {
     pub distributed: Option<Distributed>,
     /// `enable_redis` is set but this build has no Redis backend (the
     /// `redis` feature is off): rate limits and bans stay per process. The
-    /// reference default is `enable_redis = true`, so the default config
-    /// lands here in a build without the feature.
+    /// reference raises when `enable_redis` is set and the redis package is
+    /// missing, but its default config also sets `enable_redis` (and a
+    /// `redis_url`), so the Rust default config lands here in a build without
+    /// the feature and keeps constructing; the adapters forward a `redis`
+    /// feature to turn the backend on.
     pub redis_backend_missing: bool,
     /// The HTTPS-enforcement stage (always built: the route arm needs it).
     pub https: HttpsEnforcementStage,
@@ -398,6 +415,10 @@ pub struct Wiring {
     pub dynamic_rules: Option<DynamicRules>,
     /// The live config handle the dynamic-rule manager mutates.
     pub live_config: Arc<RwLock<SecurityConfig>>,
+    /// The seam an adapter reads per request so a rule-driven change to the
+    /// rate limits, country lists, blocked user agents, emergency mode or ban
+    /// knobs takes effect: see [`crate::live`].
+    pub live: LiveContext,
 }
 
 impl std::fmt::Debug for Wiring {
@@ -491,6 +512,33 @@ impl TelemetryHandler for CompositeSink {
     }
 }
 
+/// The rate-limit knobs the config describes (the limiter's own
+/// `enable_rate_limiting` switch included).
+pub(crate) fn rate_limit_config(
+    config: &SecurityConfig,
+) -> Result<RateLimitConfig, RateLimitConfigError> {
+    let mut endpoint_rate_limits = std::collections::HashMap::new();
+    for (path, (requests, window)) in &config.endpoint_rate_limits {
+        endpoint_rate_limits.insert(
+            path.clone(),
+            RateLimitEntry::new(*requests, *window).map_err(|error| RateLimitConfigError {
+                field: std::borrow::Cow::Owned(format!(
+                    "endpoint_rate_limits[{path}].{}",
+                    error.field
+                )),
+                reason: error.reason,
+            })?,
+        );
+    }
+    Ok(RateLimitConfig {
+        enable_rate_limiting: config.enable_rate_limiting,
+        rate_limit: config.rate_limit,
+        rate_limit_window: config.rate_limit_window,
+        enable_rate_limit_auto_ban: config.enable_rate_limit_auto_ban,
+        endpoint_rate_limits,
+    })
+}
+
 impl Wiring {
     /// Wire `config` with no injected collaborators.
     ///
@@ -507,8 +555,25 @@ impl Wiring {
     /// # Errors
     ///
     /// [`WiringError`] naming the value an engine constructor rejected.
-    #[allow(clippy::too_many_lines)]
     pub fn from_security_config_with(
+        config: &SecurityConfig,
+        options: &WiringOptions,
+    ) -> Result<Self, WiringError> {
+        // The reference validates at construction (the pydantic model).
+        config.validate()?;
+        Self::build_unvalidated(config, options)
+    }
+
+    /// [`Wiring::from_security_config_with`] without the
+    /// [`SecurityConfig::validate`] pass: the test seam for a config the
+    /// reference constraints would reject (a one second dynamic-rule poll,
+    /// say). A production host goes through the validating constructors.
+    ///
+    /// # Errors
+    ///
+    /// [`WiringError`] naming the value an engine constructor rejected.
+    #[allow(clippy::too_many_lines)]
+    pub fn build_unvalidated(
         config: &SecurityConfig,
         options: &WiringOptions,
     ) -> Result<Self, WiringError> {
@@ -563,28 +628,7 @@ impl Wiring {
         };
 
         let rate_limiter = if config.enable_rate_limiting {
-            let mut endpoint_rate_limits = std::collections::HashMap::new();
-            for (path, (requests, window)) in &config.endpoint_rate_limits {
-                endpoint_rate_limits.insert(
-                    path.clone(),
-                    RateLimitEntry::new(*requests, *window).map_err(|error| {
-                        RateLimitConfigError {
-                            field: std::borrow::Cow::Owned(format!(
-                                "endpoint_rate_limits[{path}].{}",
-                                error.field
-                            )),
-                            reason: error.reason,
-                        }
-                    })?,
-                );
-            }
-            Some(RateLimiter::new(RateLimitConfig {
-                enable_rate_limiting: true,
-                rate_limit: config.rate_limit,
-                rate_limit_window: config.rate_limit_window,
-                enable_rate_limit_auto_ban: config.enable_rate_limit_auto_ban,
-                endpoint_rate_limits,
-            })?)
+            Some(RateLimiter::new(rate_limit_config(config)?)?)
         } else {
             None
         };
@@ -674,11 +718,24 @@ impl Wiring {
         let response_processor = Self::build_response_processor(config, ip_ban.as_ref());
 
         let live_config = Arc::new(RwLock::new(config.clone()));
-        let dynamic_rules = Self::build_dynamic_rules(
-            config,
-            telemetry.as_ref(),
-            ip_ban.as_ref().map(|(manager, _)| manager),
-            &live_config,
+        let bans = match &ip_ban {
+            Some((manager, _)) => manager.clone(),
+            None => IpBanManager::with_trusted_proxies(address_proxies(config))?,
+        };
+        let dynamic_rules =
+            Self::build_dynamic_rules(config, telemetry.as_ref(), Some(&bans), &live_config);
+        let live = LiveContext::new(
+            Arc::clone(&live_config),
+            geo_handler.clone(),
+            cloud_refresh.as_ref().map_or_else(
+                || Arc::new(CloudIpTable::default()),
+                |refresh| Arc::clone(&refresh.table),
+            ),
+            match &rate_limiter {
+                Some(limiter) => limiter.clone(),
+                None => RateLimiter::new(RateLimitConfig::default())?,
+            },
+            bans,
         );
 
         Ok(Self {
@@ -721,6 +778,7 @@ impl Wiring {
             metrics,
             dynamic_rules,
             live_config,
+            live,
         })
     }
 
@@ -1031,7 +1089,7 @@ mod tests {
 
     fn with_agent(config: &SecurityConfig) -> (Wiring, Arc<CountingSink>) {
         let sink = Arc::new(CountingSink::default());
-        let wiring = Wiring::from_security_config_with(
+        let wiring = Wiring::build_unvalidated(
             config,
             &WiringOptions {
                 agent: Some(Arc::clone(&sink) as Arc<dyn TelemetryHandler>),
@@ -1094,7 +1152,13 @@ mod tests {
         config.blacklist = vec!["203.0.113.9".to_owned()];
         assert!(wire(&config).ip_gate.is_some());
         config.blacklist = vec!["not-an-ip".to_owned()];
-        assert!(matches!(wire_err(&config), WiringError::IpGate(_)));
+        // The validator names the bad list first; the stage constructor is
+        // the second line of defence for an unvalidated config.
+        assert!(matches!(wire_err(&config), WiringError::Config(_)));
+        assert!(matches!(
+            Wiring::build_unvalidated(&config, &WiringOptions::default()).expect_err("rejected"),
+            WiringError::IpGate(_)
+        ));
     }
 
     #[test]
@@ -1149,7 +1213,10 @@ mod tests {
             Ok(true)
         );
         config.trusted_proxies = vec!["also-bad".to_owned()];
-        assert!(matches!(wire_err(&config), WiringError::IpGate(_)));
+        assert!(matches!(
+            Wiring::build_unvalidated(&config, &WiringOptions::default()).expect_err("rejected"),
+            WiringError::IpGate(_)
+        ));
         config.trusted_proxies.clear();
         config.enable_ip_banning = false;
         assert!(wire(&config).ip_ban.is_none());
@@ -1174,6 +1241,17 @@ mod tests {
         assert!(matches!(wire_err(&config), WiringError::Redis(_)));
         config.enable_redis = false;
         assert!(wire(&config).distributed.is_none());
+    }
+
+    #[test]
+    fn an_invalid_config_is_rejected_at_wiring() {
+        let mut config = config();
+        config.enable_redis = false;
+        config.auto_ban_threshold = 0;
+        assert!(matches!(wire_err(&config), WiringError::Config(_)));
+        let message = wire_err(&config).to_string();
+        assert!(message.contains("auto_ban_threshold"), "{message}");
+        assert!(std::error::Error::source(&wire_err(&config)).is_some());
     }
 
     #[cfg(not(feature = "redis"))]
@@ -1574,7 +1652,12 @@ mod tests {
                 .into_owned(),
         );
         // Without a sink there is nothing to poll.
-        assert!(wire(&config).dynamic_rules.is_none());
+        assert!(
+            Wiring::build_unvalidated(&config, &WiringOptions::default())
+                .expect("wired")
+                .dynamic_rules
+                .is_none()
+        );
 
         let (wiring, sink) = with_agent(&config);
         let rules = wiring.dynamic_rules.as_ref().expect("driver");

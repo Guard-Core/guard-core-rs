@@ -243,6 +243,14 @@ fn content_type_block(limits: &ContentLimits, content_type: Option<&str>) -> Opt
     })
 }
 
+/// The status of a request body that did not arrive within
+/// `body_read_timeout` (`SecurityConfig::body_read_timeout`): the adapter
+/// answers it instead of forwarding a body it could not read in full.
+pub const BODY_READ_TIMEOUT_STATUS: u16 = 408;
+
+/// The body of the request-body read timeout answer.
+pub const BODY_READ_TIMEOUT_MESSAGE: &str = "Request body read timed out";
+
 #[cfg(test)]
 mod tests {
     use super::*;
