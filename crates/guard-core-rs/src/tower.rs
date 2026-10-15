@@ -889,8 +889,8 @@ impl RateLimitStage {
 
     /// The reference `log_activity` emission for a crossing: composed with
     /// this stage's knobs, dropped on the floor when nothing would log.
-    fn log_rate_limited(&self, ip: IpAddr, decision: &TierDecision) {
-        let _ = self.compose_suspicious_log(
+    fn rate_limited_log(&self, ip: IpAddr, decision: &TierDecision) -> Option<String> {
+        self.compose_suspicious_log(
             ip,
             &format!(
                 "Rate limit exceeded for IP: {ip} ({} requests in {}s window)",
@@ -898,10 +898,10 @@ impl RateLimitStage {
                 decision.retry_after()
             ),
             None,
-            false,
+            self.config.passive_mode,
             "",
             "rate_limit",
-        );
+        )
     }
 
     /// The block answer with the reference `custom_body` and `on_block`
@@ -971,7 +971,7 @@ impl RateLimitStage {
         decision: &TierDecision,
         observation: Option<&RequestObservation>,
     ) {
-        self.log_rate_limited(ip, decision);
+        let _ = self.rate_limited_log(ip, decision);
         let Some(bus) = &self.events else {
             return;
         };
@@ -2023,6 +2023,30 @@ mod tests {
                 .expect("flagged"),
         );
         assert_eq!(stage.counters().snapshot(exempt).get("xss"), Some(&1));
+    }
+
+    #[test]
+    fn a_passive_rate_limit_log_names_the_rate_limit() {
+        let stage = stage_with(
+            RateLimitStageConfig {
+                rate_limit: RateLimitConfig {
+                    enable_rate_limiting: true,
+                    rate_limit: 1,
+                    ..RateLimitConfig::default()
+                },
+                ip_ban: IpBanConfig::default(),
+                passive_mode: true,
+                custom_error_responses: CustomErrorResponses::default(),
+            },
+            Arc::new(system_clock),
+        );
+        let visitor = ip("192.0.2.40");
+        let _ = stage.limiter().check_tiers(visitor, None, None, None);
+        let decision = stage.limiter().check_tiers(visitor, None, None, None);
+        let line = stage.rate_limited_log(visitor, &decision).expect("logged");
+        assert!(line.starts_with("[PASSIVE MODE] Suspicious activity detected from 192.0.2.40"));
+        assert!(line.contains("Reason: Rate limit exceeded for IP: 192.0.2.40"));
+        assert!(!line.contains("Penetration attempt"));
     }
 
     #[test]
