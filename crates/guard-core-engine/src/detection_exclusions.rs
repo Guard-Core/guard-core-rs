@@ -123,6 +123,10 @@ pub struct DetectionExclusionConfig {
     /// `excluded_detection_headers` (merged with the defaults, never a
     /// replacement).
     pub excluded_detection_headers: Vec<String>,
+    /// `excluded_semantic_detection_headers` (opt-in, default empty):
+    /// header names whose values skip the semantic analyzer only, matched
+    /// case-insensitively. Regex category scanning is unchanged.
+    pub excluded_semantic_detection_headers: Vec<String>,
     /// `excluded_detection_params`.
     pub excluded_detection_params: Vec<String>,
     /// `excluded_detection_body_fields`.
@@ -143,6 +147,9 @@ pub struct RouteDetectionExclusions {
     /// `excluded_detection_headers` (merged with the defaults and the
     /// config set).
     pub excluded_detection_headers: Option<Vec<String>>,
+    /// `excluded_semantic_detection_headers`: merged with the global set,
+    /// never a replacement.
+    pub excluded_semantic_detection_headers: Option<Vec<String>>,
     /// `excluded_detection_params`.
     pub excluded_detection_params: Option<Vec<String>>,
     /// `excluded_detection_body_fields`.
@@ -167,11 +174,24 @@ pub struct ResolvedExclusions {
     /// Lowercased: header names routed through the excluded-header scan
     /// (defaults + config + route, merged).
     pub excluded_headers: HashSet<String>,
+    /// Lowercased, trimmed: header names whose values skip the semantic
+    /// analyzer only (global + route, merged).
+    pub semantic_headers: HashSet<String>,
     /// Lowercased: the categories that may contribute a detection. `None`
     /// means every category scans.
     pub enabled_categories: Option<HashSet<String>>,
     /// Whether the body surface scans at all.
     pub scan_body: bool,
+}
+
+/// Merge, trim and lowercase one list into the set
+/// (`_resolve_semantic_excluded_headers`).
+fn extend_trimmed_lowered(set: &mut HashSet<String>, values: impl IntoIterator<Item = String>) {
+    set.extend(
+        values
+            .into_iter()
+            .map(|value| value.trim().to_ascii_lowercase()),
+    );
 }
 
 /// Merge and lowercase one list into the set.
@@ -201,6 +221,19 @@ pub fn resolve(
     }
     if let Some(headers) = route.and_then(|route| route.excluded_detection_headers.as_ref()) {
         extend_lowered(&mut resolved.excluded_headers, headers.clone());
+    }
+
+    // Semantic-only header set: additive (global + route), opt-in.
+    if let Some(config) = config {
+        extend_trimmed_lowered(
+            &mut resolved.semantic_headers,
+            config.excluded_semantic_detection_headers.clone(),
+        );
+    }
+    if let Some(headers) =
+        route.and_then(|route| route.excluded_semantic_detection_headers.as_ref())
+    {
+        extend_trimmed_lowered(&mut resolved.semantic_headers, headers.clone());
     }
 
     // Param / body-field / category sets: a non-None route value replaces
@@ -399,6 +432,7 @@ pub fn scan_request(
         content: &'a str,
         context: &'a str,
         skip_categories: &'static [&'static str],
+        skip_semantic: bool,
     }
 
     let mut values: Vec<Value<'_>> = Vec::new();
@@ -407,6 +441,7 @@ pub fn scan_request(
             content: path,
             context: "url_path",
             skip_categories: &[],
+            skip_semantic: false,
         });
     }
     for (name, value) in surfaces.query_params {
@@ -420,24 +455,31 @@ pub fn scan_request(
             content: value,
             context: "query_param",
             skip_categories: &[],
+            skip_semantic: false,
         });
     }
     for (name, value) in surfaces.headers {
         if value.is_empty() {
             continue;
         }
-        let skip_categories = if exclusions
+        let skip_semantic = exclusions
+            .semantic_headers
+            .contains(&name.trim().to_ascii_lowercase());
+        let excluded = exclusions
             .excluded_headers
-            .contains(&name.to_ascii_lowercase())
-        {
-            excluded_header_skip_categories(name, value)
-        } else {
-            &[]
+            .contains(&name.to_ascii_lowercase());
+        let skip_categories = |value: &str| -> &'static [&'static str] {
+            if excluded {
+                excluded_header_skip_categories(name, value)
+            } else {
+                &[]
+            }
         };
         values.push(Value {
             content: value,
             context: "header",
-            skip_categories,
+            skip_categories: skip_categories(value),
+            skip_semantic,
         });
     }
     // The body values borrow the extraction's owned strings, so the owned
@@ -463,6 +505,7 @@ pub fn scan_request(
             content: &value.content,
             context: &value.context,
             skip_categories: &[],
+            skip_semantic: false,
         });
     }
 
@@ -476,7 +519,12 @@ pub fn scan_request(
         if !budget.admit(value.content) {
             continue;
         }
-        let verdict = detect::detect(value.content, value.context, config);
+        let verdict = detect::detect_with_semantic_skip(
+            value.content,
+            value.context,
+            config,
+            value.skip_semantic,
+        );
         if !verdict.is_threat {
             continue;
         }
@@ -692,6 +740,119 @@ mod tests {
             ..DetectionExclusionConfig::default()
         };
         assert!(!resolve(Some(&global), None).scan_body);
+    }
+
+    /// The Guard-Core/guard-core#161 repro: a JWT session cookie with
+    /// `theme=system` and `_ga`, which scores 0.711 against the 0.7
+    /// semantic threshold when scanned as one value.
+    const SESSION_COOKIE: &str = "session=eyJhbGciOiAiRVMyNTYiLCAidHlwIjogIkpXVCJ9.eyJzdWIiOiAiM2YyYzFiOWUtOGE0Ny00ZDJlLTljMWYtNWI2YTdkOGU5ZjAxIiwgIm5hbWUiOiAiSmFuZSBEb2UgKEFjbWUpIiwgImVtYWlsIjogImphbmUuZG9lQGV4YW1wbGUuY29tIiwgInJvbGVzIjogWyJhZG1pbiJdLCAiaWF0IjogMTc5MjAwMDAwMCwgImV4cCI6IDE3OTIwMDA5MDB9.AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw; theme=system; _ga=GA1.1.123456789.1792000000";
+
+    fn semantic_threat_count(content: &str, skip_semantic: bool) -> usize {
+        crate::detect::detect_with_semantic_skip(content, "header", &corpus_config(), skip_semantic)
+            .threats
+            .iter()
+            .filter(|threat| matches!(threat, Threat::Semantic(_)))
+            .count()
+    }
+
+    /// Scan one header next to an xss body: a semantic-only hit on the
+    /// header ends the scan clean (the terminal per-value filter), so the
+    /// xss body is reached only when the header is not a threat.
+    fn scan_header_with_xss_body(
+        name: &str,
+        value: &str,
+        global: Option<&DetectionExclusionConfig>,
+        route: Option<&RouteDetectionExclusions>,
+    ) -> RequestScanVerdict {
+        let headers = vec![(name.to_owned(), value.to_owned())];
+        scan_request(
+            &RequestSurfaces {
+                url_path: None,
+                query_params: &[],
+                headers: &headers,
+                content_type: "application/x-www-form-urlencoded",
+                raw_body: "q=<script>alert(1)</script>",
+            },
+            &resolve(global, route),
+            &corpus_config(),
+        )
+    }
+
+    #[test]
+    fn the_semantic_skip_drops_only_the_semantic_threats() {
+        assert!(
+            semantic_threat_count(SESSION_COOKIE, false) > 0,
+            "control: the unsplit session value trips the semantic analyzer"
+        );
+        assert_eq!(semantic_threat_count(SESSION_COOKIE, true), 0);
+        let verdict = crate::detect::detect_with_semantic_skip(
+            "<script>alert(1)</script>",
+            "header",
+            &corpus_config(),
+            true,
+        );
+        assert!(
+            verdict
+                .threats
+                .iter()
+                .any(|threat| matches!(threat, Threat::Regex(regex) if regex.category == "xss")),
+            "regex scanning is unchanged"
+        );
+    }
+
+    #[test]
+    fn semantic_headers_resolve_lowercased_trimmed_and_merged() {
+        let global = DetectionExclusionConfig {
+            excluded_semantic_detection_headers: vec![" X-Global ".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let route = RouteDetectionExclusions {
+            excluded_semantic_detection_headers: Some(vec!["X-Route".to_owned()]),
+            ..RouteDetectionExclusions::default()
+        };
+        let merged = resolve(Some(&global), Some(&route));
+        assert_eq!(
+            merged.semantic_headers,
+            HashSet::from(["x-global".to_owned(), "x-route".to_owned()])
+        );
+        let inherited = resolve(Some(&global), Some(&RouteDetectionExclusions::default()));
+        assert_eq!(
+            inherited.semantic_headers,
+            HashSet::from(["x-global".to_owned()])
+        );
+        assert!(resolve(None, None).semantic_headers.is_empty(), "opt-in");
+    }
+
+    #[test]
+    fn a_global_semantic_header_skips_only_the_semantic_analyzer() {
+        let global = DetectionExclusionConfig {
+            excluded_semantic_detection_headers: vec!["X-Session".to_owned()],
+            ..DetectionExclusionConfig::default()
+        };
+        let verdict = scan_header_with_xss_body("x-session", SESSION_COOKIE, Some(&global), None);
+        assert_eq!(verdict.categories, vec!["xss".to_owned()]);
+
+        let attack = scan_header_with_xss_body(
+            "x-session",
+            "<img src=x onerror=alert(1)>",
+            Some(&global),
+            None,
+        );
+        assert_eq!(
+            attack.categories,
+            vec!["xss".to_owned()],
+            "regex scanning of the header is unchanged"
+        );
+    }
+
+    #[test]
+    fn a_route_semantic_header_skips_the_semantic_analyzer() {
+        let route = RouteDetectionExclusions {
+            excluded_semantic_detection_headers: Some(vec!["x-session".to_owned()]),
+            ..RouteDetectionExclusions::default()
+        };
+        let verdict = scan_header_with_xss_body("X-Session", SESSION_COOKIE, None, Some(&route));
+        assert_eq!(verdict.categories, vec!["xss".to_owned()]);
     }
 
     #[test]
@@ -1032,6 +1193,7 @@ mod gap_tests {
             excluded_params: std::collections::HashSet::new(),
             excluded_headers: std::collections::HashSet::new(),
             excluded_body_fields: std::collections::HashSet::new(),
+            semantic_headers: std::collections::HashSet::new(),
             enabled_categories: None,
             scan_body: false,
         };
@@ -1063,6 +1225,7 @@ mod gap_tests {
             excluded_params: std::collections::HashSet::new(),
             excluded_headers,
             excluded_body_fields: std::collections::HashSet::new(),
+            semantic_headers: std::collections::HashSet::new(),
             enabled_categories: None,
             scan_body: false,
         };
@@ -1108,6 +1271,7 @@ mod gap_tests {
                 excluded_params: std::collections::HashSet::new(),
                 excluded_headers: std::collections::HashSet::new(),
                 excluded_body_fields: std::collections::HashSet::new(),
+                semantic_headers: std::collections::HashSet::new(),
                 enabled_categories: None,
                 scan_body: true,
             },

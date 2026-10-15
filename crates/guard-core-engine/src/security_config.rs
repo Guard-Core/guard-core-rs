@@ -429,6 +429,12 @@ pub struct SecurityConfig {
     pub enable_enrichment: bool,
     /// `excluded_detection_headers`.
     pub excluded_detection_headers: BTreeSet<String>,
+    /// `excluded_semantic_detection_headers` (opt-in, default empty):
+    /// header names whose values skip the semantic analyzer only, matched
+    /// case-insensitively; regex category scanning is unchanged. Useful for
+    /// apps whose JWT session cookies score near the semantic threshold
+    /// (for example `cookie`, `authorization`).
+    pub excluded_semantic_detection_headers: BTreeSet<String>,
     /// `excluded_detection_params`.
     pub excluded_detection_params: BTreeSet<String>,
     /// `excluded_detection_body_fields`.
@@ -586,6 +592,7 @@ impl Default for SecurityConfig {
             logfire_service_name: String::from("guard-core"),
             enable_enrichment: false,
             excluded_detection_headers: BTreeSet::new(),
+            excluded_semantic_detection_headers: BTreeSet::new(),
             excluded_detection_params: BTreeSet::new(),
             excluded_detection_body_fields: BTreeSet::new(),
             detection_scan_body: true,
@@ -992,6 +999,7 @@ mod tests {
         assert_eq!(config.logfire_service_name, "guard-core");
         assert!(!config.enable_enrichment);
         assert!(config.excluded_detection_headers.is_empty());
+        assert!(config.excluded_semantic_detection_headers.is_empty());
         assert!(config.excluded_detection_params.is_empty());
         assert!(config.excluded_detection_body_fields.is_empty());
         assert!(config.detection_scan_body);
