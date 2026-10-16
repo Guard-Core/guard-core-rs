@@ -2,6 +2,17 @@
 
 All notable changes to this project.
 
+## [4.4.1] - 2026-10-16
+
+### Fixed
+
+- The scan time budget charges CPU once per pass instead of once per pattern (issue #157, PR #158). `ScanTimeBudget::measure` read the thread CPU clock (`clock_gettime` with `CLOCK_THREAD_CPUTIME_ID`) twice for every pattern check. `open_pass` now reads it once, `tick` reads only a monotonic clock per pattern and charges the CPU clock when 2 ms have elapsed (the slice spans passes), and `close_pass` makes the final charge. `exhausted()` stays arithmetic only and the cap still stops a long pass within about one slice. Detect on a ~1 KB JSON-like value plus 10 headers went from 6.54 ms to 6.37 ms (release build).
+
+### Changed
+
+- `guard_core_engine::scan_budget::ScanTimeBudget::measure` is removed. It is replaced by `open_pass`, `tick` and `close_pass`, plus the `with_clocks` constructor (CPU clock and wall clock) and the `SCAN_SLICE_SECONDS` constant (0.002). `new`, `unbounded`, `with_clock` and `exhausted` are unchanged. A caller that wrapped a scan in `measure` now calls `open_pass` before it, `tick` between patterns and `close_pass` after it.
+- Dependency and CI chores: the release workflow publishes a tag only from green CI and can be re-driven by a tag input (#156), and the lint job runs on the MSRV toolchain like the release gate (#154).
+
 ## [4.4.0] - 2026-10-15
 
 ### Breaking
