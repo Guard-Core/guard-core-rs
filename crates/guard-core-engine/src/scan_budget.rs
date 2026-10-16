@@ -3,7 +3,14 @@
 //! `_scan_time_budget_exhausted`).
 //!
 //! The budget sums the CPU time of the pattern scans of one request, across
-//! every value and every view pass, and is checked between patterns. It is
+//! every value and every view pass, and is checked between patterns. The CPU
+//! is charged per pass (one loop over the pattern table), not per pattern:
+//! the thread CPU clock is read when a pass opens, when a [`SCAN_SLICE_SECONDS`]
+//! wall-clock slice has elapsed (the slice spans passes, like the
+//! reference's request-scoped slice) and when the pass closes. The
+//! per-pattern work is one cheap monotonic clock read, and
+//! [`ScanTimeBudget::exhausted`] is arithmetic only, so the budget lags the
+//! true spend by at most one slice plus one pattern. It is
 //! CPU time of the scanning thread, not wall time: wall time made loaded or
 //! CPU-starved hosts exhaust it falsely on ordinary requests. Once spent,
 //! the remaining patterns and values are skipped and the scan records a
@@ -51,12 +58,29 @@ fn thread_cpu_seconds() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
+/// The wall-clock slice between CPU charges (reference
+/// `_EVENT_LOOP_SLICE_SECONDS`, 2 ms).
+pub const SCAN_SLICE_SECONDS: f64 = 0.002;
+
+/// Seconds on a monotonic wall clock, the cheap per-pattern read.
+fn wall_seconds() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
+
 /// The CPU seconds a request has left to spend scanning.
 #[derive(Debug, Clone, Copy)]
 pub struct ScanTimeBudget {
     cap: Option<f64>,
     spent: f64,
     clock: fn() -> f64,
+    wall: fn() -> f64,
+    /// The CPU clock reading at the last charge while a pass is open.
+    mark: Option<f64>,
+    /// The wall reading at the last slice boundary, set by the first pass.
+    slice_start: Option<f64>,
 }
 
 impl ScanTimeBudget {
@@ -75,10 +99,20 @@ impl ScanTimeBudget {
     /// A budget over an injected monotonic seconds clock (tests).
     #[must_use]
     pub const fn with_clock(cap: Option<f64>, clock: fn() -> f64) -> Self {
+        Self::with_clocks(cap, clock, wall_seconds)
+    }
+
+    /// A budget over an injected scan clock and an injected wall clock
+    /// (tests).
+    #[must_use]
+    pub const fn with_clocks(cap: Option<f64>, clock: fn() -> f64, wall: fn() -> f64) -> Self {
         Self {
             cap,
             spent: 0.0,
             clock,
+            wall,
+            mark: None,
+            slice_start: None,
         }
     }
 
@@ -91,12 +125,42 @@ impl ScanTimeBudget {
             .is_some_and(|cap| self.spent.partial_cmp(&cap) != Some(Ordering::Less))
     }
 
-    /// Run one scan and charge its CPU time to the budget.
-    pub fn measure<T>(&mut self, scan: impl FnOnce() -> T) -> T {
-        let start = (self.clock)();
-        let result = scan();
-        self.spent += ((self.clock)() - start).max(0.0);
-        result
+    /// Open a pass: one scan clock read, none without a cap.
+    pub fn open_pass(&mut self) {
+        if self.cap.is_none() {
+            return;
+        }
+        self.mark = Some((self.clock)());
+        if self.slice_start.is_none() {
+            self.slice_start = Some((self.wall)());
+        }
+    }
+
+    /// The per-pattern tick: one wall clock read, and a scan clock charge
+    /// only when a slice has elapsed since the last one.
+    pub fn tick(&mut self) {
+        let Some(start) = self.slice_start else {
+            return;
+        };
+        let now = (self.wall)();
+        if now - start >= SCAN_SLICE_SECONDS {
+            self.charge();
+            self.slice_start = Some(now);
+        }
+    }
+
+    /// Close the pass with a final charge.
+    pub fn close_pass(&mut self) {
+        self.charge();
+        self.mark = None;
+    }
+
+    fn charge(&mut self) {
+        if let Some(mark) = self.mark {
+            let now = (self.clock)();
+            self.spent += (now - mark).max(0.0);
+            self.mark = Some(now);
+        }
     }
 }
 
@@ -107,6 +171,8 @@ mod tests {
 
     thread_local! {
         static NOW: Cell<f64> = const { Cell::new(0.0) };
+        static WALL: Cell<f64> = const { Cell::new(0.0) };
+        static READS: Cell<u32> = const { Cell::new(0) };
     }
 
     fn stepping_clock() -> f64 {
@@ -116,23 +182,39 @@ mod tests {
         })
     }
 
-    #[test]
-    fn unbounded_budget_is_never_exhausted() {
-        let mut budget = ScanTimeBudget::unbounded();
-        budget.measure(|| ());
-        assert!(!budget.exhausted());
+    fn counting_clock() -> f64 {
+        READS.with(|reads| reads.set(reads.get() + 1));
+        0.0
+    }
+
+    fn manual_wall() -> f64 {
+        WALL.with(Cell::get)
     }
 
     #[test]
-    fn measured_time_exhausts_the_cap() {
+    fn unbounded_budget_never_reads_the_cpu_clock() {
+        READS.with(|reads| reads.set(0));
+        let mut budget = ScanTimeBudget::with_clock(None, counting_clock);
+        budget.open_pass();
+        budget.tick();
+        budget.close_pass();
+        assert!(!budget.exhausted());
+        assert_eq!(READS.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn closing_a_pass_charges_the_cap() {
         let mut budget = ScanTimeBudget::with_clock(Some(2.5), stepping_clock);
         assert!(!budget.exhausted());
-        // Each measure reads the clock twice: one fake second per scan.
-        assert_eq!(budget.measure(|| 7), 7);
+        // Open and close read the clock once each: one fake second per pass.
+        budget.open_pass();
+        budget.close_pass();
         assert!(!budget.exhausted());
-        budget.measure(|| ());
+        budget.open_pass();
+        budget.close_pass();
         assert!(!budget.exhausted());
-        budget.measure(|| ());
+        budget.open_pass();
+        budget.close_pass();
         assert!(budget.exhausted());
     }
 
@@ -145,8 +227,57 @@ mod tests {
             })
         }
         let mut budget = ScanTimeBudget::with_clock(Some(0.1), backwards);
-        budget.measure(|| ());
+        budget.open_pass();
+        budget.close_pass();
         assert!(!budget.exhausted());
+    }
+
+    #[test]
+    fn the_cpu_clock_is_read_per_pass_not_per_pattern() {
+        READS.with(|reads| reads.set(0));
+        WALL.with(|wall| wall.set(0.0));
+        let mut budget = ScanTimeBudget::with_clocks(Some(10.0), counting_clock, manual_wall);
+        budget.open_pass();
+        for _ in 0..1_000 {
+            budget.tick();
+            assert!(!budget.exhausted());
+            WALL.with(|wall| wall.set(wall.get() + 0.00001));
+        }
+        budget.close_pass();
+        // 1000 ticks cross 4 slice boundaries: open + 4 charges + close.
+        assert_eq!(READS.with(Cell::get), 6);
+
+        READS.with(|reads| reads.set(0));
+        budget.open_pass();
+        for _ in 0..1_000 {
+            budget.tick();
+        }
+        budget.close_pass();
+        assert_eq!(READS.with(Cell::get), 2, "inside one slice: open and close");
+    }
+
+    #[test]
+    fn a_long_pass_stops_within_one_slice_of_the_cap() {
+        fn cpu_now() -> f64 {
+            WALL.with(Cell::get)
+        }
+        WALL.with(|wall| wall.set(0.0));
+        // One fake clock drives both: each pattern costs 0.5 ms.
+        let mut budget = ScanTimeBudget::with_clocks(Some(0.0105), cpu_now, manual_wall);
+        budget.open_pass();
+        loop {
+            budget.tick();
+            if budget.exhausted() {
+                break;
+            }
+            WALL.with(|wall| wall.set(wall.get() + 0.0005));
+        }
+        let overshoot = WALL.with(Cell::get) - 0.0105;
+        assert!(overshoot >= 0.0, "stopped before the cap: {overshoot}");
+        assert!(
+            overshoot <= SCAN_SLICE_SECONDS + 0.0005,
+            "lagged more than a slice plus a pattern: {overshoot}"
+        );
     }
 
     #[test]

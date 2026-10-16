@@ -598,9 +598,10 @@ pub fn scan_view(
 
 /// [`scan_view`] under a per-request scan time budget.
 ///
-/// Every pattern scan is charged to `budget`, and once it is spent the pass
-/// records the [`scan_time_budget_exhausted_threat`] and stops (the
-/// reference checks `_scan_time_budget_exhausted` between patterns).
+/// The pass's CPU is charged to `budget` once per pass and per 2 ms slice,
+/// not per pattern, and once it is spent the pass records the
+/// [`scan_time_budget_exhausted_threat`] and stops (the reference checks
+/// `_scan_time_budget_exhausted` between patterns).
 #[must_use]
 pub fn scan_view_budgeted(
     content: &str,
@@ -613,7 +614,9 @@ pub fn scan_view_budgeted(
     let binary_prefix = binary::build_binary_prefix(content);
     let gating = size_gated(content);
     let mut threats = Vec::new();
+    budget.open_pass();
     for entry in COMPILED_TABLE.iter() {
+        budget.tick();
         if budget.exhausted() {
             threats.push(scan_time_budget_exhausted_threat());
             break;
@@ -627,12 +630,13 @@ pub fn scan_view_budgeted(
         if gating && SIZE_GATED_IDS.contains(&entry.entry.id) {
             continue;
         }
-        if let Some(threat) = budget
-            .measure(|| find_first_threat(entry, content, validator_context, Some(&binary_prefix)))
+        if let Some(threat) =
+            find_first_threat(entry, content, validator_context, Some(&binary_prefix))
         {
             threats.push(threat);
         }
     }
+    budget.close_pass();
     threats
 }
 
