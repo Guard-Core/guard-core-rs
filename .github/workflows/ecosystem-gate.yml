@@ -69,6 +69,20 @@ jobs:
             extra_ref: ''
 
     steps:
+      # A dispatch runs the consumer at the ref it names with this repository's cache scope, so that ref must be a
+      # branch, tag or commit of the consumer repository and never a pull request head (fork code).
+      - name: Reject a pull request head as the dispatched consumer ref
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          CONSUMER_REF: ${{ github.event.inputs.consumer_ref }}
+        run: |
+          case "$CONSUMER_REF" in
+            refs/pull/* | pull/*)
+              echo "::error::consumer_ref must not be a pull request head: $CONSUMER_REF"
+              exit 1
+              ;;
+          esac
+
       - name: Checkout guard-core-rs
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
