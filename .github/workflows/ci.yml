@@ -12,13 +12,6 @@ on:
       - ".github/workflows/ci.yml"
   pull_request:
     branches: [master]
-    paths:
-      - "**.rs"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "conformance/**"
-      - "deny.toml"
-      - ".github/workflows/ci.yml"
   schedule:
     - cron: "0 6 * * 1"
 
@@ -34,7 +27,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    # pull_request used to carry a workflow-level paths filter, so a PR outside those paths got no run at all
+    # and the required ci context never reported. The same filter lives here now; the jobs below skip on it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Did this change touch the paths this workflow tests
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then echo "code=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          if git diff --name-only "$BASE" HEAD | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|^conformance/|^deny\.toml$|^\.github/workflows/ci\.yml$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Check
     runs-on: ubuntu-latest
     permissions:
@@ -66,6 +89,8 @@ jobs:
         run: cargo test --workspace --exclude guard-core-python
 
   conformance:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Conformance gate (spec 4.1.0)
     runs-on: ubuntu-latest
     permissions:
@@ -96,6 +121,8 @@ jobs:
         run: cargo test -p guard-core-conformance --test pipeline_conformance -- --nocapture
 
   coverage:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: coverage (100% lines)
     runs-on: ubuntu-latest
     permissions:
@@ -149,6 +176,8 @@ jobs:
         run: cargo llvm-cov report
 
   msrv:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: MSRV (1.92)
     runs-on: ubuntu-latest
     permissions:
@@ -180,6 +209,8 @@ jobs:
         run: cargo test --workspace --exclude guard-core-python
 
   security:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Security audit
     runs-on: ubuntu-latest
     permissions:
@@ -210,6 +241,8 @@ jobs:
         run: cargo deny check
 
   docs:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     name: Docs build
     runs-on: ubuntu-latest
     permissions:
@@ -232,3 +265,20 @@ jobs:
 
       - name: cargo doc
         run: cargo doc --workspace --exclude guard-core-python --no-deps --all-features
+
+  ci:
+    # The context master-rule requires: it reports on every run and fails when a job above failed or was
+    # cancelled. A skipped job counts as passed.
+    if: always()
+    needs: [changes, check, conformance, coverage, msrv, security, docs]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job above succeeded or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needs: $RESULTS"
+          for result in $RESULTS; do
+            case "$result" in failure|cancelled) exit 1 ;; esac
+          done
