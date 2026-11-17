@@ -7,10 +7,9 @@ license      = { workspace = true }
 rust-version = { workspace = true }
 
 [dependencies]
-chrono                = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-chrono-tz             = { version = "0.10", default-features = false, features = ["case-insensitive"] }
 fancy-regex           = { version = "0.19", default-features = false, features = ["unicode"] }
 html-escape           = { workspace = true }
+jiff                  = { version = "1.0", default-features = false, features = ["std", "tzdb-bundle-always"] }
 sha2                  = "0.11"
 lru                   = { workspace = true }
 percent-encoding      = { workspace = true }

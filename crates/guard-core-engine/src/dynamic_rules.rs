@@ -33,33 +33,87 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::compiler::validate_pattern_safety;
 use crate::decorators::VALID_CLOUD_PROVIDERS;
 use crate::security_config::SecurityConfig;
 
+/// The chrono `DateTime<Utc>` RFC 3339 wire shape the reference
+/// delivery carries, reproduced byte for byte on `jiff::Timestamp`: no
+/// fraction when the sub-second part is zero, otherwise chrono's 3, 6
+/// or 9 digit classes, offsets folded into UTC, the suffix always `Z`.
+mod chrono_rfc3339 {
+    use core::str::FromStr;
+    use jiff::Timestamp;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// chrono's `SecondsFormat::AutoSi` digit class of `nanos`.
+    const fn precision_of(nanos: i32) -> usize {
+        if nanos == 0 {
+            0
+        } else if nanos % 1_000_000 == 0 {
+            3
+        } else if nanos % 1_000 == 0 {
+            6
+        } else {
+            9
+        }
+    }
+
+    /// The `Z`-suffixed RFC 3339 text exactly as chrono wrote it.
+    fn zulu(value: &Timestamp) -> String {
+        let precision = precision_of(value.subsec_nanosecond());
+        if precision == 0 {
+            value.to_string()
+        } else {
+            format!("{value:.precision$}")
+        }
+    }
+
+    /// The field arrives as `&Option<Timestamp>`, the shape serde's
+    /// `with` attribute calls with; the generic keeps the preferred
+    /// `Option<&T>` shape while the conversion is the identity for the
+    /// field type.
+    pub(super) fn serialize<S, T>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: Copy + Into<Option<Timestamp>>,
+    {
+        match (*value).into() {
+            Some(timestamp) => serializer.serialize_str(&zulu(&timestamp)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Timestamp>, D::Error> {
+        let text = Option::<String>::deserialize(deserializer)?;
+        text.map(|text| Timestamp::from_str(&text).map_err(serde::de::Error::custom))
+            .transpose()
+    }
+}
+
 /// `LAST_KNOWN_RULES_SNAPSHOT_SCHEMA_VERSION` (the envelope guard).
 pub const LAST_KNOWN_RULES_SNAPSHOT_SCHEMA_VERSION: u64 = 1;
 
 /// The reference `DynamicRules` wire model, field for field (the same
 /// shape the guard-agent models carry).
-///
-/// `Eq` is unreachable while the model carries a `DateTime` (chrono
-/// answers `PartialEq` only), hence the pinpointed allowance.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-#[allow(clippy::derive_partial_eq_without_eq)]
 pub struct DynamicRules {
     /// Unique rule ID.
     pub rule_id: String,
     /// Rule version number.
     pub version: u64,
     /// Rule creation/update timestamp.
-    pub timestamp: Option<DateTime<Utc>>,
+    #[serde(with = "chrono_rfc3339")]
+    pub timestamp: Option<Timestamp>,
     /// Rule expiration time.
-    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(with = "chrono_rfc3339")]
+    pub expires_at: Option<Timestamp>,
     /// Cache TTL in seconds (drives the client-side rules cache).
     pub ttl: u64,
     /// IPs to ban.
@@ -143,7 +197,7 @@ impl DynamicRules {
 
 /// The reference snapshot envelope (`LastKnownRulesSnapshot`): the
 /// schema version beside the mirrored rules.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LastKnownRulesSnapshot {
     /// The envelope schema version.
     pub schema_version: u64,
@@ -212,7 +266,7 @@ impl DynamicRules {
 /// `_has_rule_expired`: past `expires_at` at `now` (an absent expiry
 /// never expires).
 #[must_use]
-pub fn has_expired(rules: &DynamicRules, now: DateTime<Utc>) -> bool {
+pub fn has_expired(rules: &DynamicRules, now: Timestamp) -> bool {
     rules.expires_at.is_some_and(|expires_at| now > expires_at)
 }
 
@@ -231,7 +285,7 @@ pub fn should_update(current: Option<&DynamicRules>, incoming: &DynamicRules) ->
 pub fn expired_identity(
     last_skipped: &mut Option<(String, u64)>,
     rules: &DynamicRules,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> bool {
     if !has_expired(rules, now) {
         return false;
@@ -482,7 +536,65 @@ pub fn apply_to_config_with_validation_cache(
 #[cfg(test)]
 mod dynamic_rules_tests {
     use super::*;
-    use chrono::TimeZone;
+
+    /// Golden wire captures of the chrono `DateTime<Utc>` serde shapes,
+    /// taken on the chrono build this migration replaces: 0, 3, 6 or 9
+    /// fraction digits (zero fractions drop, non-zero pad to their
+    /// class), offsets fold into a `Z` suffix.
+    #[test]
+    fn golden_timestamp_fields_round_trip_the_chrono_wire_format() {
+        let cases: &[(&str, &str)] = &[
+            ("2026-01-15T12:00:00Z", "2026-01-15T12:00:00Z"),
+            ("2026-01-15T12:00:00+00:00", "2026-01-15T12:00:00Z"),
+            ("2026-01-15T12:00:00+05:30", "2026-01-15T06:30:00Z"),
+            ("2026-01-15T12:00:00-08:00", "2026-01-15T20:00:00Z"),
+            ("2026-01-15T12:00:00.1Z", "2026-01-15T12:00:00.100Z"),
+            ("2026-01-15T12:00:00.12Z", "2026-01-15T12:00:00.120Z"),
+            ("2026-01-15T12:00:00.123Z", "2026-01-15T12:00:00.123Z"),
+            ("2026-01-15T12:00:00.1234Z", "2026-01-15T12:00:00.123400Z"),
+            ("2026-01-15T12:00:00.123456Z", "2026-01-15T12:00:00.123456Z"),
+            (
+                "2026-01-15T12:00:00.1234567Z",
+                "2026-01-15T12:00:00.123456700Z",
+            ),
+            (
+                "2026-01-15T12:00:00.12345678Z",
+                "2026-01-15T12:00:00.123456780Z",
+            ),
+            (
+                "2026-01-15T12:00:00.123456789Z",
+                "2026-01-15T12:00:00.123456789Z",
+            ),
+            ("2026-01-15T12:00:00.000Z", "2026-01-15T12:00:00Z"),
+            ("2026-01-15T12:00:00.000000000Z", "2026-01-15T12:00:00Z"),
+        ];
+        for (input, output) in cases {
+            let value: Timestamp = input.parse().expect("parses");
+            let rules = DynamicRules {
+                timestamp: Some(value),
+                expires_at: Some(value),
+                ..DynamicRules::default()
+            };
+            let wire = serde_json::to_string(&rules).expect("serializes");
+            let read: serde_json::Value = serde_json::from_str(&wire).expect("json");
+            assert_eq!(read["timestamp"], *output, "wire shape of {input}");
+            assert_eq!(read["expires_at"], *output, "wire shape of {input}");
+            // The full payload round trips byte for byte.
+            let rebuilt = serde_json::to_string(
+                &serde_json::from_str::<DynamicRules>(&wire).expect("deserializes"),
+            )
+            .expect("serializes");
+            assert_eq!(rebuilt, wire, "round trip of {input}");
+        }
+        let null_wire = serde_json::to_string(&DynamicRules::default()).expect("serializes");
+        let read: serde_json::Value = serde_json::from_str(&null_wire).expect("json");
+        assert_eq!(read["timestamp"], serde_json::Value::Null);
+        let rebuilt = serde_json::to_string(
+            &serde_json::from_str::<DynamicRules>(&null_wire).expect("deserializes"),
+        )
+        .expect("serializes");
+        assert_eq!(rebuilt, null_wire);
+    }
 
     fn rules() -> DynamicRules {
         DynamicRules {
@@ -492,8 +604,8 @@ mod dynamic_rules_tests {
         }
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs, 0).single().expect("valid time")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).expect("valid time")
     }
 
     #[test]

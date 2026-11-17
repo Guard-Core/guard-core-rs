@@ -405,7 +405,7 @@ impl TimeWindowStage {
         payload_path: &str,
         method: &str,
     ) -> Option<GateAnswer> {
-        let now = chrono::Utc::now();
+        let now = jiff::Timestamp::now();
         self.decide_at(path, now, client_ip, payload_path, method)
     }
 
@@ -415,7 +415,7 @@ impl TimeWindowStage {
     pub fn decide_at(
         &self,
         path: &str,
-        now_utc: chrono::DateTime<chrono::Utc>,
+        now_utc: jiff::Timestamp,
         client_ip: &str,
         payload_path: &str,
         method: &str,
@@ -556,13 +556,22 @@ impl TimeWindowStageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
     use std::sync::Mutex;
 
-    fn at_utc(hour: u32, minute: u32) -> chrono::DateTime<chrono::Utc> {
-        chrono::Utc
-            .with_ymd_and_hms(2026, 1, 15, hour, minute, 0)
-            .unwrap()
+    fn at_utc(hour: u32, minute: u32) -> jiff::Timestamp {
+        jiff::civil::DateTime::new(
+            2026,
+            1,
+            15,
+            i8::try_from(hour).expect("hour"),
+            i8::try_from(minute).expect("minute"),
+            0,
+            0,
+        )
+        .expect("valid civil datetime")
+        .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+        .expect("UTC is never ambiguous")
+        .timestamp()
     }
 
     fn recorder() -> (
@@ -827,6 +836,54 @@ mod tests {
                 .decide_at("/open", at_utc(23, 0), "1.2.3.4", "/open", "GET")
                 .is_none()
         );
+    }
+
+    /// Golden decision captures taken on the chrono build this
+    /// migration replaces: the midnight-wrapping 22:00-06:00 window
+    /// admits both sides, with the 06:00 boundary inclusive and the
+    /// 06:01, 21:59 answers blocked with the 403 default body.
+    #[test]
+    fn golden_time_window_gate_answers_across_midnight() {
+        let stage = TimeWindowStage::builder(GateConfig::default())
+            .resolver(Arc::new(|path| {
+                (path == "/nightly").then(|| TimeWindow {
+                    start: Some("22:00".into()),
+                    end: Some("06:00".into()),
+                    timezone: Some("UTC".into()),
+                })
+            }))
+            .build();
+        let inside = [(23, 30), (5, 59), (6, 0), (0, 0), (22, 0)];
+        for (hour, minute) in inside {
+            assert!(
+                stage
+                    .decide_at(
+                        "/nightly",
+                        at_utc(hour, minute),
+                        "1.2.3.4",
+                        "/nightly",
+                        "GET"
+                    )
+                    .is_none(),
+                "{hour:02}:{minute:02} is inside the wrapping window"
+            );
+        }
+        for (hour, minute) in [(6, 1), (21, 59), (12, 0)] {
+            let answer = stage
+                .decide_at(
+                    "/nightly",
+                    at_utc(hour, minute),
+                    "1.2.3.4",
+                    "/nightly",
+                    "GET",
+                )
+                .map(|answer| (answer.status, answer.body));
+            assert_eq!(
+                answer,
+                Some((403, "Access not allowed at this time".to_owned())),
+                "{hour:02}:{minute:02} is outside the window"
+            );
+        }
     }
 
     #[test]
