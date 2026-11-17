@@ -2311,6 +2311,8 @@ mod otel_tests {
             // the handshake lands the Ok arm.
             loop {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    // macOS hands back the listener's non-blocking mode.
+                    stream.set_nonblocking(false).expect("blocking stream");
                     let mut buffer = [0_u8; 8192];
                     let read = stream.read(&mut buffer).unwrap_or(0);
                     sink.lock()

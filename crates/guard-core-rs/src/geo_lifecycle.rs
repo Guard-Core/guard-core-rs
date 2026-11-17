@@ -678,6 +678,8 @@ mod geo_lifecycle_tests {
             std::thread::spawn(move || {
                 loop {
                     if let Ok((mut stream, _)) = listener.accept() {
+                        // macOS hands back the listener's non-blocking mode.
+                        stream.set_nonblocking(false).expect("blocking stream");
                         let mut buffer = [0_u8; 2048];
                         let _ = stream.read(&mut buffer);
                         let head =
@@ -966,6 +968,8 @@ mod geo_lifecycle_tests {
             use std::io::{Read, Write};
             loop {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    // macOS hands back the listener's non-blocking mode.
+                    stream.set_nonblocking(false).expect("blocking stream");
                     std::thread::sleep(Duration::from_millis(30));
                     let mut buffer = [0_u8; 4096];
                     let _ = stream.read(&mut buffer);

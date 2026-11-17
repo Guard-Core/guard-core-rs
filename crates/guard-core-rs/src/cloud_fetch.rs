@@ -429,6 +429,8 @@ mod tests {
                     }
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // macOS hands back the listener's non-blocking mode.
+                            stream.set_nonblocking(false).expect("blocking stream");
                             let mut buffer = [0_u8; 4096];
                             let read = stream.read(&mut buffer).unwrap_or(0);
                             let request = String::from_utf8_lossy(&buffer[..read]).to_string();
@@ -554,6 +556,26 @@ mod tests {
         }]);
         let ranges = fetcher().fetch_csv(&stub.path("/geo/google.csv"));
         assert_eq!(ranges.len(), 2);
+    }
+
+    #[test]
+    fn stub_reads_a_request_that_arrives_after_accept() {
+        let stub = Stub::serve(vec![Route {
+            path: "/late",
+            status: 200,
+            body: "ok",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let address = stub.url.trim_start_matches("http://").to_owned();
+        let mut stream = std::net::TcpStream::connect(address).expect("connect");
+        std::thread::sleep(Duration::from_millis(100));
+        stream
+            .write_all(b"GET /late HTTP/1.1\r\nHost: stub\r\n\r\n")
+            .expect("write");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("read");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     }
 
     #[test]
