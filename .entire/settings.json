@@ -1,30 +1,30 @@
 {
   "enabled": true,
   "strategy_options": {
-    "push_sessions": false,
     "checkpoint_remote": {
       "provider": "github",
       "repo": "Guard-Core/guard-core-ecosystem"
-    }
+    },
+    "push_sessions": false
   },
   "telemetry": false,
-  "checkpoints": {
-    "primary": {
-      "type": "git-refs"
-    }
-  },
   "redaction": {
-    "betterleaks": {
-      "enabled": true
-    },
-    "goredact": {
-      "enabled": true
-    },
     "pii": {
       "enabled": true,
       "email": true,
       "phone": false,
       "address": false
+    },
+    "betterleaks": {
+      "enabled": true
+    },
+    "goredact": {
+      "enabled": true
+    }
+  },
+  "checkpoints": {
+    "primary": {
+      "type": "git-refs"
     }
   }
 }
