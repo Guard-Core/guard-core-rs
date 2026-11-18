@@ -158,12 +158,13 @@ impl ScanTimeBudget {
     /// Run one scan and charge its CPU time to the budget: the scan is its
     /// own pass, or part of the pass already open, which then charges it.
     pub fn measure<T>(&mut self, scan: impl FnOnce() -> T) -> T {
-        if self.mark.is_some() {
+        // Never opens a pass, so a panicking scan cannot leave one open.
+        if self.cap.is_none() || self.mark.is_some() {
             return scan();
         }
-        self.open_pass();
+        let start = (self.clock)();
         let result = scan();
-        self.close_pass();
+        self.spent += ((self.clock)() - start).max(0.0);
         result
     }
 
@@ -236,6 +237,20 @@ mod tests {
         // Each measure reads the clock twice: one fake second per scan.
         assert_eq!(budget.measure(|| 7), 7);
         assert!(!budget.exhausted());
+        budget.measure(|| ());
+        assert!(!budget.exhausted());
+        budget.measure(|| ());
+        assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn a_measure_after_a_caught_panic_in_an_earlier_measure_still_charges() {
+        let mut budget = ScanTimeBudget::with_clock(Some(1.5), stepping_clock);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            budget.measure(|| panic!("scan blew up"))
+        }));
+        assert!(caught.is_err());
+        // One fake second per measure: the second charge reaches the cap.
         budget.measure(|| ());
         assert!(!budget.exhausted());
         budget.measure(|| ());
