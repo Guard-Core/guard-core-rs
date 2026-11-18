@@ -98,6 +98,8 @@ pub mod responses;
 pub mod route_gates;
 pub mod stage_events;
 pub mod sus_patterns;
+#[cfg(test)]
+pub(crate) mod test_http_stub;
 pub mod tower;
 pub mod user_agent;
 pub mod wiring;
