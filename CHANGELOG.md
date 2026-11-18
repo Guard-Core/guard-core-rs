@@ -10,6 +10,7 @@ All notable changes to this project.
 
 ### Changed
 
+- The probe child lookup also searches the executable's next four ancestors, so test executables under cargo 1.100's `target/debug/build/<pkg>/<hash>/out/` layout find `target/debug/guard-pattern-probe` (consumer user-agent tests failed with "probe child binary not found").
 - An RFC 3339 `DynamicRules` timestamp above jiff's range, such as the `9999-12-31T23:59:59Z` "never expires" stamp the SaaS accepts, saturates to `Timestamp::MAX` (and one below the range to `Timestamp::MIN`) instead of failing the payload, so the rules keep applying. A leap second `23:59:60Z` folds into `23:59:59Z` where chrono kept `:60`.
 - jiff's bundled tzdata is newer than chrono-tz 0.10.4's, so time-window decisions change for zones whose rules changed since (for example America/Havana, Cuba, Africa/Casablanca, Africa/El_Aaiun, America/Winnipeg and its aliases, Europe/Chisinau) and after 2037, where jiff applies DST correctly.
 
