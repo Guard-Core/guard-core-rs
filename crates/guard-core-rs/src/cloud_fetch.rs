@@ -429,9 +429,7 @@ mod tests {
                     }
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            let mut buffer = [0_u8; 4096];
-                            let read = stream.read(&mut buffer).unwrap_or(0);
-                            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                            let request = crate::test_http_stub::read_request(&mut stream);
                             let path = request.split_whitespace().nth(1).unwrap_or("/").to_owned();
                             log.lock().expect("log").push(request);
                             let hit_count = next_hit(&hits, &path);
@@ -554,6 +552,84 @@ mod tests {
         }]);
         let ranges = fetcher().fetch_csv(&stub.path("/geo/google.csv"));
         assert_eq!(ranges.len(), 2);
+    }
+
+    #[test]
+    fn stub_reads_a_request_that_arrives_after_accept() {
+        let stub = Stub::serve(vec![Route {
+            path: "/late",
+            status: 200,
+            body: "ok",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let address = stub.url.trim_start_matches("http://").to_owned();
+        let mut stream = std::net::TcpStream::connect(address).expect("connect");
+        std::thread::sleep(Duration::from_millis(100));
+        stream
+            .write_all(b"GET /late HTTP/1.1\r\nHost: stub\r\n\r\n")
+            .expect("write");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("read");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    }
+
+    fn client_to(stub: &Stub) -> std::net::TcpStream {
+        std::net::TcpStream::connect(stub.url.trim_start_matches("http://")).expect("connect")
+    }
+
+    #[test]
+    fn stub_reads_a_request_split_over_two_writes() {
+        let stub = Stub::serve(vec![Route {
+            path: "/split",
+            status: 200,
+            body: "ok",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let mut stream = client_to(&stub);
+        stream.write_all(b"GET /split HTTP/1.1\r\n").expect("first");
+        std::thread::sleep(Duration::from_millis(200));
+        stream.write_all(b"Host: stub\r\n\r\n").expect("second");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("read");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    }
+
+    #[test]
+    fn stub_reads_a_six_thousand_byte_header() {
+        let stub = Stub::serve(vec![Route {
+            path: "/big",
+            status: 200,
+            body: "ok",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let mut stream = client_to(&stub);
+        let request = format!("GET /big HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "a".repeat(6000));
+        stream.write_all(request.as_bytes()).expect("write");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("read");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    }
+
+    #[test]
+    fn a_silent_client_does_not_stall_the_stub() {
+        let stub = Stub::serve(vec![Route {
+            path: "/after",
+            status: 200,
+            body: "ok",
+            headers: &[],
+            fail_first: false,
+        }]);
+        let _silent = client_to(&stub);
+        let mut stream = client_to(&stub);
+        stream
+            .write_all(b"GET /after HTTP/1.1\r\nHost: stub\r\n\r\n")
+            .expect("write");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("read");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     }
 
     #[test]

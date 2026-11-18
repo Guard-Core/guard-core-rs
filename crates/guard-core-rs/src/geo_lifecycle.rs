@@ -670,7 +670,7 @@ mod geo_lifecycle_tests {
 
     impl DbStub {
         fn serve(payload: Vec<u8>) -> Self {
-            use std::io::{Read, Write};
+            use std::io::Write;
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             listener.set_nonblocking(true).expect("nonblocking");
             let port = listener.local_addr().expect("addr").port();
@@ -678,8 +678,7 @@ mod geo_lifecycle_tests {
             std::thread::spawn(move || {
                 loop {
                     if let Ok((mut stream, _)) = listener.accept() {
-                        let mut buffer = [0_u8; 2048];
-                        let _ = stream.read(&mut buffer);
+                        let _ = crate::test_http_stub::read_request(&mut stream);
                         let head =
                             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
                         let _ = stream.write_all(head.as_bytes());
@@ -963,13 +962,11 @@ mod geo_lifecycle_tests {
              \"service\": \"AMAZON\"}]}",
         );
         std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             loop {
                 if let Ok((mut stream, _)) = listener.accept() {
                     std::thread::sleep(Duration::from_millis(30));
-                    let mut buffer = [0_u8; 4096];
-                    let _ = stream.read(&mut buffer);
-                    let request = String::from_utf8_lossy(&buffer).to_string();
+                    let request = crate::test_http_stub::read_request(&mut stream);
                     let body = if request.contains("/aws") {
                         aws_body.clone()
                     } else {

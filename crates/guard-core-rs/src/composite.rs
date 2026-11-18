@@ -2303,7 +2303,7 @@ mod otel_tests {
         listener.set_nonblocking(true).expect("nonblocking");
         let (would_block_tx, would_block_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            use std::io::{Read, Write};
+            use std::io::Write;
             // The cloud_fetch stub's accept loop with a deterministic
             // Err arm: the main thread waits on the handshake below, so
             // the first accept is guaranteed to observe WouldBlock
@@ -2311,11 +2311,8 @@ mod otel_tests {
             // the handshake lands the Ok arm.
             loop {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buffer = [0_u8; 8192];
-                    let read = stream.read(&mut buffer).unwrap_or(0);
-                    sink.lock()
-                        .expect("sink")
-                        .push(String::from_utf8_lossy(&buffer[..read]).to_string());
+                    let request = crate::test_http_stub::read_request(&mut stream);
+                    sink.lock().expect("sink").push(request);
                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                     return;
                 }
