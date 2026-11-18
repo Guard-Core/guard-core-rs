@@ -37,35 +37,30 @@ jobs:
       fail-fast: false
       matrix:
         consumer:
-          # TEMPORARY companion pins for the chrono to jiff migration
-          # (RUSTSEC-2026-0543): every consumer is tested on its
-          # fix/chrono-to-jiff branch, because the engine's public API took
-          # jiff::Timestamp. Reset every test_ref and extra_ref below to
-          # master after the train merges.
           - repo: Guard-Core/actix-guard-rs
             path: actix-guard-rs
-            test_ref: fix/chrono-to-jiff
+            test_ref: master
             # Extra sibling checkout the consumer needs besides this engine.
             extra_repo: ''
             extra_path: ''
             extra_ref: ''
           - repo: Guard-Core/axum-guard-rs
             path: axum-guard-rs
-            test_ref: fix/chrono-to-jiff
+            test_ref: master
             # axum-guard-rs consumes tower-guard-rs as a sibling path
             # dependency, which itself consumes this engine.
             extra_repo: Guard-Core/tower-guard-rs
             extra_path: tower-guard-rs
-            extra_ref: fix/chrono-to-jiff
+            extra_ref: master
           - repo: Guard-Core/rocket-guard-rs
             path: rocket-guard-rs
-            test_ref: fix/chrono-to-jiff
+            test_ref: master
             extra_repo: ''
             extra_path: ''
             extra_ref: ''
           - repo: Guard-Core/tower-guard-rs
             path: tower-guard-rs
-            test_ref: fix/chrono-to-jiff
+            test_ref: master
             extra_repo: ''
             extra_path: ''
             extra_ref: ''
@@ -110,14 +105,12 @@ jobs:
 
       # Every adapter declares guard-agent-rs as an optional path dependency
       # (../guard-agent-rs), and cargo needs that manifest on disk even when
-      # the agent feature is off. TEMPORARY companion pin: the agent moves
-      # from chrono to jiff on fix/chrono-to-jiff; reset this ref to master
-      # after the train merges.
+      # the agent feature is off.
       - name: Checkout guard-agent-rs (sibling dependency)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Guard-Core/guard-agent-rs
-          ref: fix/chrono-to-jiff
+          ref: master
           path: guard-agent-rs
           persist-credentials: false
 
