@@ -26,7 +26,6 @@
 //!
 //! ```
 //! use guard_core_engine::time_window::{hhmm_in_zone, is_within, TimeWindow};
-//! use chrono::TimeZone;
 //!
 //! let window = TimeWindow { start: Some("09:00".into()), end: Some("17:00".into()), timezone: None };
 //! assert!(is_within(&window, "09:00"));
@@ -40,7 +39,7 @@
 //! assert!(!is_within(&night, "12:00"));
 //!
 //! // The zone resolution: 12:00 UTC is 07:00 in New York (winter).
-//! let utc = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+//! let utc: jiff::Timestamp = "2026-01-15T12:00:00Z".parse().unwrap();
 //! assert_eq!(hhmm_in_zone(utc, Some("America/New_York")), "07:00");
 //! // An unknown zone falls back to UTC.
 //! assert_eq!(hhmm_in_zone(utc, Some("Mars/Olympus")), "12:00");
@@ -76,11 +75,25 @@ pub struct TimeWindow {
 /// An unknown or empty zone falls back to UTC (the reference's `except`
 /// around `ZoneInfo`).
 #[must_use]
-pub fn hhmm_in_zone(now_utc: chrono::DateTime<chrono::Utc>, timezone: Option<&str>) -> String {
-    let zone: chrono_tz::Tz = timezone
-        .and_then(|name| name.parse().ok())
-        .unwrap_or(chrono_tz::UTC);
-    now_utc.with_timezone(&zone).format("%H:%M").to_string()
+pub fn hhmm_in_zone(now_utc: jiff::Timestamp, timezone: Option<&str>) -> String {
+    let zone = timezone
+        .and_then(resolve_zone)
+        .unwrap_or(jiff::tz::TimeZone::UTC);
+    now_utc
+        .to_zoned_datetime(zone)
+        .strftime("%H:%M")
+        .to_string()
+}
+
+/// The exact-case IANA lookup (`chrono_tz::Tz::from_str`): a name that
+/// differs from a known zone or alias in case is no match and resolves
+/// to UTC, the fallback the old `case-insensitive` feature never
+/// actually widened. jiff's own database lookup folds case, so the
+/// guard compares the resolved zone's name back to the query.
+fn resolve_zone(name: &str) -> Option<jiff::tz::TimeZone> {
+    jiff::tz::TimeZone::get(name)
+        .ok()
+        .filter(|zone| zone.iana_name() == Some(name))
 }
 
 /// The window decision against a current `"HH:MM"`.
@@ -103,7 +116,6 @@ pub fn is_within(window: &TimeWindow, current_hhmm: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     fn at(hour: u32, minute: u32) -> TimeWindow {
         TimeWindow {
@@ -159,7 +171,7 @@ mod tests {
 
     #[test]
     fn zones_shift_the_wall_clock_and_unknown_zones_fall_back() {
-        let utc = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 12, 0, 0).unwrap();
+        let utc: jiff::Timestamp = "2026-01-15T12:00:00Z".parse().unwrap();
         assert_eq!(hhmm_in_zone(utc, None), "12:00");
         assert_eq!(hhmm_in_zone(utc, Some("UTC")), "12:00");
         assert_eq!(
@@ -175,12 +187,40 @@ mod tests {
         );
 
         // The summer side of the DST boundary.
-        let summer = chrono::Utc.with_ymd_and_hms(2026, 7, 15, 12, 0, 0).unwrap();
+        let summer: jiff::Timestamp = "2026-07-15T12:00:00Z".parse().unwrap();
         assert_eq!(
             hhmm_in_zone(summer, Some("America/New_York")),
             "08:00",
             "EDT in July"
         );
+    }
+
+    /// Golden wall-clock captures taken on the chrono-tz build this
+    /// migration replaces: 12:00 UTC through zones east and west of UTC
+    /// on both sides of the DST change, the exact-case alias lookup, and
+    /// the fallbacks (unknown names, odd case, empty) that resolve to
+    /// UTC.
+    #[test]
+    fn golden_hhmm_in_zone_pins_the_zone_wall_clock() {
+        let winter: jiff::Timestamp = "2026-01-15T12:00:00Z".parse().unwrap();
+        let summer: jiff::Timestamp = "2026-07-15T12:00:00Z".parse().unwrap();
+        // UTC and None.
+        assert_eq!(hhmm_in_zone(winter, Some("UTC")), "12:00");
+        assert_eq!(hhmm_in_zone(winter, None), "12:00");
+        // West of UTC, both DST sides (EST -5, EDT -4).
+        assert_eq!(hhmm_in_zone(winter, Some("America/New_York")), "07:00");
+        assert_eq!(hhmm_in_zone(summer, Some("America/New_York")), "08:00");
+        // East of UTC, both DST sides (CET +1, CEST +2).
+        assert_eq!(hhmm_in_zone(winter, Some("Europe/Berlin")), "13:00");
+        assert_eq!(hhmm_in_zone(summer, Some("Europe/Berlin")), "14:00");
+        // The exact-case backward alias (link) still resolves.
+        assert_eq!(hhmm_in_zone(winter, Some("Asia/Calcutta")), "17:30");
+        // The fallbacks: unknown names, odd case, empty.
+        assert_eq!(hhmm_in_zone(winter, Some("Mars/Olympus")), "12:00");
+        assert_eq!(hhmm_in_zone(winter, Some("AMERICA/new_YORK")), "12:00");
+        assert_eq!(hhmm_in_zone(winter, Some("america/new_york")), "12:00");
+        assert_eq!(hhmm_in_zone(winter, Some("Asia/CalcUttA")), "12:00");
+        assert_eq!(hhmm_in_zone(winter, Some("")), "12:00");
     }
 
     #[test]
@@ -192,7 +232,7 @@ mod tests {
             end: Some("17:00".into()),
             timezone: Some("Asia/Tokyo".into()),
         };
-        let utc = chrono::Utc.with_ymd_and_hms(2026, 1, 15, 0, 0, 0).unwrap();
+        let utc: jiff::Timestamp = "2026-01-15T00:00:00Z".parse().unwrap();
         assert_eq!(hhmm_in_zone(utc, Some("Asia/Tokyo")), "09:00");
         assert!(is_within(&window, &hhmm_in_zone(utc, Some("Asia/Tokyo"))));
     }

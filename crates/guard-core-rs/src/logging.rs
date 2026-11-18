@@ -251,9 +251,9 @@ pub fn asctime(at: SystemTime) -> String {
         Ok(duration) => (duration.as_secs().cast_signed(), duration.subsec_millis()),
         Err(error) => (-(error.duration().as_secs().cast_signed()), 0),
     };
-    chrono::DateTime::from_timestamp(secs, 0)
-        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
-        .format("%Y-%m-%d %H:%M:%S")
+    jiff::Timestamp::from_second(secs)
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH)
+        .strftime("%Y-%m-%d %H:%M:%S")
         .to_string()
         + format!(",{millis:03}").as_str()
 }
@@ -340,6 +340,33 @@ mod tests {
     use super::*;
     use crate::redact::SensitiveNames;
     use std::time::Duration;
+
+    /// Golden timestamp captures taken on the chrono build this
+    /// migration replaces: the epoch, a full day plus millis, a
+    /// pre-epoch second, the sub-second pre-epoch truncation and a
+    /// modern instant, all in the python-logging asctime shape.
+    #[test]
+    fn golden_asctime_pins_the_python_logging_shape() {
+        assert_eq!(asctime(SystemTime::UNIX_EPOCH), "1970-01-01 00:00:00,000");
+        assert_eq!(
+            asctime(SystemTime::UNIX_EPOCH + Duration::from_millis(86_400_000 + 1_234)),
+            "1970-01-02 00:00:01,234"
+        );
+        assert_eq!(
+            asctime(SystemTime::UNIX_EPOCH - Duration::from_secs(1)),
+            "1969-12-31 23:59:59,000",
+            "the pre-epoch second"
+        );
+        assert_eq!(
+            asctime(SystemTime::UNIX_EPOCH - Duration::from_millis(100)),
+            "1970-01-01 00:00:00,000",
+            "the error path floors the second and drops the millis"
+        );
+        assert_eq!(
+            asctime(SystemTime::UNIX_EPOCH + Duration::from_millis(1_779_030_096_789)),
+            "2026-05-17 15:01:36,789"
+        );
+    }
 
     fn names() -> SensitiveNames {
         SensitiveNames::default()

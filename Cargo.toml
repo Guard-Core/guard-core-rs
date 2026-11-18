@@ -11,7 +11,6 @@ authors = [
 categories = ["web-programming"]
 documentation = "https://docs.rs/guard-core-rs"
 edition = "2024"
-homepage = "https://github.com/Guard-Core/guard-core-rs"
 keywords = ["security", "middleware", "api", "detection-engine", "waf"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Guard-Core/guard-core-rs"

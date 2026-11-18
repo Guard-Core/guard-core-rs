@@ -66,13 +66,13 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use chrono::{DateTime, Utc};
 use guard_core_engine::dynamic_rules::{
     AppliedDynamicRules, DynamicRules, dump_last_known_rules_snapshot, expired_identity,
     has_expired, load_last_known_rules_snapshot, matches_event, should_update,
 };
 use guard_core_engine::ip_ban::IpBanManager;
 use guard_core_engine::security_config::SecurityConfig;
+use jiff::Timestamp;
 
 use crate::composite::TelemetryHandler;
 use crate::enrichment::RuleMatcher;
@@ -172,7 +172,7 @@ impl SnapshotConfig {
 #[derive(Default)]
 struct ManagerState {
     current_rules: Option<DynamicRules>,
-    last_update: Option<DateTime<Utc>>,
+    last_update: Option<Timestamp>,
     last_skipped_expired: Option<(String, u64)>,
     base_snapshot: Option<SnapshotConfig>,
 }
@@ -186,7 +186,7 @@ pub struct DynamicRuleManager {
     patterns: Option<Arc<SusPatternsManager>>,
     cache_path: Option<PathBuf>,
     validation_cache: Option<Arc<guard_core_engine::redos::validation_cache::ValidationCache>>,
-    clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    clock: Arc<dyn Fn() -> Timestamp + Send + Sync>,
     state: Mutex<ManagerState>,
 }
 
@@ -237,7 +237,7 @@ impl DynamicRuleManager {
             patterns: None,
             cache_path,
             validation_cache: None,
-            clock: Arc::new(chrono::Utc::now),
+            clock: Arc::new(jiff::Timestamp::now),
             state: Mutex::new(ManagerState::default()),
         }
     }
@@ -269,7 +269,7 @@ impl DynamicRuleManager {
 
     /// Override the clock (deterministic expiry in tests).
     #[must_use]
-    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>) -> Self {
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> Timestamp + Send + Sync>) -> Self {
         self.clock = clock;
         self
     }
@@ -289,7 +289,7 @@ impl DynamicRuleManager {
         self
     }
 
-    fn now(&self) -> DateTime<Utc> {
+    fn now(&self) -> Timestamp {
         (self.clock)()
     }
 
@@ -311,7 +311,7 @@ impl DynamicRuleManager {
     /// # Errors
     ///
     /// Never; the state lock is fair-queued and unpoisoned.
-    pub fn last_update(&self) -> Option<DateTime<Utc>> {
+    pub fn last_update(&self) -> Option<Timestamp> {
         self.state.lock().expect("manager state").last_update
     }
 
@@ -616,10 +616,8 @@ mod dynamic_rule_manager_tests {
         }
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        chrono::TimeZone::timestamp_opt(&Utc, secs, 0)
-            .single()
-            .expect("valid time")
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_second(secs).expect("valid time")
     }
 
     /// A scripted sink: the rules payload, the events, and the health
@@ -1349,7 +1347,7 @@ mod dynamic_rule_manager_tests {
         (manager, sink, config)
     }
 
-    type SharedClock = Arc<Mutex<DateTime<Utc>>>;
+    type SharedClock = Arc<Mutex<Timestamp>>;
 
     fn overlay_manager_with_clock(
         base: SecurityConfig,
@@ -1536,7 +1534,8 @@ mod dynamic_rule_manager_tests {
         });
         poll(&manager, &sink, emergency(1, "r1"));
         let mut v2 = emergency(2, "r1");
-        v2["expires_at"] = serde_json::json!(at(1500));
+        // The wire shape of `at(1500)` (1500s after the epoch).
+        v2["expires_at"] = serde_json::json!("1970-01-01T00:25:00Z");
         poll(&manager, &sink, v2);
         assert_eq!(config.read().expect("config").auto_ban_threshold, 8);
 

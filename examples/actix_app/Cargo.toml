@@ -6,7 +6,6 @@ categories    = { workspace = true }
 description   = "Rate-limit and dynamic-ban stage for actix-web over guard-core-rs (example service)."
 documentation = { workspace = true }
 edition       = { workspace = true }
-homepage      = { workspace = true }
 keywords      = { workspace = true }
 license       = { workspace = true }
 repository    = { workspace = true }

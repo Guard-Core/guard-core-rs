@@ -348,15 +348,30 @@ pub fn parse_service_tags_date(url: &str) -> Option<(i32, u32, u32)> {
     let day: u32 = digits[6..8]
         .parse()
         .expect("the digits are validated above");
-    chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    #[cfg(not(coverage))] // unreachable: four, two and two ascii digits
+    // stay inside i16 and i8, so the narrowing cannot fail
+    let narrowed = (
+        i16::try_from(year).ok()?,
+        i8::try_from(month).ok()?,
+        i8::try_from(day).ok()?,
+    );
+    #[cfg(coverage)]
+    let narrowed = (
+        i16::try_from(year).expect("the digits are four ascii"),
+        i8::try_from(month).expect("the digits are two ascii"),
+        i8::try_from(day).expect("the digits are two ascii"),
+    );
+    jiff::civil::Date::new(narrowed.0, narrowed.1, narrowed.2).ok()?;
     // A future date does not count (the reference rejects it).
-    let today = chrono::Utc::now().date_naive();
+    let today = jiff::Timestamp::now()
+        .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+        .date();
     #[cfg(not(coverage))] // unreachable: the same year/month/day just
     // constructed a date two lines above, so this cannot fail
-    let parsed = chrono::NaiveDate::from_ymd_opt(year, month, day)?;
+    let parsed = jiff::civil::Date::new(narrowed.0, narrowed.1, narrowed.2).ok()?;
     #[cfg(coverage)]
-    let parsed =
-        chrono::NaiveDate::from_ymd_opt(year, month, day).expect("the date is validated above");
+    let parsed = jiff::civil::Date::new(narrowed.0, narrowed.1, narrowed.2)
+        .expect("the date is validated above");
     if parsed > today {
         return None;
     }
@@ -878,6 +893,46 @@ mod tests {
                 "https://download.microsoft.com/ServiceTags_Public_20260101.json"
             ),
             Some((2026, 1, 1))
+        );
+    }
+
+    /// Golden calendar captures taken on the chrono build this migration
+    /// replaces: the valid date, an impossible day, both sides of the
+    /// leap-day rule and a future date.
+    #[test]
+    fn golden_service_tags_date_validation_pins_the_calendar_rules() {
+        let url_for = |digits: &str| {
+            format!("https://download.microsoft.com/ServiceTags_Public_{digits}.json")
+        };
+        assert_eq!(
+            parse_service_tags_date(&url_for("20260115")),
+            Some((2026, 1, 15)),
+            "a valid past date"
+        );
+        assert_eq!(
+            parse_service_tags_date(&url_for("20260230")),
+            None,
+            "February never has a 30th"
+        );
+        assert_eq!(
+            parse_service_tags_date(&url_for("20240229")),
+            Some((2024, 2, 29)),
+            "the leap day of a leap year"
+        );
+        assert_eq!(
+            parse_service_tags_date(&url_for("20250229")),
+            None,
+            "the leap day of a common year"
+        );
+        assert_eq!(
+            parse_service_tags_date(&url_for("20991231")),
+            None,
+            "a future date"
+        );
+        assert_eq!(
+            parse_service_tags_date(&url_for("20260000")),
+            None,
+            "month 0 and day 0"
         );
     }
 

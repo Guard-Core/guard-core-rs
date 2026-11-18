@@ -227,6 +227,10 @@ pub fn child_path() -> Option<PathBuf> {
     )
 }
 
+/// Ancestors searched beyond the exe's directory and its parent: cargo 1.100
+/// lays test executables out as `<profile>/build/<pkg>/<hash>/out/<exe>`.
+const MAX_EXTRA_PROBE_ANCESTORS: usize = 4;
+
 /// The pure half of [`child_path`], testable without process state.
 #[must_use]
 fn resolve_child_path(
@@ -252,9 +256,11 @@ fn resolve_child_path(
         .parent()
         .expect("a named file always has a parent directory");
     let mut candidates: Vec<PathBuf> = Vec::new();
-    for base in core::iter::once(dir).chain(dir.parent()) {
-        // Unit tests run from target/debug/deps; the sibling binary is in
-        // target/debug.
+    // Unit tests run from target/debug/deps; the sibling binary is in
+    // target/debug. Cargo 1.100 puts test executables at
+    // target/debug/build/<pkg>/<hash>/out, so a bounded run of further
+    // ancestors (never past the filesystem root) follows the original two.
+    for base in dir.ancestors().take(2 + MAX_EXTRA_PROBE_ANCESTORS) {
         for name in ["guard-pattern-probe", "guard-pattern-probe.exe"] {
             candidates.push(base.join(name));
         }
@@ -807,6 +813,18 @@ mod tests {
         let exe = PathBuf::from("/opt/tools/guard-pattern-probe");
         let resolved = resolve_child_path(Some("/definitely/missing/bin"), Some(&exe));
         assert_eq!(resolved, Some(exe));
+    }
+
+    #[test]
+    fn resolve_child_path_finds_the_probe_above_the_cargo_build_dir_layout() {
+        let root = std::env::temp_dir().join(format!("gc-probe-layout-{}", std::process::id()));
+        let out = root.join("debug/build/tower-guard-rs/abc123/out");
+        std::fs::create_dir_all(&out).expect("create layout");
+        let probe = root.join("debug/guard-pattern-probe");
+        std::fs::write(&probe, b"").expect("write probe");
+        let resolved = resolve_child_path(None, Some(&out.join("tower_guard_rs-abc123")));
+        std::fs::remove_dir_all(&root).expect("cleanup");
+        assert_eq!(resolved, Some(probe));
     }
 
     #[test]

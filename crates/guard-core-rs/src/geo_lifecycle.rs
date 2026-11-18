@@ -53,8 +53,8 @@ use std::time::{Duration, SystemTime};
 use crate::cloud_fetch::{CloudFetcher, endpoints};
 use crate::composite::TelemetryRedisStore;
 use crate::mmdb::Mmdb;
-use chrono::{DateTime, Utc};
 use guard_core_engine::cloud_fetch::ParsedRanges;
+use jiff::Timestamp;
 
 /// `db_path or Path("data/ipinfo/country_asn.mmdb")`: the default
 /// database location.
@@ -69,6 +69,29 @@ pub const IPINFO_REDIS_NAMESPACE: &str = "ipinfo";
 /// The cached-database key.
 pub const IPINFO_REDIS_KEY: &str = "database";
 
+/// The chrono `DateTime<Utc>::to_rfc3339` text shape, reproduced byte
+/// for byte: no fraction when the sub-second part is zero, otherwise
+/// chrono's 3, 6 or 9 digit classes, and the explicit `+00:00` suffix
+/// (never a bare `Z`).
+fn chrono_rfc3339(at: Timestamp) -> String {
+    let nanos = at.subsec_nanosecond();
+    let precision = if nanos == 0 {
+        0
+    } else if nanos % 1_000_000 == 0 {
+        3
+    } else if nanos % 1_000 == 0 {
+        6
+    } else {
+        9
+    };
+    let stamped = at.display_with_offset(jiff::tz::Offset::UTC);
+    if precision == 0 {
+        format!("{stamped}")
+    } else {
+        format!("{stamped:.precision$}")
+    }
+}
+
 /// The reference `IPInfoManager`: the token-gated `GeoIP` database
 /// lifecycle over the crate's MMDB reader (the download attempts ride
 /// the fetcher: 3 tries with the exponential backoff starting at 1 s).
@@ -78,7 +101,7 @@ pub struct IpInfoManager {
     max_age: Duration,
     reader: Mutex<Option<Arc<Mmdb>>>,
     redis: Option<Arc<dyn TelemetryRedisStore>>,
-    last_refreshed: Mutex<Option<DateTime<Utc>>>,
+    last_refreshed: Mutex<Option<Timestamp>>,
     initialization_attempted: AtomicBool,
     fetcher: CloudFetcher,
     database_url: String,
@@ -221,7 +244,7 @@ impl IpInfoManager {
                 self.last_refreshed
                     .lock()
                     .expect("last refreshed")
-                    .map(|at| serde_json::Value::String(at.to_rfc3339()))
+                    .map(|at| serde_json::Value::String(chrono_rfc3339(at)))
                     .unwrap_or(serde_json::Value::Null),
             ),
             (
@@ -303,7 +326,7 @@ impl IpInfoManager {
         let reader = self.open_database_or_none()?;
         if let Some(reader) = reader {
             *self.reader.lock().expect("ipinfo reader") = Some(reader);
-            *self.last_refreshed.lock().expect("last refreshed") = Some(Utc::now());
+            *self.last_refreshed.lock().expect("last refreshed") = Some(Timestamp::now());
         }
         Ok(())
     }
@@ -368,7 +391,7 @@ impl IpInfoManager {
     fn apply_opened_reader(&self) -> Result<(), GeoLifecycleError> {
         if let Some(reader) = self.open_database_or_none()? {
             *self.reader.lock().expect("ipinfo reader") = Some(reader);
-            *self.last_refreshed.lock().expect("last refreshed") = Some(Utc::now());
+            *self.last_refreshed.lock().expect("last refreshed") = Some(Timestamp::now());
         }
         Ok(())
     }
@@ -554,6 +577,36 @@ mod geo_lifecycle_tests {
     use guard_core_engine::distributed::StoreError;
     use std::path::Path;
     use std::sync::Mutex;
+
+    /// Golden `get_status` captures taken on the chrono build this
+    /// migration replaces: the `to_rfc3339` shape is the 0/3/6/9-digit
+    /// fraction with the explicit `+00:00` suffix, never a bare `Z`.
+    #[test]
+    fn golden_last_refreshed_status_pins_the_rfc3339_text() {
+        let manager =
+            IpInfoManager::new("token", Some(temp_dir("golden-geo")), 3600).expect("manager");
+        let cases: &[(&str, &str)] = &[
+            ("2026-01-15T12:00:00Z", "2026-01-15T12:00:00+00:00"),
+            ("2026-01-15T12:00:00.123Z", "2026-01-15T12:00:00.123+00:00"),
+            (
+                "2026-01-15T12:00:00.123456Z",
+                "2026-01-15T12:00:00.123456+00:00",
+            ),
+            (
+                "2026-01-15T12:00:00.123456789Z",
+                "2026-01-15T12:00:00.123456789+00:00",
+            ),
+        ];
+        for (input, output) in cases {
+            let value: Timestamp = input.parse().expect("parses");
+            *manager.last_refreshed.lock().expect("stamp") = Some(value);
+            let status = manager.get_status();
+            assert_eq!(status["last_refreshed"], *output, "wire text of {input}");
+        }
+        *manager.last_refreshed.lock().expect("stamp") = None;
+        let status = manager.get_status();
+        assert_eq!(status["last_refreshed"], serde_json::Value::Null);
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));

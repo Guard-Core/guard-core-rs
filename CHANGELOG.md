@@ -2,6 +2,18 @@
 
 All notable changes to this project.
 
+## [Unreleased]
+
+### Breaking
+
+- The timestamp surfaces move from chrono and chrono-tz to jiff 1.0, so every public signature that carried a `chrono::DateTime<chrono::Utc>` changes to the jiff equivalent `jiff::Timestamp`: `guard_core_engine::time_window::hhmm_in_zone`, `guard_core_engine::dynamic_rules::has_expired` and `expired_identity`, the `DynamicRules` model fields `timestamp` and `expires_at` (and so `LastKnownRulesSnapshot`), `guard_core_rs::dynamic_rules::DynamicRuleManager::with_clock` and `last_update`, and `guard_core_rs::route_gates::TimeWindowStage::decide_at`. `DynamicRules` and `LastKnownRulesSnapshot` now derive `Eq`. The JSON wire shapes stay byte-identical and are pinned by golden tests: the rules timestamps keep chrono's RFC 3339 output (0, 3, 6 or 9 fraction digits, offsets folded into UTC, the `Z` suffix) and the `ipinfo` status stamp keeps chrono's `to_rfc3339` shape (the same fraction classes with the explicit `+00:00` suffix). Zone lookups ride the bundled IANA database (jiff's `tzdb-bundle-always`, no system dependency, the same stance chrono-tz had) with chrono-tz's exact-case name matching preserved (an odd-case or unknown zone name falls back to UTC, the reference's `except` arm). This retires the unmaintained chrono (RUSTSEC-2026-0543), chrono-tz (RUSTSEC-2026-0555) and chrono-tz-build (RUSTSEC-2026-0559) from the dependency tree
+
+### Changed
+
+- The probe child lookup also searches the executable's next four ancestors, so test executables under cargo 1.100's `target/debug/build/<pkg>/<hash>/out/` layout find `target/debug/guard-pattern-probe` (consumer user-agent tests failed with "probe child binary not found").
+- An RFC 3339 `DynamicRules` timestamp above jiff's range, such as the `9999-12-31T23:59:59Z` "never expires" stamp the SaaS accepts, saturates to `Timestamp::MAX` (and one below the range to `Timestamp::MIN`) instead of failing the payload, so the rules keep applying. A leap second `23:59:60Z` folds into `23:59:59Z` where chrono kept `:60`.
+- jiff's bundled tzdata is newer than chrono-tz 0.10.4's, so time-window decisions change for zones whose rules changed since (for example America/Havana, Cuba, Africa/Casablanca, Africa/El_Aaiun, America/Winnipeg and its aliases, Europe/Chisinau) and after 2037, where jiff applies DST correctly.
+
 ## [4.4.0] - 2026-10-15
 
 ### Breaking
