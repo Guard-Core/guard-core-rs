@@ -4,7 +4,7 @@ use std::io::Read;
 use std::net::TcpStream;
 use std::time::Duration;
 
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_TIMEOUT: Duration = Duration::from_secs(1);
 const HEAD_CAP: usize = 64 * 1024;
 const HEAD_END: &[u8] = b"\r\n\r\n";
 
@@ -35,7 +35,7 @@ fn is_complete(received: &[u8]) -> bool {
 
 /// Reads one whole request: the head up to the blank line (capped at 64 KiB),
 /// then `Content-Length` body bytes when the header is present. A client that
-/// stops sending gets 5 seconds, then the stub answers with what it has.
+/// stops sending gets 1 second, then the stub answers with what it has.
 pub fn read_request(stream: &mut TcpStream) -> String {
     // macOS hands back the listener's non-blocking mode.
     stream.set_nonblocking(false).expect("blocking stream");
