@@ -155,6 +155,18 @@ impl ScanTimeBudget {
         self.mark = None;
     }
 
+    /// Run one scan and charge its CPU time to the budget: the scan is its
+    /// own pass, or part of the pass already open, which then charges it.
+    pub fn measure<T>(&mut self, scan: impl FnOnce() -> T) -> T {
+        if self.mark.is_some() {
+            return scan();
+        }
+        self.open_pass();
+        let result = scan();
+        self.close_pass();
+        result
+    }
+
     fn charge(&mut self) {
         if let Some(mark) = self.mark {
             let now = (self.clock)();
@@ -216,6 +228,38 @@ mod tests {
         budget.open_pass();
         budget.close_pass();
         assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn measure_charges_each_scan_as_a_pass() {
+        let mut budget = ScanTimeBudget::with_clock(Some(2.5), stepping_clock);
+        // Each measure reads the clock twice: one fake second per scan.
+        assert_eq!(budget.measure(|| 7), 7);
+        assert!(!budget.exhausted());
+        budget.measure(|| ());
+        assert!(!budget.exhausted());
+        budget.measure(|| ());
+        assert!(budget.exhausted());
+    }
+
+    #[test]
+    fn measure_inside_an_open_pass_leaves_the_charge_to_the_pass() {
+        READS.with(|reads| reads.set(0));
+        let mut budget = ScanTimeBudget::with_clock(Some(10.0), counting_clock);
+        budget.open_pass();
+        assert_eq!(budget.measure(|| 3), 3);
+        assert_eq!(READS.with(Cell::get), 1, "only the pass's own open read");
+        budget.close_pass();
+        assert_eq!(READS.with(Cell::get), 2);
+    }
+
+    #[test]
+    fn unbounded_measure_never_reads_the_cpu_clock() {
+        READS.with(|reads| reads.set(0));
+        let mut budget = ScanTimeBudget::with_clock(None, counting_clock);
+        assert_eq!(budget.measure(|| 5), 5);
+        assert!(!budget.exhausted());
+        assert_eq!(READS.with(Cell::get), 0);
     }
 
     #[test]
