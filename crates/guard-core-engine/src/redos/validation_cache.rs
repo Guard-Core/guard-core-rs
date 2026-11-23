@@ -269,6 +269,28 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_publish_removes_its_temporary_file() {
+        let (dir, path) = tempdir();
+        // A directory where the cache file belongs: the rename must fail.
+        std::fs::create_dir_all(&path).expect("blocking directory");
+        let cache = ValidationCache::load(&path);
+        cache.put("^a$", true, true, "ok");
+        assert!(!path.with_extension("tmp").exists());
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn a_failed_temporary_write_publishes_nothing() {
+        let (dir, path) = tempdir();
+        // A directory where the temporary file belongs: the write must fail.
+        std::fs::create_dir_all(path.with_extension("tmp")).expect("blocking directory");
+        let cache = ValidationCache::load(&path);
+        cache.put("^a$", true, true, "ok");
+        assert!(!path.is_file());
+        cleanup(&dir);
+    }
+
+    #[test]
     fn a_missing_file_starts_absent_and_empty() {
         let (dir, path) = tempdir();
         let cache = ValidationCache::load(&path);

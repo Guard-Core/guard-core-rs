@@ -338,6 +338,34 @@ mod tests {
     }
 
     #[test]
+    fn the_detection_view_copies_every_set_list_knob() {
+        let config = with(|config| {
+            config.excluded_semantic_detection_headers =
+                Some(BTreeSet::from([String::from("x-semantic")]));
+            config.excluded_detection_params = Some(BTreeSet::from([String::from("q")]));
+            config.excluded_detection_body_fields = Some(BTreeSet::from([String::from("body")]));
+            config.enabled_detection_categories = Some(BTreeSet::from([String::from("sqli")]));
+        });
+        let view = config.detection_exclusions();
+        assert_eq!(
+            view.excluded_semantic_detection_headers,
+            Some(vec![String::from("x-semantic")])
+        );
+        assert_eq!(
+            view.excluded_detection_params,
+            Some(vec![String::from("q")])
+        );
+        assert_eq!(
+            view.excluded_detection_body_fields,
+            Some(vec![String::from("body")])
+        );
+        assert_eq!(
+            view.enabled_detection_categories,
+            Some(vec![String::from("sqli")])
+        );
+    }
+
+    #[test]
     fn a_zero_route_limit_is_rejected_by_the_engine_validator() {
         let config = with(|config| config.rate_limit = Some(0));
         assert!(config.rate_limits().is_err());

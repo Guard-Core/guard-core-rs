@@ -167,6 +167,16 @@ mod tests {
     }
 
     #[test]
+    fn record_pair_counts_a_repeated_pair_once() {
+        let mut pairs = std::collections::HashMap::new();
+        let mut pair_text_size = 0usize;
+        record_pair(&mut pairs, &mut pair_text_size, "ab", "cd").expect("first sighting");
+        record_pair(&mut pairs, &mut pair_text_size, "ab", "cd").expect("repeat sighting");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pair_text_size, 4);
+    }
+
+    #[test]
     fn record_pair_honors_the_text_budget() {
         let mut pairs = std::collections::HashMap::new();
         let mut pair_text_size = 0usize;

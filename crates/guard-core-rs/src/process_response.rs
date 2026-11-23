@@ -500,6 +500,31 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_ban_for_an_unparseable_client_ip_is_answered_but_not_stored() {
+        let bans = IpBanManager::new();
+        let rule = BehaviorRule {
+            rule_type: String::from("usage"),
+            threshold: 2,
+            window: 60,
+            pattern: String::new(),
+            action: String::from("ban"),
+            ban_duration: Some(3600),
+            correlate_with_detection: false,
+        };
+        let usage_processor = processor(Vec::new(), None, None, bans);
+        let rules = [rule];
+        let now = std::time::SystemTime::now();
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            actions = usage_processor.process_usage_rules("GET:/api", "not-an-ip", &rules, now);
+        }
+        assert!(matches!(
+            actions.as_slice(),
+            [guard_core_engine::behavior::BehaviorAction::Ban { .. }]
+        ));
+    }
+
+    #[test]
     fn the_scoped_pass_skips_the_return_rules_but_keeps_the_rest() {
         let bans = IpBanManager::new();
         let scoped = processor(

@@ -177,6 +177,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_wildcard_preflight_without_requested_headers_echoes_nothing() {
+        let cors = CorsConfig {
+            enabled: true,
+            allow_origins: vec!["https://app.example.com".to_owned()],
+            allow_methods: vec!["GET".to_owned()],
+            allow_headers: vec!["*".to_owned()],
+            allow_credentials: false,
+            max_age: 900,
+        };
+        let answer = build_preflight_response(
+            &cors,
+            PreflightRequest {
+                origin: Some("https://app.example.com"),
+                request_method: Some("get"),
+                request_headers_raw: None,
+            },
+        );
+        assert_eq!(answer.status_code, 200);
+        assert!(!answer.headers.contains_key("Access-Control-Allow-Headers"));
+    }
+
+    #[test]
     fn an_allowed_preflight_answers_the_full_header_set() {
         let cors = CorsConfig {
             enabled: true,

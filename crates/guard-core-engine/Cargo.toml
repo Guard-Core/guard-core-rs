@@ -12,7 +12,6 @@ html-escape           = { workspace = true }
 jiff                  = { version = "1.0", default-features = false, features = ["std", "tzdb-bundle-always"] }
 sha2                  = "0.11"
 lru                   = { workspace = true }
-percent-encoding      = { workspace = true }
 rand                  = { version = "0.10", default-features = false, features = ["std", "thread_rng"] }
 regex                 = { workspace = true }
 serde                 = { workspace = true }

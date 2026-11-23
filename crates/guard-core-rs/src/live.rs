@@ -360,6 +360,17 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_ip_ban_config_keeps_the_previous_user_agent_stage() {
+        let (wiring, cell) = wired();
+        let kept = cell.get();
+        mutate(&wiring, |config| {
+            config.blocked_user_agents = vec!["curl".to_owned()];
+            config.auto_ban_threshold = 0;
+        });
+        assert!(Arc::ptr_eq(&kept, &cell.get()));
+    }
+
+    #[test]
     fn a_cloud_provider_rule_builds_the_stage_and_an_uncompilable_agent_is_rejected() {
         let (wiring, cell) = wired();
         mutate(&wiring, |config| {
