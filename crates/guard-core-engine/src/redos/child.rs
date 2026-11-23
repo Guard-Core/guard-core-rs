@@ -417,9 +417,11 @@ impl CompiledProbe {
             .map_err(|e| e.to_string())
     }
 
-    /// One search pass, returning wall time.
+    /// One search pass, returning CPU seconds. The reference times with
+    /// `time.process_time()`: a preempted child must not charge the time it
+    /// spent descheduled to the pattern under test.
     pub fn timed_search(&self, text: &str) -> f64 {
-        let start = Instant::now();
+        let start = crate::scan_budget::thread_cpu_seconds();
         match self {
             Self::Re(regex) => {
                 let _ = regex.find(text);
@@ -428,7 +430,7 @@ impl CompiledProbe {
                 let _ = regex.find(text);
             }
         }
-        start.elapsed().as_secs_f64()
+        crate::scan_budget::thread_cpu_seconds() - start
     }
 }
 

@@ -45,13 +45,13 @@ pub fn budget_exhausted_message() -> String {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn thread_cpu_seconds() -> f64 {
+pub(crate) fn thread_cpu_seconds() -> f64 {
     let ts = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
     ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn thread_cpu_seconds() -> f64 {
+pub(crate) fn thread_cpu_seconds() -> f64 {
     use std::sync::OnceLock;
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
