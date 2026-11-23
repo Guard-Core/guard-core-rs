@@ -1927,15 +1927,18 @@ mod otel_tests {
             )
         };
         handler.start().expect("second start");
-        let state = handler.state.lock().expect("otel state");
-        assert!(state.started);
-        assert_eq!(
+        let (started, endpoints) = {
+            let state = handler.state.lock().expect("otel state");
             (
-                state.traces_endpoint.clone(),
-                state.metrics_endpoint.clone()
-            ),
-            first
-        );
+                state.started,
+                (
+                    state.traces_endpoint.clone(),
+                    state.metrics_endpoint.clone(),
+                ),
+            )
+        };
+        assert!(started);
+        assert_eq!(endpoints, first);
     }
 
     fn otel_with_endpoint(endpoint: Option<&str>) -> (OtelHandler, Arc<CapturingTransport>) {
