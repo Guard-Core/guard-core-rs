@@ -27,7 +27,6 @@ guard-core-engine = { path = "crates/guard-core-engine", version = "4.4.0" }
 criterion             = { version = "0.8.2", default-features = false }
 html-escape           = "0.2.13"
 lru                   = "0.18.0"
-percent-encoding      = "2.3.2"
 pyo3                  = { version = "0.29.0", features = ["extension-module", "abi3-py310"] }
 regex                 = "1.12.4"
 serde                 = { version = "1.0.228", features = ["derive"] }

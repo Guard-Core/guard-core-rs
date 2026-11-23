@@ -249,7 +249,11 @@ pub fn dump_last_known_rules_snapshot(rules: &DynamicRules) -> Result<String, Sn
         schema_version: LAST_KNOWN_RULES_SNAPSHOT_SCHEMA_VERSION,
         rules: rules.clone(),
     };
-    serde_json::to_string(&snapshot)
+    encode_snapshot_envelope(&snapshot)
+}
+
+fn encode_snapshot_envelope<T: serde::Serialize>(envelope: &T) -> Result<String, SnapshotError> {
+    serde_json::to_string(envelope)
         .map_err(|error| SnapshotError(format!("snapshot serialization: {error}")))
 }
 
@@ -558,6 +562,12 @@ pub fn apply_to_config_with_validation_cache(
 #[cfg(test)]
 mod dynamic_rules_tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_envelope_with_non_string_keys_fails_to_encode() {
+        let envelope = std::collections::BTreeMap::from([((1_u8, 2_u8), 3_u8)]);
+        assert!(encode_snapshot_envelope(&envelope).is_err());
+    }
 
     /// Golden wire captures of the chrono `DateTime<Utc>` serde shapes,
     /// taken on the chrono build this migration replaces: 0, 3, 6 or 9

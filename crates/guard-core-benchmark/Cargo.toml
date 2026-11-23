@@ -11,7 +11,7 @@ bench   = false
 doctest = false
 test    = false
 
-[dependencies]
+[dev-dependencies]
 criterion         = { workspace = true }
 guard-core-engine = { workspace = true }
 

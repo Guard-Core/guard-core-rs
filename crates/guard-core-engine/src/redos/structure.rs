@@ -367,21 +367,16 @@ fn broad_unbounded_run_at(pattern: &str, depth: usize) -> StructureResult<(usize
             let raw: Vec<char> = chars[i + 1..j - 1].to_vec();
             if let Some(inner) = normalize_group_inner(&raw) {
                 let inner_chars: Vec<char> = inner.chars().collect();
-                let mut best: Option<(usize, Vec<String>)> = None;
+                // Each count comes with its spans, so an all-zero fold keeps no spans.
+                let mut best: (usize, Vec<String>) = (0, Vec::new());
                 for branch in split_top_level_alternations(&inner_chars) {
                     let result = broad_unbounded_run_at(&branch, depth + 1)?;
-                    let better = match &best {
-                        None => true,
-                        Some((best_count, _)) => result.0 > *best_count,
-                    };
-                    if better {
-                        best = Some(result);
+                    if result.0 > best.0 {
+                        best = result;
                     }
                 }
-                if let Some((best_count, best_spans)) = best {
-                    count += best_count;
-                    spans.extend(best_spans);
-                }
+                count += best.0;
+                spans.extend(best.1);
             }
             i = j;
             continue;

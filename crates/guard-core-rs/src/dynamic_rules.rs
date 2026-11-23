@@ -1028,6 +1028,52 @@ mod dynamic_rule_manager_tests {
     }
 
     #[test]
+    fn an_expired_hydrated_rule_clears_the_rule_without_a_base_snapshot() {
+        let config = Arc::new(RwLock::new(SecurityConfig::default()));
+        let manager = DynamicRuleManager::new(Arc::clone(&config));
+        let mut expired = rules();
+        expired.expires_at = Some(Timestamp::from_second(1).expect("timestamp"));
+        manager.state.lock().expect("state").current_rules = Some(expired);
+        assert!(manager.expire_current_rule());
+        assert_eq!(manager.current_identity(), None);
+    }
+
+    #[test]
+    fn a_new_version_over_a_hydrated_rule_takes_no_base_snapshot() {
+        let config = Arc::new(RwLock::new(SecurityConfig::default()));
+        let manager = DynamicRuleManager::new(Arc::clone(&config));
+        manager.state.lock().expect("state").current_rules = Some(rules());
+        let _applied = manager.apply_rule(&rules());
+        assert!(manager.state.lock().expect("state").base_snapshot.is_none());
+    }
+
+    #[test]
+    fn a_cache_path_without_a_parent_persists_nothing() {
+        let config = Arc::new(RwLock::new(SecurityConfig {
+            dynamic_rules_cache_path: Some(std::path::PathBuf::from("/")),
+            ..SecurityConfig::default()
+        }));
+        let manager = DynamicRuleManager::new(config);
+        manager.persist_last_known(&rules());
+    }
+
+    #[test]
+    fn a_non_object_event_metadata_is_sent_without_its_fields() {
+        let config = Arc::new(RwLock::new(SecurityConfig::default()));
+        let sink = Arc::new(ScriptedSink::new(Vec::new()));
+        let manager = DynamicRuleManager::new(config).with_sink(sink.clone());
+        manager.send_rule_event(
+            "dynamic_rule_update",
+            "applied",
+            "reason",
+            serde_json::json!("plain"),
+        );
+        let events = sink.events();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].metadata.is_empty());
+    }
+
+    #[test]
     fn the_expiry_restores_the_base_snapshot() {
         let mut r = rules();
         r.blocked_countries = vec![String::from("CN")];

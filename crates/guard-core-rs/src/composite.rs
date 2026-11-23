@@ -934,24 +934,22 @@ impl TelemetryHandler for OtelHandler {
     // started flag.
     #[allow(clippy::significant_drop_tightening)]
     fn start(&self) -> Result<(), TelemetryError> {
-        if self.state.lock().expect("otel state").started {
+        let mut state = self.state.lock().expect("otel state");
+        if state.started {
             return Ok(());
         }
-        let derived = self
-            .exporter_endpoint
-            .as_ref()
-            .map_or((None, None), |endpoint| {
-                (
-                    Some(otlp_signal_endpoint(endpoint, "/v1/traces")),
-                    Some(otlp_signal_endpoint(endpoint, "/v1/metrics")),
-                )
-            });
-        let mut state = self.state.lock().expect("otel state");
-        if !state.started {
-            state.traces_endpoint = derived.0;
-            state.metrics_endpoint = derived.1;
-            state.started = true;
-        }
+        let (traces_endpoint, metrics_endpoint) =
+            self.exporter_endpoint
+                .as_ref()
+                .map_or((None, None), |endpoint| {
+                    (
+                        Some(otlp_signal_endpoint(endpoint, "/v1/traces")),
+                        Some(otlp_signal_endpoint(endpoint, "/v1/metrics")),
+                    )
+                });
+        state.traces_endpoint = traces_endpoint;
+        state.metrics_endpoint = metrics_endpoint;
+        state.started = true;
         Ok(())
     }
 
@@ -1915,6 +1913,29 @@ mod otel_tests {
             }
         }
         panic!("missing attribute {key}");
+    }
+
+    #[test]
+    fn a_second_otel_start_keeps_the_first_derived_endpoints() {
+        let (handler, _transport) = otel_with_endpoint(Some("http://collector:4318"));
+        handler.start().expect("first start");
+        let first = {
+            let state = handler.state.lock().expect("otel state");
+            (
+                state.traces_endpoint.clone(),
+                state.metrics_endpoint.clone(),
+            )
+        };
+        handler.start().expect("second start");
+        let state = handler.state.lock().expect("otel state");
+        assert!(state.started);
+        assert_eq!(
+            (
+                state.traces_endpoint.clone(),
+                state.metrics_endpoint.clone()
+            ),
+            first
+        );
     }
 
     fn otel_with_endpoint(endpoint: Option<&str>) -> (OtelHandler, Arc<CapturingTransport>) {

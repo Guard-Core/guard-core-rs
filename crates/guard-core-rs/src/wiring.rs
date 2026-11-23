@@ -1267,6 +1267,36 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_ipinfo_token_is_rejected_at_geo_wiring() {
+        let mut config = config();
+        config.blocked_countries = set(&["CN"]);
+        config.ipinfo_token = Some(String::new());
+        assert!(matches!(
+            Wiring::build_geo(&config, None),
+            Err(WiringError::Geo(_))
+        ));
+    }
+
+    #[test]
+    fn an_unvalidated_ban_config_fails_the_user_agent_stage() {
+        let mut config = config();
+        config.blocked_user_agents = vec![String::from("curl")];
+        config.auto_ban_threshold = 0;
+        assert!(Wiring::build_unvalidated(&config, &WiringOptions::default()).is_err());
+    }
+
+    #[test]
+    fn dynamic_rules_wire_without_a_bans_handle_or_a_cache_path() {
+        let mut config = config();
+        config.enable_dynamic_rules = true;
+        let (wiring, _sink) = with_agent(&config);
+        let live = Arc::new(std::sync::RwLock::new(config.clone()));
+        assert!(
+            Wiring::build_dynamic_rules(&config, wiring.telemetry.as_ref(), None, &live).is_some()
+        );
+    }
+
+    #[test]
     fn country_rules_need_a_handler_or_a_token() {
         let mut config = config();
         config.whitelist_countries = set(&["US"]);

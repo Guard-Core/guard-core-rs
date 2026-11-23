@@ -282,9 +282,8 @@ impl IpInfoManager {
     }
 
     fn initialize_inner(&self) -> Result<(), GeoLifecycleError> {
-        if let Some(parent) = self.db_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        // A root path has no parent: nothing to create, and the reader decides the outcome.
+        let _ = self.db_path.parent().map(std::fs::create_dir_all);
 
         // The Redis-cached copy: written atomically, then opened.
         if let Some(store) = &self.redis {
@@ -324,10 +323,8 @@ impl IpInfoManager {
     fn refresh_inner(&self) -> Result<(), GeoLifecycleError> {
         self.download_database()?;
         let reader = self.open_database_or_none()?;
-        if let Some(reader) = reader {
-            *self.reader.lock().expect("ipinfo reader") = Some(reader);
-            *self.last_refreshed.lock().expect("last refreshed") = Some(Timestamp::now());
-        }
+        *self.reader.lock().expect("ipinfo reader") = Some(reader);
+        *self.last_refreshed.lock().expect("last refreshed") = Some(Timestamp::now());
         Ok(())
     }
 
@@ -375,9 +372,9 @@ impl IpInfoManager {
 
     /// `_open_database_or_none`: a corrupted database is deleted and
     /// answered as `None`.
-    fn open_database_or_none(&self) -> Result<Option<Arc<Mmdb>>, GeoLifecycleError> {
+    fn open_database_or_none(&self) -> Result<Arc<Mmdb>, GeoLifecycleError> {
         match Mmdb::open(&self.db_path) {
-            Ok(reader) => Ok(Some(Arc::new(reader))),
+            Ok(reader) => Ok(Arc::new(reader)),
             Err(error) => {
                 let _ = std::fs::remove_file(&self.db_path);
                 Err(GeoLifecycleError(format!(
@@ -389,10 +386,9 @@ impl IpInfoManager {
     }
 
     fn apply_opened_reader(&self) -> Result<(), GeoLifecycleError> {
-        if let Some(reader) = self.open_database_or_none()? {
-            *self.reader.lock().expect("ipinfo reader") = Some(reader);
-            *self.last_refreshed.lock().expect("last refreshed") = Some(Timestamp::now());
-        }
+        let reader = self.open_database_or_none()?;
+        *self.reader.lock().expect("ipinfo reader") = Some(reader);
+        *self.last_refreshed.lock().expect("last refreshed") = Some(Timestamp::now());
         Ok(())
     }
 
@@ -1040,6 +1036,19 @@ mod geo_lifecycle_tests {
         // error carries the reason.
         let error = manager.refresh().expect_err("the write fails");
         assert!(error.0.contains("atomic write failed"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_rename_onto_a_directory_fails_with_the_reason() {
+        let dir = temp_dir("geo-rename-blocked");
+        let db_path = dir.join("db.mmdb");
+        std::fs::create_dir_all(&db_path).expect("a directory where the database belongs");
+        let manager = IpInfoManager::new("tok", Some(db_path), 86_400).expect("token");
+        let error = manager
+            .write_database_atomically(b"bytes")
+            .expect_err("the rename fails");
+        assert!(error.0.contains("atomic rename failed"), "{error}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
